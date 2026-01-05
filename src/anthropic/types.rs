@@ -87,6 +87,7 @@ where
 #[derive(Debug, Deserialize)]
 pub struct MessagesRequest {
     pub model: String,
+    #[serde(default = "default_max_tokens")]
     pub max_tokens: i32,
     pub messages: Vec<Message>,
     #[serde(default)]
@@ -95,6 +96,10 @@ pub struct MessagesRequest {
     pub tools: Option<Vec<Tool>>,
     pub tool_choice: Option<serde_json::Value>,
     pub thinking: Option<Thinking>,
+}
+
+fn default_max_tokens() -> i32 {
+    4096
 }
 
 /// 消息
@@ -108,6 +113,8 @@ pub struct Message {
 /// 系统消息
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SystemMessage {
+    #[serde(rename = "type", default)]
+    pub message_type: Option<String>,
     pub text: String,
 }
 
@@ -115,7 +122,8 @@ pub struct SystemMessage {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Tool {
     pub name: String,
-    pub description: String,
+    #[serde(default)]
+    pub description: Option<String>,
     pub input_schema: HashMap<String, serde_json::Value>,
 }
 
