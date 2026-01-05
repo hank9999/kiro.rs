@@ -231,11 +231,12 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
         .iter()
         .filter(|t| !is_unsupported_tool(&t.name))
         .map(|t| {
-            let mut description = t.description.clone();
-            // 限制描述长度为 10000 字符
-            if description.len() > 10000 {
-                description = description[..10000].to_string();
-            }
+            let description = t.description.clone();
+            // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
+            let description = match description.char_indices().nth(10000) {
+                Some((idx, _)) => description[..idx].to_string(),
+                None => description,
+            };
 
             Tool {
                 tool_specification: ToolSpecification {
