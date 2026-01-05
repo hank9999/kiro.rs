@@ -231,10 +231,10 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
         .iter()
         .filter(|t| !is_unsupported_tool(&t.name))
         .map(|t| {
-            let mut description = t.description.clone();
-            // 限制描述长度为 10000 字符
-            if description.len() > 10000 {
-                description = description[..10000].to_string();
+            let mut description = t.description.clone().unwrap_or_default();
+            // 限制描述长度为 10000 字符（安全截断 UTF-8）
+            if description.chars().count() > 10000 {
+                description = description.chars().take(10000).collect();
             }
 
             Tool {

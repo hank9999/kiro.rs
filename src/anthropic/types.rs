@@ -108,6 +108,8 @@ pub struct Message {
 /// 系统消息
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SystemMessage {
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub message_type: Option<String>,
     pub text: String,
 }
 
@@ -115,7 +117,8 @@ pub struct SystemMessage {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Tool {
     pub name: String,
-    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub input_schema: HashMap<String, serde_json::Value>,
 }
 
