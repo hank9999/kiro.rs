@@ -7,10 +7,10 @@ use axum::{
     routing::get,
     Router,
 };
-use rust_embed::Embed;
+use rust_embed::RustEmbed;
 
 /// 嵌入前端构建产物
-#[derive(Embed)]
+#[derive(RustEmbed)]
 #[folder = "admin-ui/dist"]
 struct Asset;
 

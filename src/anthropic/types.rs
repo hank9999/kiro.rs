@@ -184,3 +184,168 @@ pub struct CountTokensRequest {
 pub struct CountTokensResponse {
     pub input_tokens: i32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 测试 new-api 发送的完整 Claude 请求格式
+    /// 包含：system 数组格式、普通 Tool、WebSearchTool、omitempty 字段缺失等情况
+    #[test]
+    fn test_new_api_claude_request_format() {
+        // 模拟 new-api 发送的真实请求
+        let json = r#"{
+            "model": "claude-sonnet-4-5-20250929",
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ],
+            "system": [
+                {"type": "text", "text": "You are a helpful assistant"}
+            ],
+            "tools": [
+                {
+                    "name": "get_weather",
+                    "description": "Get weather info",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "location": {"type": "string"}
+                        }
+                    }
+                },
+                {
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "max_uses": 5
+                }
+            ],
+            "stream": true
+        }"#;
+
+        let req: MessagesRequest = serde_json::from_str(json).expect("应该能解析 new-api 请求");
+
+        assert_eq!(req.model, "claude-sonnet-4-5-20250929");
+        assert_eq!(req.max_tokens, 4096); // 默认值
+        assert!(req.stream);
+        assert_eq!(req.messages.len(), 1);
+
+        // 验证 system
+        let system = req.system.expect("应该有 system");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0].message_type, "text");
+        assert_eq!(system[0].text, "You are a helpful assistant");
+
+        // 验证 tools（包含普通 Tool 和 WebSearchTool）
+        let tools = req.tools.expect("应该有 tools");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].get("name").unwrap().as_str().unwrap(), "get_weather");
+        assert_eq!(tools[1].get("type").unwrap().as_str().unwrap(), "web_search_20250305");
+    }
+
+    /// 测试 max_tokens 缺失时使用默认值
+    #[test]
+    fn test_max_tokens_default() {
+        let json = r#"{
+            "model": "claude-sonnet-4-5-20250929",
+            "messages": [{"role": "user", "content": "Hi"}]
+        }"#;
+
+        let req: MessagesRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.max_tokens, 4096);
+    }
+
+    /// 测试 system 中 type 字段缺失时使用默认值
+    #[test]
+    fn test_system_message_type_default() {
+        let json = r#"{
+            "model": "claude-sonnet-4-5-20250929",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "system": [{"text": "Be helpful"}]
+        }"#;
+
+        let req: MessagesRequest = serde_json::from_str(json).unwrap();
+        let system = req.system.unwrap();
+        assert_eq!(system[0].message_type, "text");
+    }
+
+    /// 测试 Tool 的 description 可选
+    #[test]
+    fn test_tool_description_optional() {
+        let json = r#"{
+            "model": "claude-sonnet-4-5-20250929",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [{
+                "name": "my_tool",
+                "input_schema": {"type": "object"}
+            }]
+        }"#;
+
+        let req: MessagesRequest = serde_json::from_str(json).unwrap();
+        let tools = req.tools.unwrap();
+        assert!(tools[0].get("description").is_none());
+    }
+
+    /// 测试 SystemMessage 序列化时 type 字段存在
+    #[test]
+    fn test_system_message_serialization() {
+        let msg = SystemMessage {
+            message_type: "text".to_string(),
+            text: "Hello".to_string(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"text""#));
+    }
+
+    /// 测试复杂消息内容（数组格式）
+    #[test]
+    fn test_complex_message_content() {
+        let json = r#"{
+            "model": "claude-sonnet-4-5-20250929",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is this?"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "..."}}
+                ]
+            }]
+        }"#;
+
+        let req: MessagesRequest = serde_json::from_str(json).unwrap();
+        assert!(req.messages[0].content.is_array());
+    }
+
+    /// 测试 thinking 配置
+    #[test]
+    fn test_thinking_config() {
+        let json = r#"{
+            "model": "claude-sonnet-4-5-20250929",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": 10000
+            }
+        }"#;
+
+        let req: MessagesRequest = serde_json::from_str(json).unwrap();
+        let thinking = req.thinking.unwrap();
+        assert_eq!(thinking.thinking_type, "enabled");
+        assert_eq!(thinking.budget_tokens, 10000);
+    }
+
+    /// 测试 thinking budget_tokens 超过最大值时被截断
+    #[test]
+    fn test_thinking_budget_tokens_capped() {
+        let json = r#"{
+            "model": "claude-sonnet-4-5-20250929",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": 100000
+            }
+        }"#;
+
+        let req: MessagesRequest = serde_json::from_str(json).unwrap();
+        let thinking = req.thinking.unwrap();
+        assert_eq!(thinking.budget_tokens, 24576); // MAX_BUDGET_TOKENS
+    }
+}
