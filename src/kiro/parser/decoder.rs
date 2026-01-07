@@ -31,7 +31,7 @@
 //! ```
 
 use super::error::{ParseError, ParseResult};
-use super::frame::{parse_frame, Frame, PRELUDE_SIZE};
+use super::frame::{Frame, PRELUDE_SIZE, parse_frame};
 use bytes::{Buf, BytesMut};
 
 /// 默认最大缓冲区大小 (16 MB)
@@ -262,16 +262,16 @@ impl EventStreamDecoder {
             ParseError::MessageCrcMismatch { .. } | ParseError::HeaderParseFailed(_) => {
                 // 尝试读取 total_length 来跳过整帧
                 if self.buffer.len() >= PRELUDE_SIZE {
-                    let total_length =
-                        u32::from_be_bytes([self.buffer[0], self.buffer[1], self.buffer[2], self.buffer[3]])
-                            as usize;
+                    let total_length = u32::from_be_bytes([
+                        self.buffer[0],
+                        self.buffer[1],
+                        self.buffer[2],
+                        self.buffer[3],
+                    ]) as usize;
 
                     // 确保 total_length 合理且缓冲区有足够数据
                     if total_length >= 16 && total_length <= self.buffer.len() {
-                        tracing::warn!(
-                            "Data 错误恢复: 跳过损坏帧 ({} 字节)",
-                            total_length
-                        );
+                        tracing::warn!("Data 错误恢复: 跳过损坏帧 ({} 字节)", total_length);
                         self.buffer.advance(total_length);
                         self.bytes_skipped += total_length;
                         return;

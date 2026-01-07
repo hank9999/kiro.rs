@@ -2,7 +2,7 @@
 //!
 //! AWS Event Stream 使用 CRC32 (ISO-HDLC/以太网/ZIP 标准)
 
-use crc::{Crc, CRC_32_ISO_HDLC};
+use crc::{CRC_32_ISO_HDLC, Crc};
 
 /// CRC32 计算器实例 (ISO-HDLC 标准，多项式 0xEDB88320)
 const CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);

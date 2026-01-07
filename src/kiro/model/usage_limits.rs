@@ -18,7 +18,7 @@ pub struct UsageLimitsResponse {
 
     /// 使用量明细列表
     #[serde(default)]
-    pub usage_breakdown_list: Vec<UsageBreakdown>
+    pub usage_breakdown_list: Vec<UsageBreakdown>,
 }
 
 /// 订阅信息
@@ -27,7 +27,7 @@ pub struct UsageLimitsResponse {
 pub struct SubscriptionInfo {
     /// 订阅标题 (KIRO PRO+ / KIRO FREE 等)
     #[serde(default)]
-    pub subscription_title: Option<String>
+    pub subscription_title: Option<String>,
 }
 
 /// 使用量明细

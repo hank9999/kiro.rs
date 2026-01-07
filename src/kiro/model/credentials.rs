@@ -128,7 +128,6 @@ impl CredentialsConfig {
 }
 
 impl KiroCredentials {
-
     /// 获取默认凭证文件路径
     pub fn default_credentials_path() -> &'static str {
         "credentials.json"
@@ -221,7 +220,10 @@ mod tests {
 
     #[test]
     fn test_default_credentials_path() {
-        assert_eq!(KiroCredentials::default_credentials_path(), "credentials.json");
+        assert_eq!(
+            KiroCredentials::default_credentials_path(),
+            "credentials.json"
+        );
     }
 
     #[test]

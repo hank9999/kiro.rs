@@ -167,9 +167,9 @@ async fn run() -> AppResult<()> {
         .with_context(|| format!("加载配置失败: {}", config_path))?;
 
     // 加载凭证（支持单对象或数组格式）
-    let credentials_path = args.credentials.unwrap_or_else(|| {
-        KiroCredentials::default_credentials_path().to_string()
-    });
+    let credentials_path = args
+        .credentials
+        .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
     let credentials_config = CredentialsConfig::load(&credentials_path)
         .with_context(|| format!("加载凭证失败: {}", credentials_path))?;
 

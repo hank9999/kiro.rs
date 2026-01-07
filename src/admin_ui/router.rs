@@ -1,11 +1,11 @@
 //! Admin UI 路由配置
 
 use axum::{
+    Router,
     body::Body,
-    http::{header, Response, StatusCode, Uri},
+    http::{Response, StatusCode, Uri, header},
     response::IntoResponse,
     routing::get,
-    Router,
 };
 use rust_embed::Embed;
 

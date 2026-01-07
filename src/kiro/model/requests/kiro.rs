@@ -62,6 +62,13 @@ mod tests {
             Err(e) => panic!("{:?}", e),
         };
         assert_eq!(request.conversation_state.conversation_id, "conv-456");
-        assert_eq!(request.conversation_state.current_message.user_input_message.content, "Test message");
+        assert_eq!(
+            request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "Test message"
+        );
     }
 }

@@ -11,7 +11,7 @@ use tokio::sync::Mutex as TokioMutex;
 
 use std::path::PathBuf;
 
-use crate::http_client::{build_client, ProxyConfig};
+use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
@@ -54,7 +54,8 @@ impl TokenManager {
     /// 如果 Token 过期或即将过期，会自动刷新
     pub async fn ensure_valid_token(&mut self) -> anyhow::Result<String> {
         if is_token_expired(&self.credentials) || is_token_expiring_soon(&self.credentials) {
-            self.credentials = refresh_token(&self.credentials, &self.config, self.proxy.as_ref()).await?;
+            self.credentials =
+                refresh_token(&self.credentials, &self.config, self.proxy.as_ref()).await?;
 
             // 刷新后再次检查 token 时间有效性
             if is_token_expired(&self.credentials) {
@@ -78,7 +79,10 @@ impl TokenManager {
 }
 
 /// 检查 Token 是否在指定时间内过期
-pub(crate) fn is_token_expiring_within(credentials: &KiroCredentials, minutes: i64) -> Option<bool> {
+pub(crate) fn is_token_expiring_within(
+    credentials: &KiroCredentials,
+    minutes: i64,
+) -> Option<bool> {
     credentials
         .expires_at
         .as_ref()
@@ -107,9 +111,7 @@ pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::R
         bail!("refreshToken 为空");
     }
 
-    if refresh_token.len() < 100
-        || refresh_token.ends_with("...")
-        || refresh_token.contains("...")
+    if refresh_token.len() < 100 || refresh_token.ends_with("...") || refresh_token.contains("...")
     {
         bail!(
             "refreshToken 已被截断（长度: {} 字符）。\n\
@@ -213,8 +215,7 @@ async fn refresh_social_token(
 }
 
 /// IdC Token 刷新所需的 x-amz-user-agent header
-const IDC_AMZ_USER_AGENT: &str =
-    "aws-sdk-js/3.738.0 ua/2.1 os/other lang/js md/browser#unknown_unknown api/sso-oidc#3.738.0 m/E KiroIDE";
+const IDC_AMZ_USER_AGENT: &str = "aws-sdk-js/3.738.0 ua/2.1 os/other lang/js md/browser#unknown_unknown api/sso-oidc#3.738.0 m/E KiroIDE";
 
 /// 刷新 IdC Token (AWS SSO OIDC)
 async fn refresh_idc_token(
@@ -319,10 +320,7 @@ pub(crate) async fn get_usage_limits(
 
     // profileArn 是可选的
     if let Some(profile_arn) = &credentials.profile_arn {
-        url.push_str(&format!(
-            "&profileArn={}",
-            urlencoding::encode(profile_arn)
-        ));
+        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
     }
 
     // 构建 User-Agent headers
@@ -607,11 +605,7 @@ impl MultiTokenManager {
                         *current_id = new_id;
                         (new_id, new_creds)
                     } else {
-                        anyhow::bail!(
-                            "所有凭据均已禁用（{}/{}）",
-                            self.available_count(),
-                            total
-                        );
+                        anyhow::bail!("所有凭据均已禁用（{}/{}）", self.available_count(), total);
                     }
                 }
             };
@@ -622,11 +616,7 @@ impl MultiTokenManager {
                     return Ok(ctx);
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "凭据 #{} Token 刷新失败，尝试下一个凭据: {}",
-                        id,
-                        e
-                    );
+                    tracing::warn!("凭据 #{} Token 刷新失败，尝试下一个凭据: {}", id, e);
 
                     // Token 刷新失败，切换到下一个优先级的凭据（不计入失败次数）
                     self.switch_to_next_by_priority();
@@ -785,16 +775,14 @@ impl MultiTokenManager {
         };
 
         // 序列化为 pretty JSON
-        let json =
-            serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
+        let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
 
         // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::task::block_in_place(|| std::fs::write(path, &json))
                 .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
         } else {
-            std::fs::write(path, &json)
-                .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+            std::fs::write(path, &json).with_context(|| format!("回写凭据文件失败: {:?}", path))?;
         }
 
         tracing::debug!("已回写凭据到文件: {:?}", path);
@@ -843,11 +831,7 @@ impl MultiTokenManager {
 
         if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
             entry.disabled = true;
-            tracing::error!(
-                "凭据 #{} 已连续失败 {} 次，已被禁用",
-                id,
-                failure_count
-            );
+            tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
 
             // 切换到优先级最高的可用凭据
             if let Some(next) = entries
@@ -900,7 +884,13 @@ impl MultiTokenManager {
     /// 获取使用额度信息
     pub async fn get_usage_limits(&self) -> anyhow::Result<UsageLimitsResponse> {
         let ctx = self.acquire_context().await?;
-        get_usage_limits(&ctx.credentials, &self.config, &ctx.token, self.proxy.as_ref()).await
+        get_usage_limits(
+            &ctx.credentials,
+            &self.config,
+            &ctx.token,
+            self.proxy.as_ref(),
+        )
+        .await
     }
 
     // ========================================================================
@@ -1220,7 +1210,11 @@ mod tests {
             Some(e) => e.to_string(),
             None => String::new(),
         };
-        assert!(err_msg.contains("重复的凭据 ID"), "错误消息应包含 '重复的凭据 ID'，实际: {}", err_msg);
+        assert!(
+            err_msg.contains("重复的凭据 ID"),
+            "错误消息应包含 '重复的凭据 ID'，实际: {}",
+            err_msg
+        );
     }
 
     #[test]

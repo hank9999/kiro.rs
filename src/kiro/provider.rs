@@ -4,8 +4,8 @@
 //! 支持流式和非流式请求
 //! 支持多凭据故障转移和重试
 
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST};
 use reqwest::Client;
+use reqwest::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, HeaderMap, HeaderValue};
 use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 

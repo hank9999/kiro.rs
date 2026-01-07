@@ -37,11 +37,7 @@ impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Incomplete { needed, available } => {
-                write!(
-                    f,
-                    "数据不足: 需要 {} 字节, 当前 {} 字节",
-                    needed, available
-                )
+                write!(f, "数据不足: 需要 {} 字节, 当前 {} 字节", needed, available)
             }
             Self::PreludeCrcMismatch { expected, actual } => {
                 write!(
@@ -69,7 +65,11 @@ impl fmt::Display for ParseError {
             Self::PayloadDeserialize(e) => write!(f, "Payload 反序列化失败: {}", e),
             Self::Io(e) => write!(f, "IO 错误: {}", e),
             Self::TooManyErrors { count, last_error } => {
-                write!(f, "连续错误过多 ({} 次)，解码器已停止: {}", count, last_error)
+                write!(
+                    f,
+                    "连续错误过多 ({} 次)，解码器已停止: {}",
+                    count, last_error
+                )
             }
             Self::BufferOverflow { size, max } => {
                 write!(f, "缓冲区溢出: {} 字节 (最大 {})", size, max)

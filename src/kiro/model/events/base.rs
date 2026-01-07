@@ -116,9 +116,7 @@ impl Event {
                 let payload = super::ToolUseEvent::from_frame(&frame)?;
                 Ok(Self::ToolUse(payload))
             }
-            EventType::Metering => {
-                Ok(Self::Metering(()))
-            }
+            EventType::Metering => Ok(Self::Metering(())),
             EventType::ContextUsage => {
                 let payload = super::ContextUsageEvent::from_frame(&frame)?;
                 Ok(Self::ContextUsage(payload))
@@ -179,7 +177,10 @@ mod tests {
 
     #[test]
     fn test_event_type_as_str() {
-        assert_eq!(EventType::AssistantResponse.as_str(), "assistantResponseEvent");
+        assert_eq!(
+            EventType::AssistantResponse.as_str(),
+            "assistantResponseEvent"
+        );
         assert_eq!(EventType::ToolUse.as_str(), "toolUseEvent");
     }
 }

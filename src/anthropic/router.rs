@@ -1,16 +1,15 @@
 //! Anthropic API 路由配置
 
 use axum::{
-    middleware,
+    Router, middleware,
     routing::{get, post},
-    Router,
 };
 
 use crate::kiro::provider::KiroProvider;
 
 use super::{
     handlers::{count_tokens, get_models, post_messages},
-    middleware::{auth_middleware, cors_layer, AppState},
+    middleware::{AppState, auth_middleware, cors_layer},
 };
 
 /// 创建 Anthropic API 路由
