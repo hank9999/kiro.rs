@@ -86,6 +86,13 @@ where
     Ok(value.min(MAX_BUDGET_TOKENS))
 }
 
+/// Claude Code 请求中的 metadata
+#[derive(Debug, Clone, Deserialize)]
+pub struct Metadata {
+    /// 用户 ID，格式如: user_xxx_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705
+    pub user_id: Option<String>,
+}
+
 /// Messages 请求体
 #[derive(Debug, Deserialize)]
 pub struct MessagesRequest {
@@ -98,6 +105,8 @@ pub struct MessagesRequest {
     pub tools: Option<Vec<Tool>>,
     pub tool_choice: Option<serde_json::Value>,
     pub thinking: Option<Thinking>,
+    /// Claude Code 请求中的 metadata，包含 session 信息
+    pub metadata: Option<Metadata>,
 }
 
 /// 消息

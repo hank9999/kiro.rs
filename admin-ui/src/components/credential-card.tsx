@@ -14,6 +14,7 @@ import {
   useResetCredentialStats,
 } from '@/hooks/use-credentials'
 import { StatsDialog } from '@/components/stats-dialog'
+import { formatExpiry, formatTokensPair } from '@/lib/format'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
@@ -75,18 +76,6 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
     })
   }
 
-  const formatExpiry = (expiresAt: string | null) => {
-    if (!expiresAt) return '未知'
-    const date = new Date(expiresAt)
-    const now = new Date()
-    const diff = date.getTime() - now.getTime()
-    if (diff < 0) return '已过期'
-    const minutes = Math.floor(diff / 60000)
-    if (minutes < 60) return `${minutes} 分钟`
-    const hours = Math.floor(minutes / 60)
-    if (hours < 24) return `${hours} 小时`
-    return `${Math.floor(hours / 24)} 天`
-  }
 
   const formatTime = (t: string | null) => {
     if (!t) return '从未'
@@ -188,7 +177,7 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
           <div>
             <span className="text-muted-foreground">累计 Tokens：</span>
             <span className="font-medium">
-              {credential.inputTokensTotal} in / {credential.outputTokensTotal} out
+              {formatTokensPair(credential.inputTokensTotal, credential.outputTokensTotal)}
             </span>
           </div>
           <div className="col-span-2">

@@ -62,6 +62,26 @@ impl std::fmt::Display for ConversionError {
 
 impl std::error::Error for ConversionError {}
 
+/// 从 metadata.user_id 中提取 session UUID
+///
+/// user_id 格式: user_xxx_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705
+/// 提取 session_ 后面的 UUID 作为 conversationId
+fn extract_session_id(user_id: &str) -> Option<String> {
+    // 查找 "session_" 后面的内容
+    if let Some(pos) = user_id.find("session_") {
+        let session_part = &user_id[pos + 8..]; // "session_" 长度为 8
+        // session_part 应该是 UUID 格式: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+        // 验证是否是有效的 UUID 格式（36 字符，包含 4 个连字符）
+        if session_part.len() >= 36 {
+            let uuid_str = &session_part[..36];
+            // 简单验证 UUID 格式
+            if uuid_str.chars().filter(|c| *c == '-').count() == 4 {
+                return Some(uuid_str.to_string());
+            }
+        }
+    }
+    None
+}
 
 /// 收集历史消息中使用的所有工具名称
 fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
@@ -100,7 +120,6 @@ fn create_placeholder_tool(name: &str) -> Tool {
     }
 }
 
-
 /// 将 Anthropic 请求转换为 Kiro 请求
 pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
@@ -113,7 +132,13 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     }
 
     // 3. 生成会话 ID 和代理 ID
-    let conversation_id = Uuid::new_v4().to_string();
+    // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
+    let conversation_id = req
+        .metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_ref())
+        .and_then(|user_id| extract_session_id(user_id))
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let agent_continuation_id = Uuid::new_v4().to_string();
 
     // 4. 确定触发类型
@@ -822,6 +847,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
+            metadata: None,
         };
         assert_eq!(determine_chat_trigger_type(&req), "MANUAL");
     }
@@ -945,6 +971,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
+            metadata: None,
         };
 
         let result = must_ok(convert_request(&req));
@@ -960,6 +987,98 @@ mod tests {
         assert!(
             tools.iter().any(|t| t.tool_specification.name == "read"),
             "tools 列表应包含 'read' 工具的占位符定义"
+        );
+    }
+
+    #[test]
+    fn test_extract_session_id_valid() {
+        // 测试有效的 user_id 格式
+        let user_id = "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd_account__session_8bb5523b-ec7c-4540-a9ca-beb6d79f1552";
+        let session_id = extract_session_id(user_id);
+        assert_eq!(
+            session_id,
+            Some("8bb5523b-ec7c-4540-a9ca-beb6d79f1552".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_session_id_no_session() {
+        // 测试没有 session 的 user_id
+        let user_id = "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd";
+        let session_id = extract_session_id(user_id);
+        assert_eq!(session_id, None);
+    }
+
+    #[test]
+    fn test_extract_session_id_invalid_uuid() {
+        // 测试无效的 UUID 格式
+        let user_id = "user_xxx_session_invalid-uuid";
+        let session_id = extract_session_id(user_id);
+        assert_eq!(session_id, None);
+    }
+
+    #[test]
+    fn test_convert_request_with_session_metadata() {
+        use super::super::types::{Message as AnthropicMessage, Metadata};
+
+        // 测试带有 metadata 的请求，应该使用 session UUID 作为 conversationId
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: Some(Metadata {
+                user_id: Some(
+                    "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd_account__session_a0662283-7fd3-4399-a7eb-52b9a717ae88".to_string(),
+                ),
+            }),
+        };
+
+        let result = convert_request(&req).unwrap();
+        assert_eq!(
+            result.conversation_state.conversation_id,
+            "a0662283-7fd3-4399-a7eb-52b9a717ae88"
+        );
+    }
+
+    #[test]
+    fn test_convert_request_without_metadata() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 测试没有 metadata 的请求，应该生成新的 UUID
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        // 验证生成的是有效的 UUID 格式
+        assert_eq!(result.conversation_state.conversation_id.len(), 36);
+        assert_eq!(
+            result
+                .conversation_state
+                .conversation_id
+                .chars()
+                .filter(|c| *c == '-')
+                .count(),
+            4
         );
     }
 }

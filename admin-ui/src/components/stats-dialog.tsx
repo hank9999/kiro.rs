@@ -6,6 +6,7 @@ import {
 } from '@/components/ui/dialog'
 import { useCredentialStats } from '@/hooks/use-credentials'
 import { parseError } from '@/lib/utils'
+import { formatCompactNumber, formatTokensPair } from '@/lib/format'
 
 interface StatsDialogProps {
   credentialId: number
@@ -85,7 +86,7 @@ export function StatsDialog({ credentialId, open, onOpenChange }: StatsDialogPro
               <div className="p-3 border rounded">
                 <div className="text-muted-foreground">累计 Tokens</div>
                 <div className="text-base font-semibold">
-                  {data.inputTokensTotal} in / {data.outputTokensTotal} out
+                  {formatTokensPair(data.inputTokensTotal, data.outputTokensTotal)}
                 </div>
               </div>
               <div className="p-3 border rounded col-span-2">
@@ -129,7 +130,7 @@ export function StatsDialog({ credentialId, open, onOpenChange }: StatsDialogPro
                           <span className={b.callsErr > 0 ? 'text-red-500 font-medium' : ''}>{b.callsErr}</span>
                         </div>
                         <div className="col-span-4">
-                          {b.inputTokensTotal}/{b.outputTokensTotal}
+                          {formatCompactNumber(b.inputTokensTotal)}/{formatCompactNumber(b.outputTokensTotal)}
                         </div>
                       </div>
                     ))}
@@ -160,7 +161,7 @@ export function StatsDialog({ credentialId, open, onOpenChange }: StatsDialogPro
                           <span className={b.callsErr > 0 ? 'text-red-500 font-medium' : ''}>{b.callsErr}</span>
                         </div>
                         <div className="col-span-4">
-                          {b.inputTokensTotal}/{b.outputTokensTotal}
+                          {formatCompactNumber(b.inputTokensTotal)}/{formatCompactNumber(b.outputTokensTotal)}
                         </div>
                         <div className="col-span-2 text-xs text-muted-foreground">
                           {b.lastError ? truncate(b.lastError, 60) : '-'}

@@ -10,6 +10,7 @@ import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { useCredentials, useResetAllStats } from '@/hooks/use-credentials'
+import { formatExpiry, formatTokensPair } from '@/lib/format'
 
 interface DashboardProps {
   onLogout: () => void
@@ -50,6 +51,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
     queryClient.clear()
     onLogout()
   }
+
+  const activeCredential =
+    data?.credentials.find((c) => c.isCurrent) ||
+    data?.credentials.find((c) => c.id === data?.currentId)
 
   if (isLoading) {
     return (
@@ -121,7 +126,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       {/* 主内容 */}
       <main className="container mx-auto px-4 md:px-8 py-6">
         {/* 统计卡片 */}
-        <div className="grid gap-4 md:grid-cols-3 mb-6">
+        <div className="grid gap-4 md:grid-cols-4 mb-6">
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium text-muted-foreground">
@@ -153,6 +158,33 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 #{data?.currentId || '-'}
                 <Badge variant="success">活跃</Badge>
               </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground">
+                主账户信息
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              {activeCredential ? (
+                <div className="space-y-1">
+                  <div className="font-semibold">凭据 #{activeCredential.id}</div>
+                  <div className="text-sm text-muted-foreground">
+                    认证：{activeCredential.authMethod || '未知'}
+                    {activeCredential.hasProfileArn ? ' · 有 Profile ARN' : ''}
+                  </div>
+                  <div className="text-sm text-muted-foreground">
+                    Token 有效期：{formatExpiry(activeCredential.expiresAt)}
+                  </div>
+                  <div className="text-sm">
+                    Tokens：{formatTokensPair(activeCredential.inputTokensTotal, activeCredential.outputTokensTotal)}
+                  </div>
+                </div>
+              ) : (
+                <div className="text-sm text-muted-foreground">暂无</div>
+              )}
             </CardContent>
           </Card>
         </div>

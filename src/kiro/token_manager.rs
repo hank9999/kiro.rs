@@ -605,7 +605,11 @@ impl MultiTokenManager {
                         *current_id = new_id;
                         (new_id, new_creds)
                     } else {
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", self.available_count(), total);
+                        // 注意：必须在 bail! 之前计算 available_count，
+                        // 因为 available_count() 会尝试获取 entries 锁，
+                        // 而此时我们已经持有该锁，会导致死锁
+                        let available = entries.iter().filter(|e| !e.disabled).count();
+                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                     }
                 }
             };
