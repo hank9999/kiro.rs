@@ -4,6 +4,7 @@
 //! 支持单凭据 (TokenManager) 和多凭据 (MultiTokenManager) 管理
 
 use anyhow::bail;
+use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -18,6 +19,7 @@ use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
+use crate::kiro::web_portal;
 use crate::model::config::Config;
 
 /// Token 管理器
@@ -121,6 +123,96 @@ pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::R
     }
 
     Ok(())
+}
+
+fn looks_like_email(s: &str) -> bool {
+    // 极简但实用：避免误判过多，也不做 RFC 复杂校验
+    if s.is_empty() || s.len() > 254 {
+        return false;
+    }
+    if s.contains(' ') {
+        return false;
+    }
+
+    let at = match s.find('@') {
+        Some(v) => v,
+        None => return false,
+    };
+
+    // 至少要有 local@domain.tld
+    if at == 0 || at + 3 >= s.len() {
+        return false;
+    }
+
+    let domain = &s[at + 1..];
+    domain.contains('.')
+}
+
+/// 尽力从凭据中提取账户邮箱，仅用于管理面板展示。
+///
+/// 注意：
+/// - 不验证 JWT 签名（展示用途足够）。
+/// - 解析失败返回 None。
+fn extract_account_email(credentials: &KiroCredentials) -> Option<String> {
+    let access_token = match credentials.access_token.as_deref() {
+        Some(t) => t,
+        None => return None,
+    };
+
+    // JWT: header.payload.signature
+    let mut parts = access_token.split('.');
+    let _header = parts.next();
+    let payload_b64 = match parts.next() {
+        Some(v) => v,
+        None => return None,
+    };
+    let _sig = parts.next();
+
+    // 如果还有更多段，说明不是标准 JWT
+    if parts.next().is_some() {
+        return None;
+    }
+
+    let payload_bytes = match general_purpose::URL_SAFE_NO_PAD.decode(payload_b64) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+
+    let payload_json: serde_json::Value = match serde_json::from_slice(&payload_bytes) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+
+    let obj = match payload_json.as_object() {
+        Some(o) => o,
+        None => return None,
+    };
+
+    // 常见 claim 名称（按优先级）
+    const CANDIDATES: &[&str] = &[
+        "email",
+        "email_address",
+        "preferred_username",
+        "upn",
+        "username",
+        "user_name",
+    ];
+
+    for k in CANDIDATES {
+        let v = match obj.get(*k) {
+            Some(v) => v,
+            None => continue,
+        };
+        let s = match v.as_str() {
+            Some(s) => s.trim(),
+            None => continue,
+        };
+        if looks_like_email(s) {
+            return Some(s.to_string());
+        }
+    }
+
+    None
 }
 
 /// 刷新 Token
@@ -403,6 +495,8 @@ pub struct CredentialEntrySnapshot {
     pub has_profile_arn: bool,
     /// Token 过期时间
     pub expires_at: Option<String>,
+    /// 账户邮箱（尽力从 token 中解析，仅用于展示）
+    pub account_email: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -456,6 +550,97 @@ pub struct CallContext {
 }
 
 impl MultiTokenManager {
+    async fn get_access_token_for(&self, id: u64) -> anyhow::Result<(KiroCredentials, String)> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        // 检查是否需要刷新 token
+        let needs_refresh = is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
+
+        let token = if needs_refresh {
+            let _guard = self.refresh_lock.lock().await;
+            let current_creds = {
+                let entries = self.entries.lock();
+                entries
+                    .iter()
+                    .find(|e| e.id == id)
+                    .map(|e| e.credentials.clone())
+                    .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+            };
+
+            if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
+                let new_creds =
+                    refresh_token(&current_creds, &self.config, self.proxy.as_ref()).await?;
+                {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                        entry.credentials = new_creds.clone();
+                    }
+                }
+                // 持久化失败只记录警告，不影响本次请求
+                if let Err(e) = self.persist_credentials() {
+                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
+                }
+                new_creds
+                    .access_token
+                    .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
+            } else {
+                current_creds
+                    .access_token
+                    .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
+            }
+        } else {
+            credentials
+                .access_token
+                .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
+        };
+
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        Ok((credentials, token))
+    }
+
+    fn determine_idp(_credentials: &KiroCredentials) -> &'static str {
+        // 兼容性优先：目前未在凭据中保存 provider（Github/Google/BuilderId）。
+        // 先按 Kiro-account-manager 的默认值使用 BuilderId。
+        "BuilderId"
+    }
+
+    /// 获取指定凭据的“账号信息 + 套餐 + 用量明细”（通过 Kiro Web Portal API）
+    pub async fn get_account_info_for(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<web_portal::AccountAggregateInfo> {
+        let (_credentials, token) = self.get_access_token_for(id).await?;
+
+        let idp = Self::determine_idp(&_credentials);
+
+        // 并行请求：GetUserInfo & GetUserUsageAndLimits
+        let proxy = self.proxy.as_ref();
+        let (user_info, usage) = tokio::join!(
+            web_portal::get_user_info(&token, idp, proxy),
+            web_portal::get_user_usage_and_limits(&token, idp, proxy)
+        );
+
+        // GetUserInfo 失败不应阻断（参考 Kiro-account-manager 的行为）
+        let user_info = user_info.ok();
+        let usage = usage?;
+
+        Ok(web_portal::aggregate_account_info(user_info, usage))
+    }
     /// 创建多凭据 Token 管理器
     ///
     /// # Arguments
@@ -918,6 +1103,7 @@ impl MultiTokenManager {
                     auth_method: e.credentials.auth_method.clone(),
                     has_profile_arn: e.credentials.profile_arn.is_some(),
                     expires_at: e.credentials.expires_at.clone(),
+                    account_email: extract_account_email(&e.credentials),
                 })
                 .collect(),
             current_id,
@@ -983,65 +1169,7 @@ impl MultiTokenManager {
 
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
-
-        // 检查是否需要刷新 token
-        let needs_refresh = is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
-
-        let token = if needs_refresh {
-            let _guard = self.refresh_lock.lock().await;
-            let current_creds = {
-                let entries = self.entries.lock();
-                entries
-                    .iter()
-                    .find(|e| e.id == id)
-                    .map(|e| e.credentials.clone())
-                    .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-            };
-
-            if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                let new_creds =
-                    refresh_token(&current_creds, &self.config, self.proxy.as_ref()).await?;
-                {
-                    let mut entries = self.entries.lock();
-                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                        entry.credentials = new_creds.clone();
-                    }
-                }
-                // 持久化失败只记录警告，不影响本次请求
-                if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
-                }
-                new_creds
-                    .access_token
-                    .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
-            } else {
-                current_creds
-                    .access_token
-                    .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-            }
-        } else {
-            credentials
-                .access_token
-                .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-        };
-
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
-
+        let (credentials, token) = self.get_access_token_for(id).await?;
         get_usage_limits(&credentials, &self.config, &token, self.proxy.as_ref()).await
     }
 

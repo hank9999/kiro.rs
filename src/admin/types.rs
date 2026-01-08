@@ -82,6 +82,8 @@ pub struct CredentialStatusItem {
     pub auth_method: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
+    /// 账户邮箱（尽力从 token 中解析，仅用于展示）
+    pub account_email: Option<String>,
 
     // ===== 统计（可持久化） =====
 
@@ -179,6 +181,14 @@ pub struct BalanceResponse {
     pub usage_percentage: f64,
     /// 下次重置时间（Unix 时间戳）
     pub next_reset_at: Option<f64>,
+}
+
+/// 账号信息（套餐/用量/邮箱等）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialAccountInfoResponse {
+    pub id: u64,
+    pub account: crate::kiro::web_portal::AccountAggregateInfo,
 }
 
 // ============ 通用响应 ============

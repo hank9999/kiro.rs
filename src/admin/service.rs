@@ -67,6 +67,7 @@ impl AdminService {
                     expires_at: entry.expires_at,
                     auth_method: entry.auth_method,
                     has_profile_arn: entry.has_profile_arn,
+                    account_email: entry.account_email,
 
                     calls_total: stats.as_ref().map(|s| s.calls_total).unwrap_or(0),
                     calls_ok: stats.as_ref().map(|s| s.calls_ok).unwrap_or(0),
@@ -149,6 +150,24 @@ impl AdminService {
             usage_percentage,
             next_reset_at: usage.next_date_reset,
         })
+    }
+
+    /// 获取指定凭据的账号信息（套餐/用量/邮箱等）
+    pub async fn get_account_info(
+        &self,
+        id: u64,
+    ) -> Result<super::types::CredentialAccountInfoResponse, AdminServiceError> {
+        if !self.credential_exists(id) {
+            return Err(AdminServiceError::NotFound { id });
+        }
+
+        let info = self
+            .token_manager
+            .get_account_info_for(id)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))?;
+
+        Ok(super::types::CredentialAccountInfoResponse { id, account: info })
     }
 
     /// 获取指定凭据的统计详情

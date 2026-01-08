@@ -16,6 +16,7 @@ export interface CredentialStatusItem {
   expiresAt: string | null
   authMethod: string | null
   hasProfileArn: boolean
+  accountEmail: string | null
 
   // ===== 统计（可持久化） =====
   callsTotal: number
@@ -108,4 +109,62 @@ export interface AddCredentialResponse {
   success: boolean
   message: string
   credentialId: number
+}
+
+// ===== 账号信息（套餐/用量/邮箱等） =====
+
+export interface CreditBonus {
+  code: string
+  name: string
+  current: number
+  limit: number
+  expiresAt: string | null
+}
+
+export interface CreditsResourceDetail {
+  displayName: string | null
+  displayNamePlural: string | null
+  resourceType: string | null
+  currency: string | null
+  unit: string | null
+  overageRate: number | null
+  overageCap: number | null
+}
+
+export interface CreditsUsageSummary {
+  current: number
+  limit: number
+  baseCurrent: number
+  baseLimit: number
+  freeTrialCurrent: number
+  freeTrialLimit: number
+  freeTrialExpiry: string | null
+  bonuses: CreditBonus[]
+  nextResetDate: string | null
+  overageEnabled: boolean | null
+  resourceDetail: CreditsResourceDetail | null
+}
+
+export interface AccountSubscriptionDetails {
+  rawType: string | null
+  managementTarget: string | null
+  upgradeCapability: string | null
+  overageCapability: string | null
+}
+
+export interface AccountAggregateInfo {
+  email: string | null
+  userId: string | null
+  idp: string | null
+  status: string | null
+  featureFlags: string[] | null
+  subscriptionTitle: string | null
+  subscriptionType: string
+  subscription: AccountSubscriptionDetails
+  usage: CreditsUsageSummary
+}
+
+export interface CredentialAccountInfoResponse {
+  id: number
+  account: AccountAggregateInfo
 }

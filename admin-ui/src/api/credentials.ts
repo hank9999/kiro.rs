@@ -9,6 +9,7 @@ import type {
   AddCredentialRequest,
   AddCredentialResponse,
   CredentialStatsResponse,
+  CredentialAccountInfoResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -69,6 +70,14 @@ export async function resetCredentialFailure(
 // 获取凭据余额
 export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
   const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
+  return data
+}
+
+// 获取凭据账号信息（套餐/用量/邮箱等）
+export async function getCredentialAccountInfo(
+  id: number
+): Promise<CredentialAccountInfoResponse> {
+  const { data } = await api.get<CredentialAccountInfoResponse>(`/credentials/${id}/account`)
   return data
 }
 

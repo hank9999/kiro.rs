@@ -5,6 +5,7 @@ import {
   setCredentialPriority,
   resetCredentialFailure,
   getCredentialBalance,
+  getCredentialAccountInfo,
   addCredential,
   getCredentialStats,
   resetCredentialStats,
@@ -28,6 +29,16 @@ export function useCredentialBalance(id: number | null) {
     queryFn: () => getCredentialBalance(id!),
     enabled: id !== null,
     retry: false, // 余额查询失败时不重试（避免重复请求被封禁的账号）
+  })
+}
+
+// 查询凭据账号信息（套餐/用量/邮箱等）
+export function useCredentialAccountInfo(id: number | null, enabled: boolean) {
+  return useQuery({
+    queryKey: ['credential-account', id],
+    queryFn: () => getCredentialAccountInfo(id!),
+    enabled: enabled && id !== null,
+    retry: false,
   })
 }
 

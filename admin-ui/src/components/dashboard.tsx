@@ -9,7 +9,7 @@ import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
-import { useCredentials, useResetAllStats } from '@/hooks/use-credentials'
+import { useCredentials, useResetAllStats, useCredentialAccountInfo } from '@/hooks/use-credentials'
 import { formatExpiry, formatTokensPair } from '@/lib/format'
 
 interface DashboardProps {
@@ -55,6 +55,17 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const activeCredential =
     data?.credentials.find((c) => c.isCurrent) ||
     data?.credentials.find((c) => c.id === data?.currentId)
+
+  const accountInfoQuery = useCredentialAccountInfo(
+    activeCredential?.id ?? null,
+    !!activeCredential
+  )
+
+  const formatCredits = (v: number | null | undefined) => {
+    if (v === null || v === undefined) return '-'
+    if (!Number.isFinite(v)) return String(v)
+    return v.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  }
 
   if (isLoading) {
     return (
@@ -174,6 +185,18 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   <div className="text-sm text-muted-foreground">
                     认证：{activeCredential.authMethod || '未知'}
                     {activeCredential.hasProfileArn ? ' · 有 Profile ARN' : ''}
+                  </div>
+                  <div className="text-sm text-muted-foreground">
+                    邮箱：{accountInfoQuery.data?.account.email || activeCredential.accountEmail || '-'}
+                  </div>
+                  <div className="text-sm text-muted-foreground">
+                    套餐：{accountInfoQuery.data?.account.subscriptionTitle || accountInfoQuery.data?.account.subscriptionType || '-'}
+                  </div>
+                  <div className="text-sm">
+                    Credits：
+                    {accountInfoQuery.data
+                      ? `${formatCredits(accountInfoQuery.data.account.usage.current)} / ${formatCredits(accountInfoQuery.data.account.usage.limit)}`
+                      : '-'}
                   </div>
                   <div className="text-sm text-muted-foreground">
                     Token 有效期：{formatExpiry(activeCredential.expiresAt)}

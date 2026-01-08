@@ -8,7 +8,10 @@ use axum::{
 
 use super::{
     middleware::AdminState,
-    types::{AddCredentialRequest, SetDisabledRequest, SetPriorityRequest, SuccessResponse},
+    types::{
+        AddCredentialRequest, CredentialAccountInfoResponse, SetDisabledRequest, SetPriorityRequest,
+        SuccessResponse,
+    },
 };
 
 /// GET /api/admin/credentials
@@ -75,6 +78,18 @@ pub async fn get_credential_balance(
 ) -> impl IntoResponse {
     match state.service.get_balance(id).await {
         Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/credentials/:id/account
+/// 获取指定凭据的账号信息（套餐/用量/邮箱等）
+pub async fn get_credential_account_info(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.get_account_info(id).await {
+        Ok(response) => Json::<CredentialAccountInfoResponse>(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
