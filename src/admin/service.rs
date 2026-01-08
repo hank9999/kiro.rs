@@ -170,6 +170,28 @@ impl AdminService {
         Ok(super::types::CredentialAccountInfoResponse { id, account: info })
     }
 
+    /// 删除指定凭据（并持久化到凭据文件）
+    pub async fn delete_credential(&self, id: u64) -> Result<String, AdminServiceError> {
+        if !self.credential_exists(id) {
+            return Err(AdminServiceError::NotFound { id });
+        }
+
+        self.token_manager
+            .remove_credential(id)
+            .map_err(|e| self.classify_error(e, id))?;
+
+        // 统计清理（尽力而为）
+        if let Some(stats) = &self.stats {
+            stats.reset_account(id);
+            if let Err(e) = stats.flush_now().await {
+                tracing::warn!("删除凭据后清理统计落盘失败: {}", e);
+                return Ok(format!("凭据 #{} 已删除（统计清理失败: {}）", id, e));
+            }
+        }
+
+        Ok(format!("凭据 #{} 已删除", id))
+    }
+
     /// 获取指定凭据的统计详情
     pub fn get_credential_stats(&self, id: u64) -> Result<CredentialStatsResponse, AdminServiceError> {
         if !self.credential_exists(id) {

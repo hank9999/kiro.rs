@@ -10,6 +10,7 @@
 use std::time::Duration;
 
 use anyhow::Context;
+use chrono::{DateTime, Utc};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -25,7 +26,7 @@ pub struct GetUserInfoRequest {
     pub origin: String,
 }
 
-#[derive(Debug, serde::Deserialize, Clone)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInfoResponse {
     pub email: Option<String>,
@@ -42,14 +43,14 @@ pub struct GetUserUsageAndLimitsRequest {
     pub origin: String,
 }
 
-#[derive(Debug, serde::Deserialize, Clone)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageUserInfo {
     pub email: Option<String>,
     pub user_id: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize, Clone)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscriptionInfo {
     pub r#type: Option<String>,
@@ -59,7 +60,7 @@ pub struct SubscriptionInfo {
     pub subscription_management_target: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize, Clone)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Bonus {
     pub bonus_code: Option<String>,
@@ -74,7 +75,7 @@ pub struct Bonus {
     pub expires_at: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize, Clone)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct FreeTrialInfo {
     pub usage_limit: Option<f64>,
@@ -86,7 +87,7 @@ pub struct FreeTrialInfo {
     pub free_trial_status: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize, Clone)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageBreakdownItem {
     pub resource_type: Option<String>,
@@ -107,13 +108,13 @@ pub struct UsageBreakdownItem {
     pub bonuses: Option<Vec<Bonus>>,
 }
 
-#[derive(Debug, serde::Deserialize, Clone)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct OverageConfiguration {
     pub overage_enabled: Option<bool>,
 }
 
-#[derive(Debug, serde::Deserialize, Clone)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageAndLimitsResponse {
     pub user_info: Option<UsageUserInfo>,
@@ -296,6 +297,17 @@ pub struct CreditsResourceDetail {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ResourceUsageSummary {
+    pub resource_type: Option<String>,
+    pub display_name: Option<String>,
+    pub unit: Option<String>,
+    pub currency: Option<String>,
+    pub current: f64,
+    pub limit: f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AccountAggregateInfo {
     pub email: Option<String>,
     pub user_id: Option<String>,
@@ -307,7 +319,14 @@ pub struct AccountAggregateInfo {
     pub subscription_type: String,
     pub subscription: AccountSubscriptionDetails,
 
+    /// 兼容旧 UI：Credits 汇总（如有）
     pub usage: CreditsUsageSummary,
+
+    /// 全部资源用量明细（用于展示/调试）
+    pub resources: Vec<ResourceUsageSummary>,
+
+    /// 原始 GetUserUsageAndLimits 响应（不包含 token，仅包含用量/订阅信息）
+    pub raw_usage: UsageAndLimitsResponse,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -340,6 +359,40 @@ fn pick_f64(primary: Option<f64>, fallback: Option<f64>) -> f64 {
     primary.or(fallback).unwrap_or(0.0)
 }
 
+fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn free_trial_is_effective(ft: &FreeTrialInfo) -> bool {
+    match ft.free_trial_status.as_deref() {
+        Some(s) => s.eq_ignore_ascii_case("ACTIVE"),
+        None => {
+            let limit = pick_f64(ft.usage_limit_with_precision, ft.usage_limit);
+            let current = pick_f64(ft.current_usage_with_precision, ft.current_usage);
+            limit > 0.0 || current > 0.0
+        }
+    }
+}
+
+fn bonus_is_effective(b: &Bonus) -> bool {
+    match b.status.as_deref() {
+        Some(s) => s.eq_ignore_ascii_case("ACTIVE"),
+        None => {
+            // 没有 status 时：优先用 expiresAt 判断是否仍有效；再用 limit/current 兜底。
+            if let Some(exp) = b.expires_at.as_deref() {
+                if let Some(dt) = parse_rfc3339(exp) {
+                    return dt > Utc::now();
+                }
+            }
+            let limit = pick_f64(b.usage_limit_with_precision, b.usage_limit);
+            let current = pick_f64(b.current_usage_with_precision, b.current_usage);
+            limit > 0.0 || current > 0.0
+        }
+    }
+}
+
 pub fn aggregate_account_info(
     user_info: Option<UserInfoResponse>,
     usage: UsageAndLimitsResponse,
@@ -366,11 +419,7 @@ pub fn aggregate_account_info(
         .unwrap_or(0.0);
 
     let (free_trial_limit, free_trial_current, free_trial_expiry) = match credit.and_then(|c| c.free_trial_info.as_ref()) {
-        Some(t) if t
-            .free_trial_status
-            .as_deref()
-            .map(|s| s.eq_ignore_ascii_case("ACTIVE"))
-            .unwrap_or(false) => (
+        Some(t) if free_trial_is_effective(t) => (
             pick_f64(t.usage_limit_with_precision, t.usage_limit),
             pick_f64(t.current_usage_with_precision, t.current_usage),
             t.free_trial_expiry.clone(),
@@ -381,13 +430,7 @@ pub fn aggregate_account_info(
     let bonuses: Vec<CreditBonus> = credit
         .and_then(|c| c.bonuses.as_ref())
         .map(|bs| {
-            bs.iter()
-                .filter(|b| {
-                    b.status
-                        .as_deref()
-                        .map(|s| s.eq_ignore_ascii_case("ACTIVE"))
-                        .unwrap_or(true)
-                })
+            bs.iter().filter(|b| bonus_is_effective(b))
                 .map(|b| CreditBonus {
                     code: b.bonus_code.clone().unwrap_or_default(),
                     name: b.display_name.clone().unwrap_or_default(),
@@ -485,5 +528,22 @@ pub fn aggregate_account_info(
 
             resource_detail,
         },
+        resources: usage
+            .usage_breakdown_list
+            .as_ref()
+            .map(|l| {
+                l.iter()
+                    .map(|b| ResourceUsageSummary {
+                        resource_type: b.resource_type.clone(),
+                        display_name: b.display_name.clone(),
+                        unit: b.unit.clone(),
+                        currency: b.currency.clone(),
+                        current: pick_f64(b.current_usage_with_precision, b.current_usage),
+                        limit: pick_f64(b.usage_limit_with_precision, b.usage_limit),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        raw_usage: usage,
     }
 }

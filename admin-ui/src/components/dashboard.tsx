@@ -67,6 +67,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
     return v.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   }
 
+  const formatUsageLine = (
+    label: string,
+    current: number | null | undefined,
+    limit: number | null | undefined,
+    unit?: string | null
+  ) => {
+    const v = `${formatCredits(current)} / ${formatCredits(limit)}`
+    return `${label}: ${v}${unit ? ' ' + unit : ''}`
+  }
+
   if (isLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
@@ -192,11 +202,107 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   <div className="text-sm text-muted-foreground">
                     套餐：{accountInfoQuery.data?.account.subscriptionTitle || accountInfoQuery.data?.account.subscriptionType || '-'}
                   </div>
+
+                  {accountInfoQuery.error ? (
+                    <div className="text-xs text-red-500">
+                      账号信息拉取失败：{(accountInfoQuery.error as Error).message}
+                    </div>
+                  ) : null}
+
                   <div className="text-sm">
-                    Credits：
-                    {accountInfoQuery.data
-                      ? `${formatCredits(accountInfoQuery.data.account.usage.current)} / ${formatCredits(accountInfoQuery.data.account.usage.limit)}`
-                      : '-'}
+                    用量：
+                    {(() => {
+                      const account = accountInfoQuery.data?.account
+                      if (!account) return '-'
+
+                      const usage = account.usage
+                      const resources = account.resources || []
+                      const hasCreditResource = resources.some((r) =>
+                        (r.resourceType || '').toUpperCase().includes('CREDIT')
+                      )
+
+                      const unit = usage.resourceDetail?.unit || usage.resourceDetail?.currency || ''
+                      const bonuses = usage.bonuses || []
+
+                      const hasCreditsMeaningful =
+                        hasCreditResource &&
+                        (usage.limit > 0 ||
+                          usage.current > 0 ||
+                          usage.baseLimit > 0 ||
+                          usage.baseCurrent > 0 ||
+                          usage.freeTrialLimit > 0 ||
+                          usage.freeTrialCurrent > 0 ||
+                          bonuses.length > 0)
+
+                      // 结构化渲染，避免依赖前导空格缩进
+                      type Line = { text: string; muted?: boolean; indent?: boolean }
+                      const lines: Line[] = []
+
+                      if (hasCreditsMeaningful) {
+                        lines.push({ text: formatUsageLine('总计', usage.current, usage.limit, unit) })
+
+                        if (usage.baseLimit > 0 || usage.baseCurrent > 0) {
+                          lines.push({ text: formatUsageLine('基础', usage.baseCurrent, usage.baseLimit, unit) })
+                        }
+
+                        if (usage.freeTrialLimit > 0 || usage.freeTrialCurrent > 0) {
+                          const expiry = usage.freeTrialExpiry ? `，到期 ${usage.freeTrialExpiry}` : ''
+                          lines.push({
+                            text: `${formatUsageLine('试用', usage.freeTrialCurrent, usage.freeTrialLimit, unit)}${expiry}`,
+                          })
+                        }
+
+                        if (bonuses.length > 0) {
+                          const bCurrent = bonuses.reduce((acc, b) => acc + (b.current || 0), 0)
+                          const bLimit = bonuses.reduce((acc, b) => acc + (b.limit || 0), 0)
+                          lines.push({ text: formatUsageLine('赠送', bCurrent, bLimit, unit) })
+                        }
+                      } else {
+                        // 没有 Credits 或 Credits 不适用：展示最主要的一个资源作为“总计”
+                        const preferred = resources[0]
+                        if (preferred) {
+                          const label = preferred.displayName || preferred.resourceType || 'Usage'
+                          const u = preferred.unit || preferred.currency || ''
+                          lines.push({ text: formatUsageLine(label, preferred.current, preferred.limit, u) })
+                        } else {
+                          return '-'
+                        }
+                      }
+
+                      // 其它资源（例如 MONTHLY_REQUEST_COUNT 等）
+                      const others = resources.filter((r) => {
+                        const t = (r.resourceType || '').toUpperCase()
+                        return hasCreditsMeaningful ? !t.includes('CREDIT') : true
+                      })
+
+                      if (others.length > 0) {
+                        const top = others.slice(0, 6)
+                        lines.push({ text: '其它资源：', muted: true })
+                        for (const r of top) {
+                          const label = r.displayName || r.resourceType || 'Usage'
+                          const u = r.unit || r.currency || ''
+                          lines.push({ text: formatUsageLine(label, r.current, r.limit, u), indent: true })
+                        }
+                        if (others.length > top.length) {
+                          lines.push({ text: `...以及 ${others.length - top.length} 项`, indent: true, muted: true })
+                        }
+                      }
+
+                      return (
+                        <div className="space-y-0.5">
+                          {lines.map((l, idx) => (
+                            <div
+                              key={idx}
+                              className={[l.muted ? 'text-muted-foreground' : '', l.indent ? 'pl-4' : '']
+                                .filter(Boolean)
+                                .join(' ')}
+                            >
+                              {l.text}
+                            </div>
+                          ))}
+                        </div>
+                      )
+                    })()}
                   </div>
                   <div className="text-sm text-muted-foreground">
                     Token 有效期：{formatExpiry(activeCredential.expiresAt)}

@@ -1,6 +1,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   getCredentials,
+  deleteCredential,
   setCredentialDisabled,
   setCredentialPriority,
   resetCredentialFailure,
@@ -39,6 +40,20 @@ export function useCredentialAccountInfo(id: number | null, enabled: boolean) {
     queryFn: () => getCredentialAccountInfo(id!),
     enabled: enabled && id !== null,
     retry: false,
+  })
+}
+
+// 删除指定凭据
+export function useDeleteCredential() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => deleteCredential(id),
+    onSuccess: (_res, id) => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['credential-balance', id] })
+      queryClient.invalidateQueries({ queryKey: ['credential-account', id] })
+      queryClient.invalidateQueries({ queryKey: ['credential-stats', id] })
+    },
   })
 }
 

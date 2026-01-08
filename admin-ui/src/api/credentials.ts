@@ -35,6 +35,12 @@ export async function getCredentials(): Promise<CredentialsStatusResponse> {
   return data
 }
 
+// 删除指定凭据
+export async function deleteCredential(id: number): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>(`/credentials/${id}`)
+  return data
+}
+
 // 设置凭据禁用状态
 export async function setCredentialDisabled(
   id: number,

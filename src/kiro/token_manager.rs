@@ -613,10 +613,22 @@ impl MultiTokenManager {
         Ok((credentials, token))
     }
 
-    fn determine_idp(_credentials: &KiroCredentials) -> &'static str {
+    fn candidate_idps(credentials: &KiroCredentials) -> &'static [&'static str] {
         // 兼容性优先：目前未在凭据中保存 provider（Github/Google/BuilderId）。
-        // 先按 Kiro-account-manager 的默认值使用 BuilderId。
-        "BuilderId"
+        // 这里按 auth_method 做一个“尽力猜测 + 多候选重试”。
+        let auth = credentials
+            .auth_method
+            .as_deref()
+            .unwrap_or("social")
+            .to_ascii_lowercase();
+
+        match auth.as_str() {
+            // social 更可能是 Github/Google
+            "social" => &["Github", "Google", "BuilderId"],
+            // builder-id / idc 默认 BuilderId
+            "builder-id" | "idc" => &["BuilderId", "Github", "Google"],
+            _ => &["BuilderId", "Github", "Google"],
+        }
     }
 
     /// 获取指定凭据的“账号信息 + 套餐 + 用量明细”（通过 Kiro Web Portal API）
@@ -624,22 +636,34 @@ impl MultiTokenManager {
         &self,
         id: u64,
     ) -> anyhow::Result<web_portal::AccountAggregateInfo> {
-        let (_credentials, token) = self.get_access_token_for(id).await?;
+        let (credentials, token) = self.get_access_token_for(id).await?;
 
-        let idp = Self::determine_idp(&_credentials);
-
-        // 并行请求：GetUserInfo & GetUserUsageAndLimits
         let proxy = self.proxy.as_ref();
-        let (user_info, usage) = tokio::join!(
-            web_portal::get_user_info(&token, idp, proxy),
-            web_portal::get_user_usage_and_limits(&token, idp, proxy)
-        );
 
-        // GetUserInfo 失败不应阻断（参考 Kiro-account-manager 的行为）
-        let user_info = user_info.ok();
-        let usage = usage?;
+        let mut last_err: Option<anyhow::Error> = None;
+        for idp in Self::candidate_idps(&credentials) {
+            // 并行请求：GetUserInfo & GetUserUsageAndLimits
+            let (user_info, usage) = tokio::join!(
+                web_portal::get_user_info(&token, idp, proxy),
+                web_portal::get_user_usage_and_limits(&token, idp, proxy)
+            );
 
-        Ok(web_portal::aggregate_account_info(user_info, usage))
+            match usage {
+                Ok(u) => {
+                    // GetUserInfo 失败不应阻断（参考 Kiro-account-manager 的行为）
+                    return Ok(web_portal::aggregate_account_info(user_info.ok(), u));
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            }
+        }
+
+        Err(match last_err {
+            Some(e) => e,
+            None => anyhow::anyhow!("获取账号信息失败：没有可用的 Idp 候选"),
+        })
     }
     /// 创建多凭据 Token 管理器
     ///
@@ -936,21 +960,17 @@ impl MultiTokenManager {
 
     /// 将凭据列表回写到源文件
     ///
-    /// 仅在以下条件满足时回写：
-    /// - 源文件是多凭据格式（数组）
-    /// - credentials_path 已设置
+    /// 回写规则：
+    /// - credentials_path 未设置：跳过写入
+    /// - 如果启动时读取的是多凭据格式（数组），或当前凭据数量 != 1：写回数组格式
+    /// - 否则（单凭据且启动时为单对象格式）：写回单对象格式
     ///
     /// # Returns
     /// - `Ok(true)` - 成功写入文件
-    /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
+    /// - `Ok(false)` - 跳过写入（无路径配置）
     /// - `Err(_)` - 写入失败
     fn persist_credentials(&self) -> anyhow::Result<bool> {
         use anyhow::Context;
-
-        // 仅多凭据格式才回写
-        if !self.is_multiple_format {
-            return Ok(false);
-        }
 
         let path = match &self.credentials_path {
             Some(p) => p,
@@ -958,13 +978,23 @@ impl MultiTokenManager {
         };
 
         // 收集所有凭据
-        let credentials: Vec<KiroCredentials> = {
+        let mut credentials: Vec<KiroCredentials> = {
             let entries = self.entries.lock();
             entries.iter().map(|e| e.credentials.clone()).collect()
         };
 
+        // 稳定输出：按 priority、id 排序
+        credentials.sort_by_key(|c| (c.priority, c.id.unwrap_or(u64::MAX)));
+
         // 序列化为 pretty JSON
-        let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
+        let json = if self.is_multiple_format || credentials.len() != 1 {
+            serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?
+        } else {
+            let only = credentials
+                .get(0)
+                .ok_or_else(|| anyhow::anyhow!("序列化凭据失败：凭据数量异常"))?;
+            serde_json::to_string_pretty(only).context("序列化凭据失败")?
+        };
 
         // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
         if tokio::runtime::Handle::try_current().is_ok() {
@@ -1110,6 +1140,52 @@ impl MultiTokenManager {
             total: entries.len(),
             available,
         }
+    }
+
+    /// 删除指定凭据（Admin API）
+    ///
+    /// 删除后会：
+    /// - 从内存 entries 移除
+    /// - 如果当前凭据被删除或当前凭据不可用，则选择一个可用凭据作为新的 current_id（否则为 0）
+    /// - 回写到凭据文件（credentials_path 必须已配置）
+    pub fn remove_credential(&self, id: u64) -> anyhow::Result<()> {
+        if id == 0 {
+            anyhow::bail!("无效的凭据 ID: 0");
+        }
+
+        {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let idx = entries
+                .iter()
+                .position(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            entries.remove(idx);
+
+            // 如果 current_id 指向被删除/不存在/已禁用，则重新选择一个可用凭据
+            let current_exists_and_enabled = entries
+                .iter()
+                .any(|e| e.id == *current_id && !e.disabled);
+
+            if !current_exists_and_enabled {
+                *current_id = entries
+                    .iter()
+                    .filter(|e| !e.disabled)
+                    .min_by_key(|e| e.credentials.priority)
+                    .map(|e| e.id)
+                    .unwrap_or(0);
+            }
+        }
+
+        // 必须持久化（否则“删除”会在重启后回滚）
+        let wrote = self.persist_credentials()?;
+        if !wrote {
+            anyhow::bail!("凭据文件路径未配置，无法持久化删除操作");
+        }
+
+        Ok(())
     }
 
     /// 设置凭据禁用状态（Admin API）

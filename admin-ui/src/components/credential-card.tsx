@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, BarChart3, Trash2 } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, BarChart3, Trash2, Trash } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -8,6 +8,7 @@ import { Switch } from '@/components/ui/switch'
 import { Input } from '@/components/ui/input'
 import type { CredentialStatusItem } from '@/types/api'
 import {
+  useDeleteCredential,
   useSetDisabled,
   useSetPriority,
   useResetFailure,
@@ -26,6 +27,7 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [statsDialogOpen, setStatsDialogOpen] = useState(false)
 
+  const deleteCredential = useDeleteCredential()
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const resetFailure = useResetFailure()
@@ -256,6 +258,28 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
           >
             <BarChart3 className="h-4 w-4 mr-1" />
             统计详情
+          </Button>
+          <Button
+            size="sm"
+            variant="destructive"
+            onClick={() => {
+              const extra = credential.isCurrent
+                ? '（这是当前凭据，删除后会自动切换到其他可用凭据；如果没有可用凭据，将变为无凭据状态）'
+                : ''
+              const ok = window.confirm(
+                `确定删除凭据 #${credential.id} 吗？此操作不可恢复，且会从凭据文件中移除。${extra}`
+              )
+              if (!ok) return
+
+              deleteCredential.mutate(credential.id, {
+                onSuccess: (res) => toast.success(res.message),
+                onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+              })
+            }}
+            disabled={deleteCredential.isPending}
+          >
+            <Trash className="h-4 w-4 mr-1" />
+            删除凭据
           </Button>
           <Button
             size="sm"

@@ -127,6 +127,18 @@ pub async fn reset_all_stats(State(state): State<AdminState>) -> impl IntoRespon
     }
 }
 
+/// DELETE /api/admin/credentials/:id
+/// 删除指定凭据（并持久化到凭据文件）
+pub async fn delete_credential(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.delete_credential(id).await {
+        Ok(msg) => Json(SuccessResponse::new(msg)).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials
 /// 添加新凭据
 pub async fn add_credential(

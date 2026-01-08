@@ -152,6 +152,67 @@ export interface AccountSubscriptionDetails {
   overageCapability: string | null
 }
 
+export interface ResourceUsageSummary {
+  resourceType: string | null
+  displayName: string | null
+  unit: string | null
+  currency: string | null
+  current: number
+  limit: number
+}
+
+export interface UsageAndLimitsResponse {
+  userInfo: { email: string | null; userId: string | null } | null
+  subscriptionInfo:
+    | {
+        type: string | null
+        subscriptionTitle: string | null
+        upgradeCapability: string | null
+        overageCapability: string | null
+        subscriptionManagementTarget: string | null
+      }
+    | null
+  usageBreakdownList:
+    | Array<{
+        resourceType: string | null
+        currentUsage: number | null
+        currentUsageWithPrecision: number | null
+        usageLimit: number | null
+        usageLimitWithPrecision: number | null
+        displayName: string | null
+        displayNamePlural: string | null
+        currency: string | null
+        unit: string | null
+        overageRate: number | null
+        overageCap: number | null
+        freeTrialInfo:
+          | {
+              usageLimit: number | null
+              usageLimitWithPrecision: number | null
+              currentUsage: number | null
+              currentUsageWithPrecision: number | null
+              freeTrialExpiry: string | null
+              freeTrialStatus: string | null
+            }
+          | null
+        bonuses:
+          | Array<{
+              bonusCode: string | null
+              displayName: string | null
+              usageLimit: number | null
+              usageLimitWithPrecision: number | null
+              currentUsage: number | null
+              currentUsageWithPrecision: number | null
+              status: string | null
+              expiresAt: string | null
+            }>
+          | null
+      }>
+    | null
+  nextDateReset: string | null
+  overageConfiguration: { overageEnabled: boolean | null } | null
+}
+
 export interface AccountAggregateInfo {
   email: string | null
   userId: string | null
@@ -162,6 +223,8 @@ export interface AccountAggregateInfo {
   subscriptionType: string
   subscription: AccountSubscriptionDetails
   usage: CreditsUsageSummary
+  resources: ResourceUsageSummary[]
+  rawUsage: UsageAndLimitsResponse
 }
 
 export interface CredentialAccountInfoResponse {
