@@ -316,6 +316,50 @@ impl KiroProvider {
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
+            // 429 Too Many Requests - 限流：不计入凭据失败，不切换凭据；按 Retry-After/退避重试
+            if status.as_u16() == 429 {
+                let retry_after_secs = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok());
+
+                let body = response.text().await.unwrap_or_default();
+                let api_type = if is_stream { "流式" } else { "非流式" };
+
+                if let Some(stats) = &self.stats {
+                    stats.record_error(
+                        ctx.id,
+                        model,
+                        truncate_error(format!("{} API 请求失败: {} {}", api_type, status, body)),
+                    );
+                }
+
+                let backoff_secs = retry_after_secs.unwrap_or_else(|| {
+                    // 退避：1,2,4,8... 秒，最多 30 秒
+                    let exp = 1u64.checked_shl(attempt as u32).unwrap_or(u64::MAX);
+                    exp.min(30).max(1)
+                });
+
+                tracing::warn!(
+                    "触发限流 429（尝试 {}/{}，credential_id={}），{} 秒后重试同一凭据",
+                    attempt + 1,
+                    max_retries,
+                    ctx.id,
+                    backoff_secs
+                );
+
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    truncate_error(body)
+                ));
+
+                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                continue;
+            }
+
             // 其他错误 - 记录失败并可能重试（使用绑定的 id）
             let body = response.text().await.unwrap_or_default();
             tracing::warn!(
