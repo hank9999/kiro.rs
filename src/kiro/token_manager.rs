@@ -373,6 +373,17 @@ struct CredentialEntry {
     failure_count: u32,
     /// 是否已禁用
     disabled: bool,
+    /// 禁用原因（用于区分手动禁用 vs 自动禁用，便于自愈）
+    disabled_reason: Option<DisabledReason>,
+}
+
+/// 禁用原因
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisabledReason {
+    /// Admin API 手动禁用
+    Manual,
+    /// 连续失败达到阈值后自动禁用
+    TooManyFailures,
 }
 
 // ============================================================================
@@ -485,6 +496,7 @@ impl MultiTokenManager {
                     credentials: cred,
                     failure_count: 0,
                     disabled: false,
+                    disabled_reason: None,
                 }
             })
             .collect();
@@ -577,7 +589,7 @@ impl MultiTokenManager {
             }
 
             let (id, credentials) = {
-                let entries = self.entries.lock();
+                let mut entries = self.entries.lock();
                 let current_id = *self.current_id.lock();
 
                 // 找到当前凭据
@@ -585,11 +597,34 @@ impl MultiTokenManager {
                     (entry.id, entry.credentials.clone())
                 } else {
                     // 当前凭据不可用，选择优先级最高的可用凭据
-                    if let Some(entry) = entries
+                    let mut best = entries
                         .iter()
                         .filter(|e| !e.disabled)
-                        .min_by_key(|e| e.credentials.priority)
+                        .min_by_key(|e| e.credentials.priority);
+
+                    // 没有可用凭据：如果是“自动禁用导致全灭”，做一次类似重启的自愈
+                    if best.is_none()
+                        && entries.iter().any(|e| {
+                            e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
+                        })
                     {
+                        tracing::warn!(
+                            "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
+                        );
+                        for e in entries.iter_mut() {
+                            if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
+                                e.disabled = false;
+                                e.disabled_reason = None;
+                                e.failure_count = 0;
+                            }
+                        }
+                        best = entries
+                            .iter()
+                            .filter(|e| !e.disabled)
+                            .min_by_key(|e| e.credentials.priority);
+                    }
+
+                    if let Some(entry) = best {
                         // 先提取数据
                         let new_id = entry.id;
                         let new_creds = entry.credentials.clone();
@@ -829,6 +864,7 @@ impl MultiTokenManager {
 
         if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
             entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::TooManyFailures);
             tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
 
             // 切换到优先级最高的可用凭据
@@ -932,6 +968,9 @@ impl MultiTokenManager {
             if !disabled {
                 // 启用时重置失败计数
                 entry.failure_count = 0;
+                entry.disabled_reason = None;
+            } else {
+                entry.disabled_reason = Some(DisabledReason::Manual);
             }
         }
         // 持久化更改
@@ -969,6 +1008,7 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             entry.failure_count = 0;
             entry.disabled = false;
+            entry.disabled_reason = None;
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -1079,6 +1119,7 @@ impl MultiTokenManager {
                 credentials: validated_cred,
                 failure_count: 0,
                 disabled: false,
+                disabled_reason: None,
             });
         }
 
@@ -1276,5 +1317,34 @@ mod tests {
             manager.credentials().refresh_token,
             Some("token2".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_multi_token_manager_acquire_context_auto_recovers_all_disabled() {
+        let config = Config::default();
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        // 凭据会自动分配 ID（从 1 开始）
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(2);
+        }
+
+        assert_eq!(manager.available_count(), 0);
+
+        // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
+        let ctx = manager.acquire_context().await.unwrap();
+        assert!(ctx.token == "t1" || ctx.token == "t2");
+        assert_eq!(manager.available_count(), 2);
     }
 }
