@@ -7,9 +7,9 @@
 //! - 西文字符：每个计 1 个字符单位
 //! - 4 个字符单位 = 1 token（四舍五入）
 
-use std::sync::OnceLock;
 use crate::anthropic::types::{CountTokensRequest, CountTokensResponse, Message, SystemMessage};
 use crate::http_client::{build_client, ProxyConfig};
+use std::sync::OnceLock;
 
 /// Count Tokens API 配置
 #[derive(Clone, Default)]
@@ -39,7 +39,6 @@ fn get_config() -> Option<&'static CountTokensConfig> {
     COUNT_TOKENS_CONFIG.get()
 }
 
-
 /// 判断字符是否为非西文字符
 ///
 /// 西文字符包括：
@@ -64,7 +63,6 @@ fn is_non_western_char(c: char) -> bool {
         '\u{AB30}'..='\u{AB6F}'
     )
 }
-
 
 /// 计算文本的 token 数量
 ///
@@ -99,19 +97,24 @@ pub fn count_tokens(text: &str) -> u64 {
     acc_token
 }
 
-
 /// 估算请求的输入 tokens
 ///
 /// 优先调用远程 API，失败时回退到本地计算
-pub(crate) fn count_all_tokens(model: String, system: Option<Vec<SystemMessage>>, messages: Vec<Message>, tools: Option<Vec<serde_json::Value>>) -> u64 {
+/// tools 使用 serde_json::Value 以兼容多种工具格式（普通 Tool 和 WebSearchTool 等）
+pub(crate) fn count_all_tokens(
+    model: String,
+    system: Option<Vec<SystemMessage>>,
+    messages: Vec<Message>,
+    tools: Option<Vec<serde_json::Value>>,
+) -> u64 {
     // 检查是否配置了远程 API
     if let Some(config) = get_config() {
         if let Some(api_url) = &config.api_url {
             // 尝试调用远程 API
             let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(
-                    call_remote_count_tokens(api_url, config, model, &system, &messages, &tools)
-                )
+                tokio::runtime::Handle::current().block_on(call_remote_count_tokens(
+                    api_url, config, model, &system, &messages, &tools,
+                ))
             });
 
             match result {
@@ -177,7 +180,12 @@ async fn call_remote_count_tokens(
 }
 
 /// 本地计算请求的输入 tokens
-fn count_all_tokens_local(system: Option<Vec<SystemMessage>>, messages: Vec<Message>, tools: Option<Vec<serde_json::Value>>) -> u64 {
+/// tools 使用 serde_json::Value 以兼容多种工具格式
+fn count_all_tokens_local(
+    system: Option<Vec<SystemMessage>>,
+    messages: Vec<Message>,
+    tools: Option<Vec<serde_json::Value>>,
+) -> u64 {
     let mut total = 0;
 
     // 系统消息
@@ -219,7 +227,6 @@ fn count_all_tokens_local(system: Option<Vec<SystemMessage>>, messages: Vec<Mess
     total.max(1)
 }
 
-
 /// 估算输出 tokens
 pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
     let mut total = 0;
@@ -239,4 +246,3 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
 
     total.max(1)
 }
-

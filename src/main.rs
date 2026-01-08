@@ -13,8 +13,8 @@ use clap::Parser;
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
-use model::config::Config;
 use model::arg::Args;
+use model::config::Config;
 
 #[tokio::main]
 async fn main() {
@@ -30,14 +30,18 @@ async fn main() {
         .init();
 
     // 加载配置
-    let config_path = args.config.unwrap_or_else(|| Config::default_config_path().to_string());
+    let config_path = args
+        .config
+        .unwrap_or_else(|| Config::default_config_path().to_string());
     let config = Config::load(&config_path).unwrap_or_else(|e| {
         tracing::error!("加载配置失败: {}", e);
         std::process::exit(1);
     });
 
     // 加载凭证（支持单对象或数组格式）
-    let credentials_path = args.credentials.unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
+    let credentials_path = args
+        .credentials
+        .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
     let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
         tracing::error!("加载凭证失败: {}", e);
         std::process::exit(1);

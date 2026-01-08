@@ -1,14 +1,14 @@
 //! Admin API HTTP 处理器
 
 use axum::{
+    Json,
     extract::{Path, State},
     response::IntoResponse,
-    Json,
 };
 
 use super::{
     middleware::AdminState,
-    types::{SetDisabledRequest, SetPriorityRequest, SuccessResponse},
+    types::{AddCredentialRequest, SetDisabledRequest, SetPriorityRequest, SuccessResponse},
 };
 
 /// GET /api/admin/credentials
@@ -74,6 +74,18 @@ pub async fn get_credential_balance(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.get_balance(id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials
+/// 添加新凭据
+pub async fn add_credential(
+    State(state): State<AdminState>,
+    Json(payload): Json<AddCredentialRequest>,
+) -> impl IntoResponse {
+    match state.service.add_credential(payload).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

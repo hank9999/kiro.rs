@@ -81,7 +81,10 @@ impl ToolResult {
     /// 创建成功的工具结果
     pub fn success(tool_use_id: impl Into<String>, content: impl Into<String>) -> Self {
         let mut map = serde_json::Map::new();
-        map.insert("text".to_string(), serde_json::Value::String(content.into()));
+        map.insert(
+            "text".to_string(),
+            serde_json::Value::String(content.into()),
+        );
 
         Self {
             tool_use_id: tool_use_id.into(),

@@ -6,6 +6,8 @@ import type {
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
+  AddCredentialRequest,
+  AddCredentialResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -66,5 +68,13 @@ export async function resetCredentialFailure(
 // 获取凭据余额
 export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
   const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
+  return data
+}
+
+// 添加新凭据
+export async function addCredential(
+  req: AddCredentialRequest
+): Promise<AddCredentialResponse> {
+  const { data } = await api.post<AddCredentialResponse>('/credentials', req)
   return data
 }

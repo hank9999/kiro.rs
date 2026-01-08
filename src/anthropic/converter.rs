@@ -8,7 +8,9 @@ use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
     HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
 };
-use crate::kiro::model::requests::tool::{InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry};
+use crate::kiro::model::requests::tool::{
+    InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
+};
 
 use super::types::{ContentBlock, MessagesRequest, Thinking};
 
@@ -36,14 +38,14 @@ pub fn map_model(model: &str) -> Option<String> {
 #[derive(Debug)]
 pub struct ConversionResult {
     /// 转换后的 Kiro 请求
-    pub conversation_state: ConversationState
+    pub conversation_state: ConversationState,
 }
 
 /// 转换错误
 #[derive(Debug)]
 pub enum ConversionError {
     UnsupportedModel(String),
-    EmptyMessages
+    EmptyMessages,
 }
 
 impl std::fmt::Display for ConversionError {
@@ -57,6 +59,64 @@ impl std::fmt::Display for ConversionError {
 
 impl std::error::Error for ConversionError {}
 
+/// 从 metadata.user_id 中提取 session UUID
+///
+/// user_id 格式: user_xxx_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705
+/// 提取 session_ 后面的 UUID 作为 conversationId
+fn extract_session_id(user_id: &str) -> Option<String> {
+    // 查找 "session_" 后面的内容
+    if let Some(pos) = user_id.find("session_") {
+        let session_part = &user_id[pos + 8..]; // "session_" 长度为 8
+        // session_part 应该是 UUID 格式: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+        // 验证是否是有效的 UUID 格式（36 字符，包含 4 个连字符）
+        if session_part.len() >= 36 {
+            let uuid_str = &session_part[..36];
+            // 简单验证 UUID 格式
+            if uuid_str.chars().filter(|c| *c == '-').count() == 4 {
+                return Some(uuid_str.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 收集历史消息中使用的所有工具名称
+fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
+    let mut tool_names = Vec::new();
+
+    for msg in history {
+        if let Message::Assistant(assistant_msg) = msg {
+            if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
+                for tool_use in tool_uses {
+                    if !tool_names.contains(&tool_use.name) {
+                        tool_names.push(tool_use.name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    tool_names
+}
+
+/// 为历史中使用但不在 tools 列表中的工具创建占位符定义
+/// Kiro API 要求：历史消息中引用的工具必须在 currentMessage.tools 中有定义
+fn create_placeholder_tool(name: &str) -> Tool {
+    Tool {
+        tool_specification: ToolSpecification {
+            name: name.to_string(),
+            description: "Tool used in conversation history".to_string(),
+            input_schema: InputSchema::from_json(serde_json::json!({
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": true
+            })),
+        },
+    }
+}
+
 /// 将 Anthropic 请求转换为 Kiro 请求
 pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
@@ -69,7 +129,13 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     }
 
     // 3. 生成会话 ID 和代理 ID
-    let conversation_id = Uuid::new_v4().to_string();
+    // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
+    let conversation_id = req
+        .metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_ref())
+        .and_then(|user_id| extract_session_id(user_id))
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let agent_continuation_id = Uuid::new_v4().to_string();
 
     // 4. 确定触发类型
@@ -80,9 +146,27 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
 
     // 6. 转换工具定义
-    let tools = convert_tools(&req.tools);
+    let mut tools = convert_tools(&req.tools);
 
-    // 7. 构建 UserInputMessageContext
+    // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
+    let history = build_history(req, &model_id)?;
+
+    // 8. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
+    // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
+    // 注意：Kiro 匹配工具名称时忽略大小写，所以这里也需要忽略大小写比较
+    let history_tool_names = collect_history_tool_names(&history);
+    let existing_tool_names: std::collections::HashSet<_> = tools
+        .iter()
+        .map(|t| t.tool_specification.name.to_lowercase())
+        .collect();
+
+    for tool_name in history_tool_names {
+        if !existing_tool_names.contains(&tool_name.to_lowercase()) {
+            tools.push(create_placeholder_tool(&tool_name));
+        }
+    }
+
+    // 9. 构建 UserInputMessageContext
     let mut context = UserInputMessageContext::new();
     if !tools.is_empty() {
         context = context.with_tools(tools);
@@ -91,7 +175,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         context = context.with_tool_results(tool_results.clone());
     }
 
-    // 8. 构建当前消息
+    // 10. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
     let content = text_content;
 
@@ -105,10 +189,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     let current_message = CurrentMessage::new(user_input);
 
-    // 9. 构建历史消息
-    let history = build_history(req, &model_id)?;
-
-    // 10. 构建 ConversationState
+    // 11. 构建 ConversationState
     let conversation_state = ConversationState::new(conversation_id)
         .with_agent_continuation_id(agent_continuation_id)
         .with_agent_task_type("vibe")
@@ -116,9 +197,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .with_current_message(current_message)
         .with_history(history);
 
-    Ok(ConversionResult {
-        conversation_state
-    })
+    Ok(ConversionResult { conversation_state })
 }
 
 /// 确定聊天触发类型
@@ -137,7 +216,7 @@ fn determine_chat_trigger_type(req: &MessagesRequest) -> String {
 
 /// 处理消息内容，提取文本、图片和工具结果
 fn process_message_content(
-    content: &serde_json::Value
+    content: &serde_json::Value,
 ) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
@@ -173,7 +252,8 @@ fn process_message_content(
                                 } else {
                                     ToolResult::success(&tool_use_id, result_content)
                                 };
-                                result.status = Some(if is_error { "error" } else { "success" }.to_string());
+                                result.status =
+                                    Some(if is_error { "error" } else { "success" }.to_string());
 
                                 tool_results.push(result);
                             }
@@ -301,10 +381,7 @@ fn has_thinking_tags(content: &str) -> bool {
 }
 
 /// 构建历史消息
-fn build_history(
-    req: &MessagesRequest,
-    model_id: &str,
-) -> Result<Vec<Message>, ConversionError> {
+fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -486,7 +563,10 @@ fn convert_assistant_message(
     // 格式: <thinking>思考内容</thinking>\n\ntext内容
     let final_content = if !thinking_content.is_empty() {
         if !text_content.is_empty() {
-            format!("<thinking>{}</thinking>\n\n{}", thinking_content, text_content)
+            format!(
+                "<thinking>{}</thinking>\n\n{}",
+                thinking_content, text_content
+            )
         } else {
             format!("<thinking>{}</thinking>", thinking_content)
         }
@@ -510,18 +590,34 @@ mod tests {
 
     #[test]
     fn test_map_model_sonnet() {
-        assert!(map_model("claude-sonnet-4-20250514").unwrap().contains("sonnet"));
-        assert!(map_model("claude-3-5-sonnet-20241022").unwrap().contains("sonnet"));
+        assert!(
+            map_model("claude-sonnet-4-20250514")
+                .unwrap()
+                .contains("sonnet")
+        );
+        assert!(
+            map_model("claude-3-5-sonnet-20241022")
+                .unwrap()
+                .contains("sonnet")
+        );
     }
 
     #[test]
     fn test_map_model_opus() {
-        assert!(map_model("claude-opus-4-20250514").unwrap().contains("opus"));
+        assert!(
+            map_model("claude-opus-4-20250514")
+                .unwrap()
+                .contains("opus")
+        );
     }
 
     #[test]
     fn test_map_model_haiku() {
-        assert!(map_model("claude-haiku-4-20250514").unwrap().contains("haiku"));
+        assert!(
+            map_model("claude-haiku-4-20250514")
+                .unwrap()
+                .contains("haiku")
+        );
     }
 
     #[test]
@@ -541,6 +637,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
+            metadata: None,
         };
         assert_eq!(determine_chat_trigger_type(&req), "MANUAL");
     }
@@ -625,5 +722,190 @@ mod tests {
         let tools = Some(vec![]);
         let result = convert_tools(&tools);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_collect_history_tool_names() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        // 创建包含工具使用的历史消息
+        let mut assistant_msg = AssistantMessage::new("I'll read the file.");
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("tool-1", "read")
+                .with_input(serde_json::json!({"path": "/test.txt"})),
+            ToolUseEntry::new("tool-2", "write")
+                .with_input(serde_json::json!({"path": "/out.txt"})),
+        ]);
+
+        let history = vec![
+            Message::User(HistoryUserMessage::new(
+                "Read the file",
+                "claude-sonnet-4.5",
+            )),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: assistant_msg,
+            }),
+        ];
+
+        let tool_names = collect_history_tool_names(&history);
+        assert_eq!(tool_names.len(), 2);
+        assert!(tool_names.contains(&"read".to_string()));
+        assert!(tool_names.contains(&"write".to_string()));
+    }
+
+    #[test]
+    fn test_create_placeholder_tool() {
+        let tool = create_placeholder_tool("my_custom_tool");
+
+        assert_eq!(tool.tool_specification.name, "my_custom_tool");
+        assert!(!tool.tool_specification.description.is_empty());
+
+        // 验证 JSON 序列化正确
+        let json = serde_json::to_string(&tool).unwrap();
+        assert!(json.contains("\"name\":\"my_custom_tool\""));
+    }
+
+    #[test]
+    fn test_history_tools_added_to_tools_list() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 创建一个请求，历史中有工具使用，但 tools 列表为空
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Read the file"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "I'll read the file."},
+                        {"type": "tool_use", "id": "tool-1", "name": "read", "input": {"path": "/test.txt"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "file content"}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None, // 没有提供工具定义
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+
+        // 验证 tools 列表中包含了历史中使用的工具的占位符定义
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+
+        assert!(!tools.is_empty(), "tools 列表不应为空");
+        assert!(
+            tools.iter().any(|t| t.tool_specification.name == "read"),
+            "tools 列表应包含 'read' 工具的占位符定义"
+        );
+    }
+
+    #[test]
+    fn test_extract_session_id_valid() {
+        // 测试有效的 user_id 格式
+        let user_id = "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd_account__session_8bb5523b-ec7c-4540-a9ca-beb6d79f1552";
+        let session_id = extract_session_id(user_id);
+        assert_eq!(
+            session_id,
+            Some("8bb5523b-ec7c-4540-a9ca-beb6d79f1552".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_session_id_no_session() {
+        // 测试没有 session 的 user_id
+        let user_id = "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd";
+        let session_id = extract_session_id(user_id);
+        assert_eq!(session_id, None);
+    }
+
+    #[test]
+    fn test_extract_session_id_invalid_uuid() {
+        // 测试无效的 UUID 格式
+        let user_id = "user_xxx_session_invalid-uuid";
+        let session_id = extract_session_id(user_id);
+        assert_eq!(session_id, None);
+    }
+
+    #[test]
+    fn test_convert_request_with_session_metadata() {
+        use super::super::types::{Message as AnthropicMessage, Metadata};
+
+        // 测试带有 metadata 的请求，应该使用 session UUID 作为 conversationId
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: Some(Metadata {
+                user_id: Some(
+                    "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd_account__session_a0662283-7fd3-4399-a7eb-52b9a717ae88".to_string(),
+                ),
+            }),
+        };
+
+        let result = convert_request(&req).unwrap();
+        assert_eq!(
+            result.conversation_state.conversation_id,
+            "a0662283-7fd3-4399-a7eb-52b9a717ae88"
+        );
+    }
+
+    #[test]
+    fn test_convert_request_without_metadata() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 测试没有 metadata 的请求，应该生成新的 UUID
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        // 验证生成的是有效的 UUID 格式
+        assert_eq!(result.conversation_state.conversation_id.len(), 36);
+        assert_eq!(
+            result
+                .conversation_state
+                .conversation_id
+                .chars()
+                .filter(|c| *c == '-')
+                .count(),
+            4
+        );
     }
 }

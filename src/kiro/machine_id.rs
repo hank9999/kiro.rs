@@ -8,19 +8,12 @@ use crate::model::config::Config;
 
 /// 根据凭证信息生成唯一的 Machine ID
 ///
-/// 优先使用自定义配置，然后使用 profileArn 生成，否则使用 refreshToken 生成
+/// 优先使用自定义配置，然后使用 refreshToken 生成
 pub fn generate_from_credentials(credentials: &KiroCredentials, config: &Config) -> Option<String> {
     // 如果配置了自定义 machineId 且长度为 64，优先使用
     if let Some(ref machine_id) = config.machine_id {
         if machine_id.len() == 64 {
             return Some(machine_id.clone());
-        }
-    }
-
-    // 如果有有效的 profileArn 则使用 profileArn 固定指纹
-    if let Some(ref profile_arn) = credentials.profile_arn {
-        if is_valid_profile_arn(profile_arn) {
-            return Some(sha256_hex(&format!("KotlinNativeAPI/{}", profile_arn)));
         }
     }
 
@@ -33,13 +26,6 @@ pub fn generate_from_credentials(credentials: &KiroCredentials, config: &Config)
 
     // 没有有效的凭证
     None
-}
-
-/// 验证 profileArn 是否有效
-fn is_valid_profile_arn(profile_arn: &str) -> bool {
-    !profile_arn.is_empty()
-        && profile_arn.starts_with("arn:aws")
-        && profile_arn.contains("profile/")
 }
 
 /// SHA256 哈希实现（返回十六进制字符串）
@@ -65,14 +51,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_valid_profile_arn() {
-        assert!(is_valid_profile_arn("arn:aws:sso::123456789:profile/test"));
-        assert!(!is_valid_profile_arn("invalid"));
-        assert!(!is_valid_profile_arn("arn:aws:sso::123456789"));
-        assert!(!is_valid_profile_arn(""));
-    }
-
-    #[test]
     fn test_generate_with_custom_machine_id() {
         let credentials = KiroCredentials::default();
         let mut config = Config::default();
@@ -80,17 +58,6 @@ mod tests {
 
         let result = generate_from_credentials(&credentials, &config);
         assert_eq!(result, Some("a".repeat(64)));
-    }
-
-    #[test]
-    fn test_generate_with_profile_arn() {
-        let mut credentials = KiroCredentials::default();
-        credentials.profile_arn = Some("arn:aws:sso::123456789:profile/test".to_string());
-        let config = Config::default();
-
-        let result = generate_from_credentials(&credentials, &config);
-        assert!(result.is_some());
-        assert_eq!(result.as_ref().unwrap().len(), 64);
     }
 
     #[test]

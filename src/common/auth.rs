@@ -2,7 +2,7 @@
 
 use axum::{
     body::Body,
-    http::{header, Request},
+    http::{Request, header},
 };
 use subtle::ConstantTimeEq;
 

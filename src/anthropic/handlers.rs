@@ -2,25 +2,25 @@
 
 use std::convert::Infallible;
 
+use crate::kiro::model::events::Event;
+use crate::kiro::model::requests::kiro::KiroRequest;
+use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::token;
 use axum::{
+    Json as JsonExtractor,
     body::Body,
     extract::State,
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{IntoResponse, Json, Response},
-    Json as JsonExtractor,
 };
 use bytes::Bytes;
-use futures::{stream, Stream, StreamExt};
+use futures::{Stream, StreamExt, stream};
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
-use crate::token;
-use crate::kiro::model::events::Event;
-use crate::kiro::model::requests::kiro::KiroRequest;
-use crate::kiro::parser::decoder::EventStreamDecoder;
 
-use super::converter::{convert_request, ConversionError};
+use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{SseEvent, StreamContext};
 use super::types::{
@@ -144,17 +144,30 @@ pub async fn post_messages(
     tracing::debug!("Kiro request body: {}", request_body);
 
     // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(payload.model.clone(), payload.system, payload.messages, payload.tools) as i32;
+    let input_tokens = token::count_all_tokens(
+        payload.model.clone(),
+        payload.system,
+        payload.messages,
+        payload.tools,
+    ) as i32;
 
     // 检查是否启用了thinking
-    let thinking_enabled = payload.thinking
+    let thinking_enabled = payload
+        .thinking
         .as_ref()
         .map(|t| t.thinking_type == "enabled")
         .unwrap_or(false);
 
     if payload.stream {
         // 流式响应
-        handle_stream_request(provider, &request_body, &payload.model, input_tokens, thinking_enabled).await
+        handle_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            thinking_enabled,
+        )
+        .await
     } else {
         // 非流式响应
         handle_non_stream_request(provider, &request_body, &payload.model, input_tokens).await
@@ -360,7 +373,8 @@ async fn handle_non_stream_request(
     let mut context_input_tokens: Option<i32> = None;
 
     // 收集工具调用的增量 JSON
-    let mut tool_json_buffers: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut tool_json_buffers: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     for result in decoder.decode_iter() {
         match result {
@@ -401,7 +415,10 @@ async fn handle_non_stream_request(
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
                             // 公式: percentage * 200000 / 100 = percentage * 2000
-                            let actual_input_tokens = (context_usage.context_usage_percentage * (CONTEXT_WINDOW_SIZE as f64) / 100.0) as i32;
+                            let actual_input_tokens = (context_usage.context_usage_percentage
+                                * (CONTEXT_WINDOW_SIZE as f64)
+                                / 100.0)
+                                as i32;
                             context_input_tokens = Some(actual_input_tokens);
                             tracing::debug!(
                                 "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
@@ -465,19 +482,24 @@ async fn handle_non_stream_request(
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
-
-
 /// POST /v1/messages/count_tokens
 ///
 /// 计算消息的 token 数量
-pub async fn count_tokens(JsonExtractor(payload): JsonExtractor<CountTokensRequest>) -> impl IntoResponse {
+pub async fn count_tokens(
+    JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
+) -> impl IntoResponse {
     tracing::info!(
         model = %payload.model,
         message_count = %payload.messages.len(),
         "Received POST /v1/messages/count_tokens request"
     );
 
-    let total_tokens = token::count_all_tokens(payload.model, payload.system, payload.messages, payload.tools) as i32;
+    let total_tokens = token::count_all_tokens(
+        payload.model,
+        payload.system,
+        payload.messages,
+        payload.tools,
+    ) as i32;
 
     Json(CountTokensResponse {
         input_tokens: total_tokens.max(1) as i32,

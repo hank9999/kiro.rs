@@ -18,7 +18,7 @@
 
 use super::crc::crc32;
 use super::error::{ParseError, ParseResult};
-use super::header::{parse_headers, Headers};
+use super::header::{Headers, parse_headers};
 
 /// Prelude 固定大小 (12 字节)
 pub const PRELUDE_SIZE: usize = 12;

@@ -188,9 +188,7 @@ impl KiroImage {
     pub fn from_base64(format: impl Into<String>, data: impl Into<String>) -> Self {
         Self {
             format: format.into(),
-            source: KiroImageSource {
-                bytes: data.into(),
-            },
+            source: KiroImageSource { bytes: data.into() },
         }
     }
 }
@@ -369,7 +367,6 @@ mod tests {
         assert_eq!(msg.model_id, "claude-3-5-sonnet");
         assert_eq!(msg.origin, Some("AI_EDITOR".to_string()));
     }
-
 
     #[test]
     fn test_message_enum() {

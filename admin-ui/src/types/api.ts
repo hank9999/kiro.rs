@@ -51,3 +51,19 @@ export interface SetDisabledRequest {
 export interface SetPriorityRequest {
   priority: number
 }
+
+// 添加凭据请求
+export interface AddCredentialRequest {
+  refreshToken: string
+  authMethod?: 'social' | 'idc' | 'builder-id'
+  clientId?: string
+  clientSecret?: string
+  priority?: number
+}
+
+// 添加凭据响应
+export interface AddCredentialResponse {
+  success: boolean
+  message: string
+  credentialId: number
+}

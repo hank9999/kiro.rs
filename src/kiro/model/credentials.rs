@@ -70,11 +70,25 @@ pub enum CredentialsConfig {
 
 impl CredentialsConfig {
     /// 从文件加载凭据配置
+    ///
+    /// - 如果文件不存在，返回空数组
+    /// - 如果文件内容为空，返回空数组
+    /// - 支持单对象或数组格式
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
-        let content = fs::read_to_string(path.as_ref())?;
-        if content.is_empty() {
-            anyhow::bail!("凭证文件为空: {:?}", path.as_ref());
+        let path = path.as_ref();
+
+        // 文件不存在时返回空数组
+        if !path.exists() {
+            return Ok(CredentialsConfig::Multiple(vec![]));
         }
+
+        let content = fs::read_to_string(path)?;
+
+        // 文件为空时返回空数组
+        if content.trim().is_empty() {
+            return Ok(CredentialsConfig::Multiple(vec![]));
+        }
+
         let config = serde_json::from_str(&content)?;
         Ok(config)
     }
@@ -114,7 +128,6 @@ impl CredentialsConfig {
 }
 
 impl KiroCredentials {
-
     /// 获取默认凭证文件路径
     pub fn default_credentials_path() -> &'static str {
         "credentials.json"
@@ -198,7 +211,10 @@ mod tests {
 
     #[test]
     fn test_default_credentials_path() {
-        assert_eq!(KiroCredentials::default_credentials_path(), "credentials.json");
+        assert_eq!(
+            KiroCredentials::default_credentials_path(),
+            "credentials.json"
+        );
     }
 
     #[test]

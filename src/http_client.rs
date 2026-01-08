@@ -49,8 +49,7 @@ pub fn build_client(proxy: Option<&ProxyConfig>, timeout_secs: u64) -> anyhow::R
         let mut proxy = Proxy::all(&proxy_config.url)?;
 
         // 设置代理认证
-        if let (Some(username), Some(password)) = (&proxy_config.username, &proxy_config.password)
-        {
+        if let (Some(username), Some(password)) = (&proxy_config.username, &proxy_config.password) {
             proxy = proxy.basic_auth(username, password);
         }
 

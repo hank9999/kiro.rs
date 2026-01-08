@@ -58,6 +58,42 @@ pub struct SetPriorityRequest {
     pub priority: u32,
 }
 
+/// 添加凭据请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddCredentialRequest {
+    /// 刷新令牌（必填）
+    pub refresh_token: String,
+
+    /// 认证方式（可选，默认 social）
+    #[serde(default = "default_auth_method")]
+    pub auth_method: String,
+
+    /// OIDC Client ID（IdC 认证需要）
+    pub client_id: Option<String>,
+
+    /// OIDC Client Secret（IdC 认证需要）
+    pub client_secret: Option<String>,
+
+    /// 优先级（可选，默认 0）
+    #[serde(default)]
+    pub priority: u32,
+}
+
+fn default_auth_method() -> String {
+    "social".to_string()
+}
+
+/// 添加凭据成功响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddCredentialResponse {
+    pub success: bool,
+    pub message: String,
+    /// 新添加的凭据 ID
+    pub credential_id: u64,
+}
+
 // ============ 余额查询 ============
 
 /// 余额查询响应

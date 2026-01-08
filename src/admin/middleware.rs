@@ -10,9 +10,9 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 
-use crate::common::auth;
 use super::service::AdminService;
 use super::types::AdminErrorResponse;
+use crate::common::auth;
 
 /// Admin API 共享状态
 #[derive(Clone)]

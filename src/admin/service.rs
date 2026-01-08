@@ -2,10 +2,14 @@
 
 use std::sync::Arc;
 
+use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
-use super::types::{BalanceResponse, CredentialStatusItem, CredentialsStatusResponse};
+use super::types::{
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
+    CredentialsStatusResponse,
+};
 
 /// Admin 服务
 ///
@@ -23,7 +27,7 @@ impl AdminService {
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
         let snapshot = self.token_manager.snapshot();
 
-        let credentials: Vec<CredentialStatusItem> = snapshot
+        let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
             .map(|entry| CredentialStatusItem {
@@ -37,6 +41,9 @@ impl AdminService {
                 has_profile_arn: entry.has_profile_arn,
             })
             .collect();
+
+        // 按优先级排序（数字越小优先级越高）
+        credentials.sort_by_key(|c| c.priority);
 
         CredentialsStatusResponse {
             total: snapshot.total,
@@ -105,12 +112,40 @@ impl AdminService {
         })
     }
 
-    /// 分类简单操作错误（set_disabled, set_priority, reset_and_enable）
-    fn classify_error(
+    /// 添加新凭据
+    pub async fn add_credential(
         &self,
-        e: anyhow::Error,
-        id: u64,
-    ) -> AdminServiceError {
+        req: AddCredentialRequest,
+    ) -> Result<AddCredentialResponse, AdminServiceError> {
+        // 构建凭据对象
+        let new_cred = KiroCredentials {
+            id: None,
+            access_token: None,
+            refresh_token: Some(req.refresh_token),
+            profile_arn: None,
+            expires_at: None,
+            auth_method: Some(req.auth_method),
+            client_id: req.client_id,
+            client_secret: req.client_secret,
+            priority: req.priority,
+        };
+
+        // 调用 token_manager 添加凭据
+        let credential_id = self
+            .token_manager
+            .add_credential(new_cred)
+            .await
+            .map_err(|e| self.classify_add_error(e))?;
+
+        Ok(AddCredentialResponse {
+            success: true,
+            message: format!("凭据添加成功，ID: {}", credential_id),
+            credential_id,
+        })
+    }
+
+    /// 分类简单操作错误（set_disabled, set_priority, reset_and_enable）
+    fn classify_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
@@ -120,11 +155,7 @@ impl AdminService {
     }
 
     /// 分类余额查询错误（可能涉及上游 API 调用）
-    fn classify_balance_error(
-        &self,
-        e: anyhow::Error,
-        id: u64,
-    ) -> AdminServiceError {
+    fn classify_balance_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
         let msg = e.to_string();
 
         // 1. 凭据不存在
@@ -152,6 +183,30 @@ impl AdminService {
         } else {
             // 3. 默认归类为内部错误（本地验证失败、配置错误等）
             // 包括：缺少 refreshToken、refreshToken 已被截断、无法生成 machineId 等
+            AdminServiceError::InternalError(msg)
+        }
+    }
+
+    /// 分类添加凭据错误
+    fn classify_add_error(&self, e: anyhow::Error) -> AdminServiceError {
+        let msg = e.to_string();
+
+        // 凭据验证失败（refreshToken 无效、格式错误等）
+        let is_invalid_credential = msg.contains("缺少 refreshToken")
+            || msg.contains("refreshToken 为空")
+            || msg.contains("refreshToken 已被截断")
+            || msg.contains("凭证已过期或无效")
+            || msg.contains("权限不足")
+            || msg.contains("已被限流");
+
+        if is_invalid_credential {
+            AdminServiceError::InvalidCredential(msg)
+        } else if msg.contains("error trying to connect")
+            || msg.contains("connection")
+            || msg.contains("timeout")
+        {
+            AdminServiceError::UpstreamError(msg)
+        } else {
             AdminServiceError::InternalError(msg)
         }
     }

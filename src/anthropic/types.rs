@@ -67,7 +67,10 @@ const MAX_BUDGET_TOKENS: i32 = 24576;
 pub struct Thinking {
     #[serde(rename = "type")]
     pub thinking_type: String,
-    #[serde(default = "default_budget_tokens", deserialize_with = "deserialize_budget_tokens")]
+    #[serde(
+        default = "default_budget_tokens",
+        deserialize_with = "deserialize_budget_tokens"
+    )]
     pub budget_tokens: i32,
 }
 
@@ -80,6 +83,13 @@ where
 {
     let value = i32::deserialize(deserializer)?;
     Ok(value.min(MAX_BUDGET_TOKENS))
+}
+
+/// Claude Code 请求中的 metadata
+#[derive(Debug, Clone, Deserialize)]
+pub struct Metadata {
+    /// 用户 ID，格式如: user_xxx_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705
+    pub user_id: Option<String>,
 }
 
 /// Messages 请求体
@@ -96,6 +106,8 @@ pub struct MessagesRequest {
     pub tools: Option<Vec<serde_json::Value>>,
     pub tool_choice: Option<serde_json::Value>,
     pub thinking: Option<Thinking>,
+    /// Claude Code 请求中的 metadata，包含 session 信息
+    pub metadata: Option<Metadata>,
 }
 
 fn default_max_tokens() -> i32 {

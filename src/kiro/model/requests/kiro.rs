@@ -56,6 +56,13 @@ mod tests {
 
         let request: KiroRequest = serde_json::from_str(json).unwrap();
         assert_eq!(request.conversation_state.conversation_id, "conv-456");
-        assert_eq!(request.conversation_state.current_message.user_input_message.content, "Test message");
+        assert_eq!(
+            request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "Test message"
+        );
     }
 }

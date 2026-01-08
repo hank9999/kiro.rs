@@ -49,7 +49,8 @@ cargo build --release
    "countTokensAuthType": "x-api-key",  // 可选, 用于自定义token统计API, 不需要请删除
    "proxyUrl": "http://127.0.0.1:7890", // 可选, HTTP/SOCK5代理, 不需要请删除
    "proxyUsername": "user",  // 可选, HTTP/SOCK5代理用户名, 不需要请删除
-   "proxyPassword": "pass"  // 可选, HTTP/SOCK5代理密码, 不需要请删除
+   "proxyPassword": "pass",  // 可选, HTTP/SOCK5代理密码, 不需要请删除
+   "adminApiKey": "sk-admin-your-secret-key"  // 可选, Admin API 密钥, 用于启用凭据管理 API, 不需要请删除
 }
 ```
 最小启动配置为: 
@@ -172,6 +173,7 @@ curl http://127.0.0.1:8990/v1/messages \
 | `proxyUrl` | string | - | HTTP/SOCKS5 代理地址（可选） |
 | `proxyUsername` | string | - | 代理用户名（可选） |
 | `proxyPassword` | string | - | 代理密码（可选） |
+| `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API（可选） |
 
 ### credentials.json
 
