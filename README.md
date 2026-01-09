@@ -24,6 +24,11 @@
 
 ## 快速开始
 
+> **前置步骤**：编译前需要先构建前端 Admin UI：
+> ```bash
+> cd admin-ui && npm install && npm run build
+> ```
+
 ### 1. 编译项目
 
 ```bash
