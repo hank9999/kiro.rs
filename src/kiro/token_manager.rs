@@ -1298,6 +1298,69 @@ impl MultiTokenManager {
         tracing::info!("成功添加凭据 #{}", new_id);
         Ok(new_id)
     }
+
+    /// 删除凭据（Admin API）
+    ///
+    /// # 前置条件
+    /// - 凭据必须已禁用（disabled = true）
+    ///
+    /// # 行为
+    /// 1. 验证凭据存在
+    /// 2. 验证凭据已禁用
+    /// 3. 从 entries 移除
+    /// 4. 如果删除的是当前凭据，切换到优先级最高的可用凭据
+    /// 5. 如果删除后没有凭据，将 current_id 重置为 0
+    /// 6. 持久化到文件
+    ///
+    /// # 返回
+    /// - `Ok(())` - 删除成功
+    /// - `Err(_)` - 凭据不存在、未禁用或持久化失败
+    pub fn delete_credential(&self, id: u64) -> anyhow::Result<()> {
+        let was_current = {
+            let mut entries = self.entries.lock();
+
+            // 查找凭据
+            let entry = entries
+                .iter()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            // 检查是否已禁用
+            if !entry.disabled {
+                anyhow::bail!("只能删除已禁用的凭据（请先禁用凭据 #{}）", id);
+            }
+
+            // 记录是否是当前凭据
+            let current_id = *self.current_id.lock();
+            let was_current = current_id == id;
+
+            // 删除凭据
+            entries.retain(|e| e.id != id);
+
+            was_current
+        };
+
+        // 如果删除的是当前凭据，切换到优先级最高的可用凭据
+        if was_current {
+            self.select_highest_priority();
+        }
+
+        // 如果删除后没有任何凭据，将 current_id 重置为 0（与初始化行为保持一致）
+        {
+            let entries = self.entries.lock();
+            if entries.is_empty() {
+                let mut current_id = self.current_id.lock();
+                *current_id = 0;
+                tracing::info!("所有凭据已删除，current_id 已重置为 0");
+            }
+        }
+
+        // 持久化更改
+        self.persist_credentials()?;
+
+        tracing::info!("已删除凭据 #{}", id);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

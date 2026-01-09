@@ -303,6 +303,13 @@ impl AdminService {
         })
     }
 
+    /// 删除凭据
+    pub fn delete_credential(&self, id: u64) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .delete_credential(id)
+            .map_err(|e| self.classify_delete_error(e, id))
+    }
+
     /// 分类简单操作错误（set_disabled, set_priority, reset_and_enable）
     fn classify_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
         let msg = e.to_string();
@@ -365,6 +372,18 @@ impl AdminService {
             || msg.contains("timeout")
         {
             AdminServiceError::UpstreamError(msg)
+        } else {
+            AdminServiceError::InternalError(msg)
+        }
+    }
+
+    /// 分类删除凭据错误
+    fn classify_delete_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
+        let msg = e.to_string();
+        if msg.contains("不存在") {
+            AdminServiceError::NotFound { id }
+        } else if msg.contains("只能删除已禁用的凭据") {
+            AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
         }

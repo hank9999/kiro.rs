@@ -207,16 +207,8 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 }
 
 /// 确定聊天触发类型
-fn determine_chat_trigger_type(req: &MessagesRequest) -> String {
-    if req.tools.is_some() {
-        if let Some(ref tool_choice) = req.tool_choice {
-            if let Some(tc_type) = tool_choice.get("type").and_then(|v| v.as_str()) {
-                if tc_type == "any" || tc_type == "tool" {
-                    return "AUTO".to_string();
-                }
-            }
-        }
-    }
+/// "AUTO" 模式可能会导致 400 Bad Request 错误
+fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
     "MANUAL".to_string()
 }
 
