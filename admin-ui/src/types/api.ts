@@ -17,6 +17,7 @@ export interface CredentialStatusItem {
   authMethod: string | null
   hasProfileArn: boolean
   accountEmail: string | null
+  userId: string | null
 
   // ===== 统计（可持久化） =====
   callsTotal: number

@@ -508,6 +508,8 @@ pub struct CredentialEntrySnapshot {
     pub expires_at: Option<String>,
     /// 账户邮箱（尽力从 token 中解析，仅用于展示）
     pub account_email: Option<String>,
+    /// 用户 ID（从 API 获取，持久化保存）
+    pub user_id: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -1191,6 +1193,7 @@ impl MultiTokenManager {
                     has_profile_arn: e.credentials.profile_arn.is_some(),
                     expires_at: e.credentials.expires_at.clone(),
                     account_email: extract_account_email(&e.credentials),
+                    user_id: e.credentials.user_id.clone(),
                 })
                 .collect(),
             current_id,

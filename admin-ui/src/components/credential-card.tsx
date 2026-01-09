@@ -129,6 +129,17 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
               />
             </div>
           </div>
+          {/* 账户信息：邮箱和用户ID */}
+          {(credential.accountEmail || credential.userId) && (
+            <div className="text-sm text-muted-foreground mt-1">
+              {credential.accountEmail && (
+                <span className="mr-3">{credential.accountEmail}</span>
+              )}
+              {credential.userId && (
+                <span className="text-xs opacity-70">ID: {credential.userId}</span>
+              )}
+            </div>
+          )}
         </CardHeader>
         <CardContent className="space-y-4">
           {/* 信息网格 */}

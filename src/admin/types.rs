@@ -84,6 +84,8 @@ pub struct CredentialStatusItem {
     pub has_profile_arn: bool,
     /// 账户邮箱（尽力从 token 中解析，仅用于展示）
     pub account_email: Option<String>,
+    /// 用户 ID（从 API 获取，持久化保存）
+    pub user_id: Option<String>,
 
     // ===== 统计（可持久化） =====
 

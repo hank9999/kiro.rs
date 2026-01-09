@@ -68,6 +68,7 @@ impl AdminService {
                     auth_method: entry.auth_method,
                     has_profile_arn: entry.has_profile_arn,
                     account_email: entry.account_email,
+                    user_id: entry.user_id,
 
                     calls_total: stats.as_ref().map(|s| s.calls_total).unwrap_or(0),
                     calls_ok: stats.as_ref().map(|s| s.calls_ok).unwrap_or(0),
@@ -125,15 +126,21 @@ impl AdminService {
     }
 
     /// 获取凭据余额
+    ///
+    /// 使用 Kiro Web Portal API (GetUserUsageAndLimits) 获取用量信息
     pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        let usage = self
+        if !self.credential_exists(id) {
+            return Err(AdminServiceError::NotFound { id });
+        }
+
+        let info = self
             .token_manager
-            .get_usage_limits_for(id)
+            .get_account_info_for(id)
             .await
             .map_err(|e| self.classify_balance_error(e, id))?;
 
-        let current_usage = usage.current_usage();
-        let usage_limit = usage.usage_limit();
+        let current_usage = info.usage.current;
+        let usage_limit = info.usage.limit;
         let remaining = (usage_limit - current_usage).max(0.0);
         let usage_percentage = if usage_limit > 0.0 {
             (current_usage / usage_limit * 100.0).min(100.0)
@@ -143,12 +150,12 @@ impl AdminService {
 
         Ok(BalanceResponse {
             id,
-            subscription_title: usage.subscription_title().map(|s| s.to_string()),
+            subscription_title: info.subscription_title,
             current_usage,
             usage_limit,
             remaining,
             usage_percentage,
-            next_reset_at: usage.next_date_reset,
+            next_reset_at: info.usage.next_reset_date,
         })
     }
 
