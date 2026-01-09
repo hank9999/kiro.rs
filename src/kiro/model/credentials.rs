@@ -47,6 +47,18 @@ pub struct KiroCredentials {
     #[serde(default)]
     #[serde(skip_serializing_if = "is_zero")]
     pub priority: u32,
+
+    /// 账户邮箱（从 API 获取，持久化保存）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_email: Option<String>,
+
+    /// 用户 ID（从 API 获取，持久化保存）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+
+    /// 身份提供商（BuilderId / Github / Google）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -205,6 +217,9 @@ mod tests {
             client_id: None,
             client_secret: None,
             priority: 0,
+            account_email: None,
+            user_id: None,
+            provider: None,
         };
 
         let json = match creds.to_pretty_json() {

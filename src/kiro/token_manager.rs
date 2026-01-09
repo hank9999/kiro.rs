@@ -150,10 +150,21 @@ fn looks_like_email(s: &str) -> bool {
 
 /// 尽力从凭据中提取账户邮箱，仅用于管理面板展示。
 ///
+/// 优先级：
+/// 1. 已保存的 account_email（从 API 获取并持久化）
+/// 2. 从 access_token JWT payload 中解析
+///
 /// 注意：
 /// - 不验证 JWT 签名（展示用途足够）。
 /// - 解析失败返回 None。
 fn extract_account_email(credentials: &KiroCredentials) -> Option<String> {
+    // 优先使用已保存的邮箱
+    if let Some(email) = credentials.account_email.as_ref() {
+        if !email.is_empty() {
+            return Some(email.clone());
+        }
+    }
+
     let access_token = match credentials.access_token.as_deref() {
         Some(t) => t,
         None => return None,
@@ -614,8 +625,17 @@ impl MultiTokenManager {
     }
 
     fn candidate_idps(credentials: &KiroCredentials) -> &'static [&'static str] {
-        // 兼容性优先：目前未在凭据中保存 provider（Github/Google/BuilderId）。
-        // 这里按 auth_method 做一个“尽力猜测 + 多候选重试”。
+        // 优先使用保存的 provider（Github/Google/BuilderId）
+        if let Some(provider) = credentials.provider.as_deref() {
+            match provider.to_lowercase().as_str() {
+                "github" => return &["Github", "Google", "BuilderId"],
+                "google" => return &["Google", "Github", "BuilderId"],
+                "builderid" | "builder-id" => return &["BuilderId", "Github", "Google"],
+                _ => {}
+            }
+        }
+        
+        // 兼容性：按 auth_method 做一个"尽力猜测 + 多候选重试"
         let auth = credentials
             .auth_method
             .as_deref()
@@ -630,8 +650,9 @@ impl MultiTokenManager {
             _ => &["BuilderId", "Github", "Google"],
         }
     }
-
     /// 获取指定凭据的“账号信息 + 套餐 + 用量明细”（通过 Kiro Web Portal API）
+    ///
+    /// 成功后会自动更新凭据的 account_email、user_id、provider 字段并持久化
     pub async fn get_account_info_for(
         &self,
         id: u64,
@@ -650,6 +671,42 @@ impl MultiTokenManager {
 
             match usage {
                 Ok(u) => {
+                    // 尝试从 usage.user_info 获取邮箱和用户 ID，并更新凭据
+                    let mut should_persist = false;
+                    {
+                        let mut entries = self.entries.lock();
+                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                            // 更新 account_email
+                            if entry.credentials.account_email.is_none() {
+                                if let Some(ref ui) = u.user_info {
+                                    if let Some(ref email) = ui.email {
+                                        entry.credentials.account_email = Some(email.clone());
+                                        should_persist = true;
+                                    }
+                                }
+                            }
+                            // 更新 user_id
+                            if entry.credentials.user_id.is_none() {
+                                if let Some(ref ui) = u.user_info {
+                                    if let Some(ref uid) = ui.user_id {
+                                        entry.credentials.user_id = Some(uid.clone());
+                                        should_persist = true;
+                                    }
+                                }
+                            }
+                            // 更新 provider
+                            if entry.credentials.provider.is_none() {
+                                entry.credentials.provider = Some(idp.to_string());
+                                should_persist = true;
+                            }
+                        }
+                    }
+                    // 持久化（在锁外执行以避免死锁）
+                    if should_persist {
+                        if let Err(e) = self.persist_credentials() {
+                            tracing::warn!("自动更新账户信息后持久化失败: {}", e);
+                        }
+                    }
                     // GetUserInfo 失败不应阻断（参考 Kiro-account-manager 的行为）
                     return Ok(web_portal::aggregate_account_info(user_info.ok(), u));
                 }
@@ -1256,7 +1313,8 @@ impl MultiTokenManager {
     /// 2. 尝试刷新 Token 验证凭据有效性
     /// 3. 分配新 ID（当前最大 ID + 1）
     /// 4. 添加到 entries 列表
-    /// 5. 持久化到配置文件
+    /// 5. 调用 API 获取账户信息（邮箱等）
+    /// 6. 持久化到配置文件
     ///
     /// # 返回
     /// - `Ok(u64)` - 新凭据 ID
@@ -1278,9 +1336,42 @@ impl MultiTokenManager {
         // 4. 设置 ID 并保留用户输入的元数据
         validated_cred.id = Some(new_id);
         validated_cred.priority = new_cred.priority;
-        validated_cred.auth_method = new_cred.auth_method;
+        validated_cred.auth_method = new_cred.auth_method.clone();
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;
+        validated_cred.provider = new_cred.provider.clone();
+
+        // 5. 调用 API 获取账户信息（邮箱、用户 ID 等）
+        if let Some(token) = validated_cred.access_token.as_ref() {
+            let proxy = self.proxy.as_ref();
+            // 尝试多个 idp 候选
+            for idp in Self::candidate_idps(&validated_cred) {
+                match web_portal::get_user_usage_and_limits(token, idp, proxy).await {
+                    Ok(usage) => {
+                        // 从 usage.user_info 获取邮箱和用户 ID
+                        if let Some(user_info) = &usage.user_info {
+                            if validated_cred.account_email.is_none() {
+                                validated_cred.account_email = user_info.email.clone();
+                            }
+                            if validated_cred.user_id.is_none() {
+                                validated_cred.user_id = user_info.user_id.clone();
+                            }
+                        }
+                        // 记录提供商（如果从 API 能推断）
+                        if validated_cred.provider.is_none() {
+                            validated_cred.provider = Some(idp.to_string());
+                        }
+                        tracing::debug!("获取到账户信息: email={:?}, userId={:?}",
+                            validated_cred.account_email, validated_cred.user_id);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::debug!("使用 idp={} 获取账户信息失败: {}", idp, e);
+                        continue;
+                    }
+                }
+            }
+        }
 
         {
             let mut entries = self.entries.lock();
@@ -1292,7 +1383,7 @@ impl MultiTokenManager {
             });
         }
 
-        // 5. 持久化
+        // 6. 持久化
         self.persist_credentials()?;
 
         tracing::info!("成功添加凭据 #{}", new_id);

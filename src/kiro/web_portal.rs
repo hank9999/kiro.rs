@@ -12,6 +12,7 @@ use std::time::Duration;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue};
+use serde::{Deserialize, Deserializer};
 
 use crate::http_client::{ProxyConfig, build_client};
 
@@ -19,6 +20,79 @@ const KIRO_API_BASE: &str = "https://app.kiro.dev/service/KiroWebPortalService/o
 const SMITHY_PROTOCOL: &str = "rpc-v2-cbor";
 const AMZ_SDK_REQUEST: &str = "attempt=1; max=1";
 const X_AMZ_USER_AGENT: &str = "aws-sdk-js/1.0.0 kiro-rs/1.0.0";
+
+/// 自定义反序列化器：处理 CBOR Tag(1) 时间戳或字符串，统一转换为 RFC3339 字符串
+///
+/// CBOR Tag(1) 表示 Unix 时间戳（秒），可以是整数或浮点数
+/// 此反序列化器支持以下格式：
+/// - Tag(1, Float/Integer) -> 转换为 RFC3339 字符串
+/// - 普通字符串 -> 直接使用
+mod cbor_timestamp {
+    use super::*;
+    use chrono::TimeZone;
+
+    /// 反序列化 CBOR 时间戳为 Option<String>
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // 使用 ciborium::Value 来处理各种可能的格式
+        let value: Option<ciborium::Value> = Option::deserialize(deserializer)?;
+
+        match value {
+            None => Ok(None),
+            Some(v) => match convert_to_timestamp_string(&v) {
+                Some(s) => Ok(Some(s)),
+                None => {
+                    tracing::warn!("[CBOR] 无法解析时间戳值: {:?}", v);
+                    Ok(None)
+                }
+            },
+        }
+    }
+
+    /// 将 ciborium::Value 转换为时间戳字符串
+    fn convert_to_timestamp_string(value: &ciborium::Value) -> Option<String> {
+        match value {
+            // Tag(1, ...) 是 CBOR 标准的 Unix 时间戳格式
+            ciborium::Value::Tag(1, inner) => {
+                let timestamp = extract_number(inner)?;
+                timestamp_to_rfc3339(timestamp)
+            }
+            // 直接的浮点数（可能是时间戳）
+            ciborium::Value::Float(f) => timestamp_to_rfc3339(*f),
+            // 直接的整数（可能是时间戳）
+            ciborium::Value::Integer(i) => {
+                let n: i128 = (*i).into();
+                timestamp_to_rfc3339(n as f64)
+            }
+            // 已经是字符串
+            ciborium::Value::Text(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// 从 ciborium::Value 提取数值
+    fn extract_number(value: &ciborium::Value) -> Option<f64> {
+        match value {
+            ciborium::Value::Float(f) => Some(*f),
+            ciborium::Value::Integer(i) => {
+                let n: i128 = (*i).into();
+                Some(n as f64)
+            }
+            _ => None,
+        }
+    }
+
+    /// 将 Unix 时间戳转换为 RFC3339 字符串
+    fn timestamp_to_rfc3339(timestamp: f64) -> Option<String> {
+        let secs = timestamp.trunc() as i64;
+        let nanos = ((timestamp.fract()) * 1_000_000_000.0) as u32;
+        Utc.timestamp_opt(secs, nanos)
+            .single()
+            .map(|dt| dt.to_rfc3339())
+    }
+}
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -72,6 +146,7 @@ pub struct Bonus {
     pub current_usage_with_precision: Option<f64>,
 
     pub status: Option<String>,
+    #[serde(default, deserialize_with = "cbor_timestamp::deserialize")]
     pub expires_at: Option<String>,
 }
 
@@ -83,6 +158,7 @@ pub struct FreeTrialInfo {
     pub current_usage: Option<f64>,
     pub current_usage_with_precision: Option<f64>,
 
+    #[serde(default, deserialize_with = "cbor_timestamp::deserialize")]
     pub free_trial_expiry: Option<String>,
     pub free_trial_status: Option<String>,
 }
@@ -106,6 +182,9 @@ pub struct UsageBreakdownItem {
 
     pub free_trial_info: Option<FreeTrialInfo>,
     pub bonuses: Option<Vec<Bonus>>,
+
+    #[serde(default, deserialize_with = "cbor_timestamp::deserialize")]
+    pub next_date_reset: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
@@ -120,6 +199,7 @@ pub struct UsageAndLimitsResponse {
     pub user_info: Option<UsageUserInfo>,
     pub subscription_info: Option<SubscriptionInfo>,
     pub usage_breakdown_list: Option<Vec<UsageBreakdownItem>>,
+    #[serde(default, deserialize_with = "cbor_timestamp::deserialize")]
     pub next_date_reset: Option<String>,
     pub overage_configuration: Option<OverageConfiguration>,
 }
@@ -181,13 +261,32 @@ where
 {
     let url = format!("{}/{}", KIRO_API_BASE, operation);
 
-    let body = serde_cbor::to_vec(req).context("CBOR 编码失败")?;
+    // 详细日志：请求信息
+    tracing::debug!(
+        "[KiroAPI] 请求 {} | idp={} | token_len={}",
+        operation,
+        idp,
+        access_token.len()
+    );
+
+    let mut body = Vec::new();
+    ciborium::into_writer(req, &mut body).context("CBOR 编码失败")?;
+    tracing::debug!("[KiroAPI] 请求体 CBOR 编码完成，长度: {} bytes", body.len());
 
     let client = build_client(proxy, 60)?;
+    let headers = build_headers(access_token, idp)?;
+
+    // 打印请求头（脱敏）
+    tracing::debug!(
+        "[KiroAPI] 请求头: smithy-protocol={:?}, content-type={:?}, accept={:?}",
+        headers.get("smithy-protocol"),
+        headers.get("content-type"),
+        headers.get("accept")
+    );
 
     let resp = client
         .post(&url)
-        .headers(build_headers(access_token, idp)?)
+        .headers(headers)
         .timeout(Duration::from_secs(60))
         .body(body)
         .send()
@@ -195,26 +294,82 @@ where
         .context("请求 Kiro Web Portal API 失败")?;
 
     let status = resp.status();
+    let resp_headers = resp.headers().clone();
     let bytes = resp.bytes().await.context("读取响应失败")?;
 
+    // 详细日志：响应信息
+    tracing::debug!(
+        "[KiroAPI] 响应状态: {} | 响应体长度: {} bytes | Content-Type: {:?}",
+        status,
+        bytes.len(),
+        resp_headers.get("content-type")
+    );
+
+    // 打印响应体前 200 字节的十六进制（用于调试 CBOR 格式）
+    if bytes.len() > 0 {
+        let preview_len = bytes.len().min(200);
+        let hex_preview: String = bytes[..preview_len]
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::debug!("[KiroAPI] 响应体前 {} 字节 (hex): {}", preview_len, hex_preview);
+
+        // 尝试将响应体解析为 UTF-8 字符串（如果是 JSON 错误响应）
+        if let Ok(text) = std::str::from_utf8(&bytes) {
+            if text.starts_with('{') || text.starts_with('[') {
+                tracing::warn!("[KiroAPI] 响应体是 JSON 而非 CBOR: {}", &text[..text.len().min(500)]);
+            }
+        }
+    }
+
     if !status.is_success() {
+        tracing::error!("[KiroAPI] HTTP 错误: {} | 响应体长度: {}", status, bytes.len());
+
         // 尽力解析 CBOR 错误体
-        if let Ok(err) = serde_cbor::from_slice::<CborErrorResponse>(&bytes) {
+        if let Ok(err) = ciborium::from_reader::<CborErrorResponse, _>(bytes.as_ref()) {
             let type_name = err
                 .type_name
                 .as_deref()
                 .and_then(|s| s.split('#').last())
                 .unwrap_or("HTTPError");
             let msg = err.message.unwrap_or_else(|| format!("HTTP {}", status));
+            tracing::error!("[KiroAPI] CBOR 错误响应: type={}, message={}", type_name, msg);
             anyhow::bail!("{}: {}", type_name, msg);
         }
 
         let raw = String::from_utf8_lossy(&bytes);
+        tracing::error!("[KiroAPI] 原始错误响应: {}", raw);
         anyhow::bail!("HTTP {}: {}", status, raw);
     }
 
-    let out = serde_cbor::from_slice::<TResp>(&bytes).context("CBOR 解码失败")?;
-    Ok(out)
+    // 尝试解码 CBOR 响应
+    match ciborium::from_reader::<TResp, _>(bytes.as_ref()) {
+        Ok(out) => {
+            tracing::debug!("[KiroAPI] CBOR 解码成功");
+            Ok(out)
+        }
+        Err(e) => {
+            tracing::error!(
+                "[KiroAPI] CBOR 解码失败: {} | 响应体长度: {} | 前 100 字节: {:?}",
+                e,
+                bytes.len(),
+                &bytes[..bytes.len().min(100)]
+            );
+
+            // 尝试解析为 ciborium::Value 以查看原始结构
+            match ciborium::from_reader::<ciborium::Value, _>(bytes.as_ref()) {
+                Ok(value) => {
+                    tracing::error!("[KiroAPI] 原始 CBOR 结构: {:?}", value);
+                }
+                Err(e2) => {
+                    tracing::error!("[KiroAPI] 无法解析为 CBOR Value: {}", e2);
+                }
+            }
+
+            anyhow::bail!("CBOR 解码失败: {} (响应体长度: {} bytes)", e, bytes.len())
+        }
+    }
 }
 
 pub async fn get_user_info(

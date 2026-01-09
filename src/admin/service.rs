@@ -287,6 +287,9 @@ impl AdminService {
             client_id: req.client_id,
             client_secret: req.client_secret,
             priority: req.priority,
+            account_email: None,
+            user_id: None,
+            provider: req.provider,
         };
 
         // 调用 token_manager 添加凭据

@@ -9,9 +9,13 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageLimitsResponse {
-    /// 下次重置日期 (Unix 时间戳)
+    /// 距离下次重置的天数
     #[serde(default)]
-    pub next_date_reset: Option<f64>,
+    pub days_until_reset: Option<i32>,
+
+    /// 下次重置日期 (ISO 8601 日期字符串，如 "2025-02-01T00:00:00Z")
+    #[serde(default)]
+    pub next_date_reset: Option<String>,
 
     /// 订阅信息
     #[serde(default)]
@@ -20,6 +24,36 @@ pub struct UsageLimitsResponse {
     /// 使用量明细列表
     #[serde(default)]
     pub usage_breakdown_list: Vec<UsageBreakdown>,
+
+    /// 超额配置
+    #[serde(default)]
+    pub overage_configuration: Option<OverageConfiguration>,
+
+    /// 用户信息
+    #[serde(default)]
+    pub user_info: Option<UserInfo>,
+}
+
+/// 超额配置
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverageConfiguration {
+    /// 是否启用超额
+    #[serde(default)]
+    pub overage_enabled: bool,
+}
+
+/// 用户信息
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInfo {
+    /// 用户邮箱
+    #[serde(default)]
+    pub email: Option<String>,
+
+    /// 用户 ID
+    #[serde(default)]
+    pub user_id: Option<String>,
 }
 
 /// 订阅信息
@@ -29,6 +63,22 @@ pub struct SubscriptionInfo {
     /// 订阅标题 (KIRO PRO+ / KIRO FREE 等)
     #[serde(default)]
     pub subscription_title: Option<String>,
+
+    /// 订阅类型 (如 Q_DEVELOPER_STANDALONE_PRO_PLUS)
+    #[serde(default, rename = "type")]
+    pub subscription_type: Option<String>,
+
+    /// 可升级能力
+    #[serde(default)]
+    pub upgrade_capability: Option<String>,
+
+    /// 超额能力
+    #[serde(default)]
+    pub overage_capability: Option<String>,
+
+    /// 订阅管理目标
+    #[serde(default)]
+    pub subscription_management_target: Option<String>,
 }
 
 /// 使用量明细
@@ -42,13 +92,14 @@ pub struct UsageBreakdown {
     /// 当前使用量（精确值）
     #[serde(default)]
     pub current_usage_with_precision: f64,
+
     /// 免费试用信息
     #[serde(default)]
     pub free_trial_info: Option<FreeTrialInfo>,
 
-    /// 下次重置日期 (Unix 时间戳)
+    /// 下次重置日期 (ISO 8601 日期字符串)
     #[serde(default)]
-    pub next_date_reset: Option<f64>,
+    pub next_date_reset: Option<String>,
 
     /// 使用限额
     #[serde(default)]
@@ -61,6 +112,34 @@ pub struct UsageBreakdown {
     /// 额外用量包（如 GIFT 类型）
     #[serde(default)]
     pub bonuses: Option<Vec<Bonus>>,
+
+    /// 资源类型 (CREDIT 等)
+    #[serde(default)]
+    pub resource_type: Option<String>,
+
+    /// 显示名称
+    #[serde(default)]
+    pub display_name: Option<String>,
+
+    /// 显示名称（复数形式）
+    #[serde(default)]
+    pub display_name_plural: Option<String>,
+
+    /// 货币类型 (USD 等)
+    #[serde(default)]
+    pub currency: Option<String>,
+
+    /// 单位 (INVOCATIONS 等)
+    #[serde(default)]
+    pub unit: Option<String>,
+
+    /// 超额费率
+    #[serde(default)]
+    pub overage_rate: Option<f64>,
+
+    /// 超额上限
+    #[serde(default)]
+    pub overage_cap: Option<f64>,
 }
 
 /// 额外用量包信息（如 GIFT 类型）
@@ -112,9 +191,9 @@ pub struct FreeTrialInfo {
     #[serde(default)]
     pub current_usage_with_precision: f64,
 
-    /// 免费试用过期时间 (Unix 时间戳)
+    /// 免费试用过期时间 (ISO 8601 日期字符串)
     #[serde(default)]
-    pub free_trial_expiry: Option<f64>,
+    pub free_trial_expiry: Option<String>,
 
     /// 免费试用状态 (ACTIVE / EXPIRED)
     #[serde(default)]

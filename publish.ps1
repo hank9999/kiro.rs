@@ -67,4 +67,63 @@ if (Test-Path $UiDist) {
     Write-Host "已发布 Admin UI 静态文件到: $DestUi" -ForegroundColor Green
 }
 
+# 4. 部署到上一级目录并重启服务
+Write-Host "[4/4] 正在部署到上一级目录并重启服务..." -ForegroundColor Yellow
+
+$ParentDir = Split-Path $RootDir -Parent
+$ParentExe = Join-Path $ParentDir "kiro-rs.exe"
+$ParentExeBackup = Join-Path $ParentDir "kiro-rs_$Date.exe"
+$ServiceName = "kiro-2api"
+
+# 检查管理员权限
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Host "警告: 未以管理员身份运行，将尝试使用 sc.exe 操作服务..." -ForegroundColor DarkYellow
+}
+
+# 停止服务（以便替换文件）
+Write-Host "正在停止服务 $ServiceName..." -ForegroundColor Yellow
+$stopResult = sc.exe stop $ServiceName 2>&1
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "服务已停止，等待进程退出..." -ForegroundColor Green
+    Start-Sleep -Seconds 3
+} elseif ($stopResult -match "1062") {
+    Write-Host "服务 $ServiceName 当前未运行" -ForegroundColor DarkYellow
+} elseif ($stopResult -match "1060") {
+    Write-Host "服务 $ServiceName 不存在，跳过服务操作" -ForegroundColor DarkYellow
+} else {
+    Write-Host "停止服务返回: $stopResult" -ForegroundColor DarkYellow
+    Start-Sleep -Seconds 2
+}
+
+# 备份旧版本
+if (Test-Path $ParentExe) {
+    if (Test-Path $ParentExeBackup) {
+        Remove-Item $ParentExeBackup -Force
+    }
+    Rename-Item $ParentExe $ParentExeBackup -Force
+    Write-Host "已备份旧版本: $ParentExeBackup" -ForegroundColor Green
+}
+
+# 复制新版本到上一级目录
+if (Test-Path $DestBin) {
+    Copy-Item $DestBin $ParentExe -Force
+    Write-Host "已部署新版本: $ParentExe" -ForegroundColor Green
+} else {
+    Write-Error "找不到新版本文件: $DestBin"
+    exit 1
+}
+
+# 重启服务
+Write-Host "正在启动服务 $ServiceName..." -ForegroundColor Yellow
+$startResult = sc.exe start $ServiceName 2>&1
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "服务 $ServiceName 已成功启动" -ForegroundColor Green
+} elseif ($startResult -match "1060") {
+    Write-Host "服务 $ServiceName 不存在，请手动启动程序" -ForegroundColor DarkYellow
+} else {
+    Write-Error "启动服务 $ServiceName 失败: $startResult"
+    Write-Host "请尝试以管理员身份运行此脚本，或手动启动服务" -ForegroundColor Yellow
+}
+
 Write-Host "--- 发布完成！ ---" -ForegroundColor Cyan

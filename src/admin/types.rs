@@ -145,6 +145,9 @@ pub struct AddCredentialRequest {
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,
+
+    /// 身份提供商（BuilderId / Github / Google）
+    pub provider: Option<String>,
 }
 
 fn default_auth_method() -> String {
@@ -179,8 +182,8 @@ pub struct BalanceResponse {
     pub remaining: f64,
     /// 使用百分比
     pub usage_percentage: f64,
-    /// 下次重置时间（Unix 时间戳）
-    pub next_reset_at: Option<f64>,
+    /// 下次重置时间（ISO 8601 日期字符串）
+    pub next_reset_at: Option<String>,
 }
 
 /// 账号信息（套餐/用量/邮箱等）
