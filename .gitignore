@@ -10,3 +10,4 @@
 /admin-ui/dist/
 /admin-ui/pnpm-lock.yaml
 /admin-ui/tsconfig.tsbuildinfo
+public/
