@@ -6,7 +6,9 @@
 
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, HeaderMap, HeaderValue};
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::http_client::{build_client, build_stream_client, ProxyConfig};
@@ -151,7 +153,8 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移：
     /// - 400 Bad Request: 直接返回错误，不计入凭据失败
-    /// - 其他错误: 计入失败次数，达到阈值后切换凭据重试
+    /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
+    /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
     ///
     /// # Arguments
     /// * `request_body` - JSON 格式的请求体字符串
@@ -176,7 +179,8 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移：
     /// - 400 Bad Request: 直接返回错误，不计入凭据失败
-    /// - 其他错误: 计入失败次数，达到阈值后切换凭据重试
+    /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
+    /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
     ///
     /// # Arguments
     /// * `request_body` - JSON 格式的请求体字符串
@@ -212,6 +216,7 @@ impl KiroProvider {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
+        let api_type = if is_stream { "流式" } else { "非流式" };
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
@@ -224,8 +229,13 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
+
+                    if let Some(stats) = &self.stats {
+                        stats.record_error(0, model, truncate_error(e.to_string()));
+                    }
+
                     last_error = Some(e);
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    sleep(Self::retry_delay(attempt)).await;
                     continue;
                 }
             };
@@ -247,7 +257,7 @@ impl KiroProvider {
                     }
 
                     last_error = Some(e);
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    sleep(Self::retry_delay(attempt)).await;
                     continue;
                 }
             };
@@ -283,11 +293,12 @@ impl KiroProvider {
                         stats.record_error(ctx.id, model, truncate_error(e.to_string()));
                     }
 
-                    // 网络错误，报告失败并重试（使用绑定的 id）
-                    if !self.token_manager.report_failure(ctx.id) {
-                        return Err(e.into());
-                    }
+                    // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
+                    // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
                     last_error = Some(e.into());
+                    if attempt + 1 < max_retries {
+                        sleep(Self::retry_delay(attempt)).await;
+                    }
                     continue;
                 }
             };
@@ -300,11 +311,11 @@ impl KiroProvider {
                 return Ok((ctx.id, response));
             }
 
-            // 400 Bad Request - 不算凭据错误（不影响 failover），但仍记录为该凭据的一次错误
-            if status.as_u16() == 400 {
-                let body = response.text().await.unwrap_or_default();
-                let api_type = if is_stream { "流式" } else { "非流式" };
+            // 失败响应：读取 body 用于日志/错误信息
+            let body = response.text().await.unwrap_or_default();
 
+            // 400 Bad Request - 请求问题，重试/切换凭据无意义
+            if status.as_u16() == 400 {
                 if let Some(stats) = &self.stats {
                     stats.record_error(
                         ctx.id,
@@ -312,20 +323,18 @@ impl KiroProvider {
                         truncate_error(format!("{} API 请求失败: {} {}", api_type, status, body)),
                     );
                 }
-
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
-            // 429 Too Many Requests - 限流：不计入凭据失败，不切换凭据；按 Retry-After/退避重试
-            if status.as_u16() == 429 {
-                let retry_after_secs = response
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.trim().parse::<u64>().ok());
-
-                let body = response.text().await.unwrap_or_default();
-                let api_type = if is_stream { "流式" } else { "非流式" };
+            // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
+            if matches!(status.as_u16(), 401 | 403) {
+                tracing::warn!(
+                    "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
 
                 if let Some(stats) = &self.stats {
                     stats.record_error(
@@ -335,35 +344,61 @@ impl KiroProvider {
                     );
                 }
 
-                let backoff_secs = retry_after_secs.unwrap_or_else(|| {
-                    // 退避：1,2,4,8... 秒，最多 30 秒
-                    let exp = 1u64.checked_shl(attempt as u32).unwrap_or(u64::MAX);
-                    exp.min(30).max(1)
-                });
+                let has_available = self.token_manager.report_failure(ctx.id);
+                if !has_available {
+                    anyhow::bail!(
+                        "{} API 请求失败（所有凭据已用尽）: {} {}",
+                        api_type,
+                        status,
+                        body
+                    );
+                }
 
-                tracing::warn!(
-                    "触发限流 429（尝试 {}/{}，credential_id={}），{} 秒后重试同一凭据",
-                    attempt + 1,
-                    max_retries,
-                    ctx.id,
-                    backoff_secs
-                );
-
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    truncate_error(body)
-                ));
-
-                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                last_error = Some(anyhow::anyhow!("{} API 请求失败: {} {}", api_type, status, body));
                 continue;
             }
 
-            // 其他错误 - 记录失败并可能重试（使用绑定的 id）
-            let body = response.text().await.unwrap_or_default();
+            // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
+            // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
+            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+                tracing::warn!(
+                    "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+
+                if let Some(stats) = &self.stats {
+                    stats.record_error(
+                        ctx.id,
+                        model,
+                        truncate_error(format!("{} API 请求失败: {} {}", api_type, status, body)),
+                    );
+                }
+
+                last_error = Some(anyhow::anyhow!("{} API 请求失败: {} {}", api_type, status, body));
+                if attempt + 1 < max_retries {
+                    sleep(Self::retry_delay(attempt)).await;
+                }
+                continue;
+            }
+
+            // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
+            if status.is_client_error() {
+                if let Some(stats) = &self.stats {
+                    stats.record_error(
+                        ctx.id,
+                        model,
+                        truncate_error(format!("{} API 请求失败: {} {}", api_type, status, body)),
+                    );
+                }
+                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+            }
+
+            // 兜底：当作可重试的瞬态错误处理（不切换凭据）
             tracing::warn!(
-                "API 请求失败（尝试 {}/{}）: {} {}",
+                "API 请求失败（未知错误，尝试 {}/{}）: {} {}",
                 attempt + 1,
                 max_retries,
                 status,
@@ -374,47 +409,35 @@ impl KiroProvider {
                 stats.record_error(
                     ctx.id,
                     model,
-                    truncate_error(format!(
-                        "{} API 请求失败: {} {}",
-                        if is_stream { "流式" } else { "非流式" },
-                        status,
-                        body
-                    )),
+                    truncate_error(format!("{} API 请求失败: {} {}", api_type, status, body)),
                 );
             }
 
-            let has_available = self.token_manager.report_failure(ctx.id);
-            if !has_available {
-                let api_type = if is_stream { "流式" } else { "非流式" };
-                anyhow::bail!(
-                    "{} API 请求失败（所有凭据已用尽）: {} {}",
-                    api_type,
-                    status,
-                    body
-                );
+            last_error = Some(anyhow::anyhow!("{} API 请求失败: {} {}", api_type, status, body));
+            if attempt + 1 < max_retries {
+                sleep(Self::retry_delay(attempt)).await;
             }
-
-            last_error = Some(anyhow::anyhow!(
-                "{} API 请求失败: {} {}",
-                if is_stream { "流式" } else { "非流式" },
-                status,
-                body
-            ));
-
-            // 失败后做一个小的退避，避免瞬间打满上游/本地 CPU
-            tokio::time::sleep(Duration::from_millis(200)).await;
         }
 
         // 所有重试都失败
-        let api_type = if is_stream { "流式" } else { "非流式" };
-        Err(match last_error {
-            Some(e) => e,
-            None => anyhow::anyhow!(
+        Err(last_error.unwrap_or_else(|| {
+            anyhow::anyhow!(
                 "{} API 请求失败：已达到最大重试次数（{}次）",
                 api_type,
                 max_retries
-            ),
-        })
+            )
+        }))
+    }
+
+    fn retry_delay(attempt: usize) -> Duration {
+        // 指数退避 + 少量抖动，避免上游抖动时放大故障
+        const BASE_MS: u64 = 200;
+        const MAX_MS: u64 = 2_000;
+        let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
+        let backoff = exp.min(MAX_MS);
+        let jitter_max = (backoff / 4).max(1);
+        let jitter = fastrand::u64(0..=jitter_max);
+        Duration::from_millis(backoff.saturating_add(jitter))
     }
 }
 
