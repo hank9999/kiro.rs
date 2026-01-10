@@ -21,6 +21,7 @@ import {
   useSetPriority,
   useResetFailure,
   useResetCredentialStats,
+  useCredentialBalance,
 } from '@/hooks/use-credentials'
 import { StatsDialog } from '@/components/stats-dialog'
 import { formatExpiry, formatTokensPair } from '@/lib/format'
@@ -41,6 +42,9 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
   const setPriority = useSetPriority()
   const resetFailure = useResetFailure()
   const resetStats = useResetCredentialStats()
+  const balanceQuery = useCredentialBalance(credential.id, {
+    refetchInterval: 10 * 60 * 1000, // 每 10 分钟刷新一次
+  })
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -97,6 +101,12 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
         toast.error('删除失败: ' + (err as Error).message)
       },
     })
+  }
+
+  const formatMoney = (num: number | null | undefined) => {
+    if (num === null || num === undefined) return '-'
+    if (!Number.isFinite(num)) return String(num)
+    return num.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   }
 
   const formatTime = (t: string | null) => {
@@ -214,6 +224,23 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
                 {formatTokensPair(credential.inputTokensTotal, credential.outputTokensTotal)}
               </span>
             </div>
+            <div>
+              <span className="text-muted-foreground">用量：</span>
+              {balanceQuery.isLoading ? (
+                <span className="text-muted-foreground">加载中...</span>
+              ) : balanceQuery.error ? (
+                <span className="text-red-500 font-medium">获取失败</span>
+              ) : balanceQuery.data ? (
+                <span className="font-medium">
+                  ${formatMoney(balanceQuery.data.currentUsage)} / ${formatMoney(balanceQuery.data.usageLimit)}
+                  <span className="text-xs text-muted-foreground ml-2">
+                    ({balanceQuery.data.usagePercentage.toFixed(1)}%)
+                  </span>
+                </span>
+              ) : (
+                <span className="text-muted-foreground">-</span>
+              )}
+            </div>
             <div className="col-span-2">
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatTime(credential.lastCallAt)}</span>
@@ -319,7 +346,10 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
             <Button
               size="sm"
               variant="default"
-              onClick={() => onViewBalance(credential.id)}
+              onClick={() => {
+                void balanceQuery.refetch()
+                onViewBalance(credential.id)
+              }}
             >
               <Wallet className="h-4 w-4 mr-1" />
               查看余额

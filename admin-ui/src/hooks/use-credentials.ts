@@ -24,12 +24,30 @@ export function useCredentials() {
 }
 
 // 查询凭据余额
-export function useCredentialBalance(id: number | null) {
+interface UseCredentialBalanceOptions {
+  enabled?: boolean
+  refetchInterval?: number | false
+}
+
+export function useCredentialBalance(
+  id: number | null,
+  options?: UseCredentialBalanceOptions
+) {
+  const enabled = (options?.enabled ?? true) && id !== null
   return useQuery({
     queryKey: ['credential-balance', id],
-    queryFn: () => getCredentialBalance(id!),
-    enabled: id !== null,
+    queryFn: () => {
+      if (id === null) {
+        return Promise.reject(new Error('Invalid credential id'))
+      }
+      return getCredentialBalance(id)
+    },
+    enabled,
     retry: false, // 余额查询失败时不重试（避免重复请求被封禁的账号）
+    refetchInterval: options?.refetchInterval,
+    staleTime: options?.refetchInterval || 5 * 60 * 1000, // 默认 5 分钟内不重新请求
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
   })
 }
 
