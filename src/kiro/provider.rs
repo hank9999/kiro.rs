@@ -13,8 +13,10 @@ use uuid::Uuid;
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
-use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{CallContext, MultiTokenManager};
+
+#[cfg(test)]
+use crate::kiro::model::credentials::KiroCredentials;
 
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
@@ -126,6 +128,7 @@ impl KiroProvider {
     /// 支持多凭据故障转移：
     /// - 400 Bad Request: 直接返回错误，不计入凭据失败
     /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
+    /// - 402 MONTHLY_REQUEST_COUNT: 视为额度用尽，禁用凭据并切换
     /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
     ///
     /// # Arguments
@@ -142,6 +145,7 @@ impl KiroProvider {
     /// 支持多凭据故障转移：
     /// - 400 Bad Request: 直接返回错误，不计入凭据失败
     /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
+    /// - 402 MONTHLY_REQUEST_COUNT: 视为额度用尽，禁用凭据并切换
     /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
     ///
     /// # Arguments
@@ -225,6 +229,30 @@ impl KiroProvider {
 
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
+
+            // 402 Payment Required 且额度用尽：禁用凭据并故障转移
+            if status.as_u16() == 402 && Self::is_monthly_request_limit(&body) {
+                tracing::warn!(
+                    "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+
+                let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                if !has_available {
+                    anyhow::bail!(
+                        "{} API 请求失败（所有凭据已用尽）: {} {}",
+                        api_type,
+                        status,
+                        body
+                    );
+                }
+
+                last_error = Some(anyhow::anyhow!("{} API 请求失败: {} {}", api_type, status, body));
+                continue;
+            }
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
@@ -311,6 +339,29 @@ impl KiroProvider {
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
     }
+
+    fn is_monthly_request_limit(body: &str) -> bool {
+        if body.contains("MONTHLY_REQUEST_COUNT") {
+            return true;
+        }
+
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+            return false;
+        };
+
+        if value
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
+        {
+            return true;
+        }
+
+        value
+            .pointer("/error/reason")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
+    }
 }
 
 #[cfg(test)]
@@ -372,5 +423,23 @@ mod tests {
                 .starts_with("Bearer ")
         );
         assert_eq!(headers.get(CONNECTION).unwrap(), "close");
+    }
+
+    #[test]
+    fn test_is_monthly_request_limit_detects_reason() {
+        let body = r#"{"message":"You have reached the limit.","reason":"MONTHLY_REQUEST_COUNT"}"#;
+        assert!(KiroProvider::is_monthly_request_limit(body));
+    }
+
+    #[test]
+    fn test_is_monthly_request_limit_nested_reason() {
+        let body = r#"{"error":{"reason":"MONTHLY_REQUEST_COUNT"}}"#;
+        assert!(KiroProvider::is_monthly_request_limit(body));
+    }
+
+    #[test]
+    fn test_is_monthly_request_limit_false() {
+        let body = r#"{"message":"nope","reason":"DAILY_REQUEST_COUNT"}"#;
+        assert!(!KiroProvider::is_monthly_request_limit(body));
     }
 }
