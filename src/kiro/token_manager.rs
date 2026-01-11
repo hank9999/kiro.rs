@@ -341,10 +341,19 @@ async fn refresh_social_token(
         new_credentials.profile_arn = Some(profile_arn);
     }
 
-    if let Some(expires_in) = data.expires_in {
-        let expires_at = Utc::now() + Duration::seconds(expires_in);
-        new_credentials.expires_at = Some(expires_at.to_rfc3339());
-    }
+    // Social Token 默认有效期为 1 小时（3600 秒）
+    // 如果响应中没有 expires_in，使用默认值确保 expires_at 总是被正确设置
+    // 否则会导致 is_token_expired 始终返回 true，造成疯狂刷新
+    const SOCIAL_DEFAULT_EXPIRES_IN_SECONDS: i64 = 3600;
+    let expires_in = data.expires_in.unwrap_or(SOCIAL_DEFAULT_EXPIRES_IN_SECONDS);
+    let expires_at = Utc::now() + Duration::seconds(expires_in);
+    new_credentials.expires_at = Some(expires_at.to_rfc3339());
+
+    tracing::debug!(
+        "Social Token 刷新成功，有效期 {} 秒，过期时间: {}",
+        expires_in,
+        new_credentials.expires_at.as_deref().unwrap_or("unknown")
+    );
 
     Ok(new_credentials)
 }
