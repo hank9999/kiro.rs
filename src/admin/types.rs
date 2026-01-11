@@ -18,6 +18,50 @@ pub struct CredentialsStatusResponse {
     pub credentials: Vec<CredentialStatusItem>,
 }
 
+// ============ 统计（可持久化） ============
+
+/// 单个统计 bucket（按日/按模型）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsBucket {
+    /// bucket key：
+    /// - 按日：YYYY-MM-DD
+    /// - 按模型：model id
+    pub key: String,
+
+    pub calls_total: u64,
+    pub calls_ok: u64,
+    pub calls_err: u64,
+    pub input_tokens_total: u64,
+    pub output_tokens_total: u64,
+
+    pub last_call_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub last_error_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+/// 指定凭据的详细统计
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialStatsResponse {
+    pub id: u64,
+
+    pub calls_total: u64,
+    pub calls_ok: u64,
+    pub calls_err: u64,
+    pub input_tokens_total: u64,
+    pub output_tokens_total: u64,
+
+    pub last_call_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub last_error_at: Option<String>,
+    pub last_error: Option<String>,
+
+    pub by_day: Vec<StatsBucket>,
+    pub by_model: Vec<StatsBucket>,
+}
+
 /// 单个凭据的状态信息
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,6 +82,31 @@ pub struct CredentialStatusItem {
     pub auth_method: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
+    /// 账户邮箱（尽力从 token 中解析，仅用于展示）
+    pub account_email: Option<String>,
+    /// 用户 ID（从 API 获取，持久化保存）
+    pub user_id: Option<String>,
+
+    // ===== 统计（可持久化） =====
+
+    /// 调用次数（对上游发起请求的尝试次数）
+    pub calls_total: u64,
+    /// 成功次数（上游返回 2xx）
+    pub calls_ok: u64,
+    /// 失败次数（网络/非 2xx/流读取中断等）
+    pub calls_err: u64,
+    /// 累计输入 tokens
+    pub input_tokens_total: u64,
+    /// 累计输出 tokens
+    pub output_tokens_total: u64,
+    /// 最后一次调用时间（RFC3339）
+    pub last_call_at: Option<String>,
+    /// 最后一次成功时间（RFC3339）
+    pub last_success_at: Option<String>,
+    /// 最后一次错误时间（RFC3339）
+    pub last_error_at: Option<String>,
+    /// 最后一次错误（如果最后一次调用成功则为 None）
+    pub last_error: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -78,6 +147,9 @@ pub struct AddCredentialRequest {
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,
+
+    /// 身份提供商（BuilderId / Github / Google）
+    pub provider: Option<String>,
 }
 
 fn default_auth_method() -> String {
@@ -112,8 +184,16 @@ pub struct BalanceResponse {
     pub remaining: f64,
     /// 使用百分比
     pub usage_percentage: f64,
-    /// 下次重置时间（Unix 时间戳）
-    pub next_reset_at: Option<f64>,
+    /// 下次重置时间（ISO 8601 日期字符串）
+    pub next_reset_at: Option<String>,
+}
+
+/// 账号信息（套餐/用量/邮箱等）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialAccountInfoResponse {
+    pub id: u64,
+    pub account: crate::kiro::web_portal::AccountAggregateInfo,
 }
 
 // ============ 通用响应 ============

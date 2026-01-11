@@ -13,14 +13,36 @@
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
 - **工具调用**: 完整支持 function calling / tool use
 - **多模型支持**: 支持 Sonnet、Opus、Haiku 系列模型
+- **Admin UI**: 内置管理面板，支持凭据管理和账号信息查询
+- **账号信息**: 通过 Kiro Web Portal API 获取套餐、用量等详细信息
 
 ## 支持的 API 端点
+
+### Anthropic 兼容 API
 
 | 端点 | 方法 | 描述          |
 |------|------|-------------|
 | `/v1/models` | GET | 获取可用模型列表    |
 | `/v1/messages` | POST | 创建消息（对话）    |
 | `/v1/messages/count_tokens` | POST | 估算 Token 数量 |
+
+### Admin API（凭据管理）
+
+需要配置 `adminApiKey` 后启用，所有端点前缀为 `/api/admin`。
+
+| 端点 | 方法 | 描述 |
+|------|------|------|
+| `/credentials` | GET | 获取所有凭据状态 |
+| `/credentials` | POST | 添加新凭据 |
+| `/credentials/{id}` | DELETE | 删除凭据（需先禁用） |
+| `/credentials/{id}/disabled` | POST | 设置凭据禁用状态 |
+| `/credentials/{id}/priority` | POST | 设置凭据优先级 |
+| `/credentials/{id}/reset` | POST | 重置失败计数并重新启用 |
+| `/credentials/{id}/balance` | GET | 获取凭据余额（getUsageLimits） |
+| `/credentials/{id}/account` | GET | 获取账号详细信息（套餐/用量/邮箱） |
+| `/credentials/{id}/stats` | GET | 获取凭据统计详情 |
+| `/credentials/{id}/stats/reset` | POST | 清空指定凭据统计 |
+| `/stats/reset` | POST | 清空全部统计 |
 
 ## 快速开始
 
@@ -220,9 +242,17 @@ kiro-rs/
 │   │   ├── converter.rs        # 协议转换器
 │   │   ├── stream.rs           # 流式响应处理
 │   │   └── token.rs            # Token 估算
+│   ├── admin/                  # Admin API 模块
+│   │   ├── router.rs           # 路由配置
+│   │   ├── handlers.rs         # 请求处理器
+│   │   ├── middleware.rs       # 认证中间件
+│   │   ├── service.rs          # 业务逻辑
+│   │   ├── types.rs            # 类型定义
+│   │   └── error.rs            # 错误处理
 │   └── kiro/                   # Kiro API 客户端
 │       ├── provider.rs         # API 提供者
-│       ├── token_manager.rs    # Token 管理
+│       ├── token_manager.rs    # Token 管理（单/多凭据）
+│       ├── web_portal.rs       # Kiro Web Portal API（账号信息）
 │       ├── machine_id.rs       # 设备指纹生成
 │       ├── model/              # 数据模型
 │       │   ├── credentials.rs  # OAuth 凭证
@@ -235,6 +265,7 @@ kiro-rs/
 │           ├── header.rs       # 头部解析
 │           └── crc.rs          # CRC 校验
 ├── Cargo.toml                  # 项目配置
+├── admin-ui/                   # 管理面板前端（Vue 3 + Vite）
 ├── config.example.json         # 配置示例
 ├── credentials.example.social.json   # Social 凭证示例
 ├── credentials.example.idc.json      # IdC 凭证示例
@@ -251,6 +282,35 @@ kiro-rs/
 - **命令行**: [Clap](https://github.com/clap-rs/clap)
 
 ## 高级功能
+
+### Admin UI（管理面板）
+
+配置 `adminApiKey` 后，访问 `http://127.0.0.1:8990/` 即可打开管理面板。
+
+功能包括：
+- 查看所有凭据状态（优先级、禁用状态、失败次数、过期时间）
+- 添加/删除凭据
+- 设置凭据优先级和禁用状态
+- 查看账号详细信息（邮箱、套餐类型、用量明细）
+- 查看凭据余额和统计信息
+- 重置失败计数
+
+### 账号信息查询
+
+通过 Kiro Web Portal API（app.kiro.dev）获取账号详细信息：
+
+```bash
+# 获取指定凭据的账号信息
+curl http://127.0.0.1:8990/api/admin/credentials/1/account \
+  -H "x-api-key: sk-admin-your-secret-key"
+```
+
+返回信息包括：
+- 账户邮箱和用户 ID
+- 订阅类型（Free/Pro/Enterprise/Teams）
+- Credits 用量明细（基础额度、免费试用、奖励额度）
+- 下次重置时间
+- 超额配置状态
 
 ### Thinking 模式
 

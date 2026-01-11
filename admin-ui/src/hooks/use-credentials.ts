@@ -1,12 +1,16 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   getCredentials,
+  deleteCredential,
   setCredentialDisabled,
   setCredentialPriority,
   resetCredentialFailure,
   getCredentialBalance,
+  getCredentialAccountInfo,
   addCredential,
-  deleteCredential,
+  getCredentialStats,
+  resetCredentialStats,
+  resetAllStats,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -20,12 +24,56 @@ export function useCredentials() {
 }
 
 // 查询凭据余额
-export function useCredentialBalance(id: number | null) {
+interface UseCredentialBalanceOptions {
+  enabled?: boolean
+  refetchInterval?: number | false
+}
+
+export function useCredentialBalance(
+  id: number | null,
+  options?: UseCredentialBalanceOptions
+) {
+  const enabled = (options?.enabled ?? true) && id !== null
   return useQuery({
     queryKey: ['credential-balance', id],
-    queryFn: () => getCredentialBalance(id!),
-    enabled: id !== null,
+    queryFn: () => {
+      if (id === null) {
+        return Promise.reject(new Error('Invalid credential id'))
+      }
+      return getCredentialBalance(id)
+    },
+    enabled,
     retry: false, // 余额查询失败时不重试（避免重复请求被封禁的账号）
+    refetchInterval: options?.refetchInterval,
+    staleTime: options?.refetchInterval || 5 * 60 * 1000, // 默认 5 分钟内不重新请求
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  })
+}
+
+// 查询凭据账号信息（套餐/用量/邮箱等）
+export function useCredentialAccountInfo(id: number | null, enabled: boolean) {
+  return useQuery({
+    queryKey: ['credential-account', id],
+    queryFn: () => getCredentialAccountInfo(id!),
+    enabled: enabled && id !== null,
+    retry: false,
+    refetchInterval: 10 * 60 * 1000, // 每 10 分钟刷新一次
+    staleTime: 5 * 60 * 1000, // 5 分钟内不重新请求
+  })
+}
+
+// 删除指定凭据
+export function useDeleteCredential() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => deleteCredential(id),
+    onSuccess: (_res, id) => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['credential-balance', id] })
+      queryClient.invalidateQueries({ queryKey: ['credential-account', id] })
+      queryClient.invalidateQueries({ queryKey: ['credential-stats', id] })
+    },
   })
 }
 
@@ -75,13 +123,36 @@ export function useAddCredential() {
   })
 }
 
-// 删除凭据
-export function useDeleteCredential() {
+// 查询指定凭据统计
+export function useCredentialStats(id: number | null, enabled: boolean) {
+  return useQuery({
+    queryKey: ['credential-stats', id],
+    queryFn: () => getCredentialStats(id!),
+    enabled: enabled && id !== null,
+    retry: false,
+  })
+}
+
+// 清空指定凭据统计
+export function useResetCredentialStats() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (id: number) => deleteCredential(id),
+    mutationFn: (id: number) => resetCredentialStats(id),
+    onSuccess: (_res, id) => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['credential-stats', id] })
+    },
+  })
+}
+
+// 清空全部统计
+export function useResetAllStats() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: () => resetAllStats(),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['credential-stats'] })
     },
   })
 }
