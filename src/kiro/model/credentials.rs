@@ -47,6 +47,16 @@ pub struct KiroCredentials {
     #[serde(default)]
     #[serde(skip_serializing_if = "is_zero")]
     pub priority: u32,
+
+    /// 凭据级 Region 配置（用于 OIDC token 刷新）
+    /// 未配置时回退到 config.json 的全局 region
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+
+    /// 凭据级 Machine ID 配置（可选）
+    /// 未配置时回退到 config.json 的 machineId；都未配置时由 refreshToken 派生
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -199,6 +209,8 @@ mod tests {
             client_id: None,
             client_secret: None,
             priority: 0,
+            region: None,
+            machine_id: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -264,5 +276,187 @@ mod tests {
         assert_eq!(list[0].refresh_token, Some("t2".to_string())); // priority 0
         assert_eq!(list[1].refresh_token, Some("t3".to_string())); // priority 1
         assert_eq!(list[2].refresh_token, Some("t1".to_string())); // priority 2
+    }
+
+    // ============ Region 字段测试 ============
+
+    #[test]
+    fn test_region_field_parsing() {
+        // 测试解析包含 region 字段的 JSON
+        let json = r#"{
+            "refreshToken": "test_refresh",
+            "region": "us-east-1"
+        }"#;
+
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(creds.refresh_token, Some("test_refresh".to_string()));
+        assert_eq!(creds.region, Some("us-east-1".to_string()));
+    }
+
+    #[test]
+    fn test_region_field_missing_backward_compat() {
+        // 测试向后兼容：不包含 region 字段的旧格式 JSON
+        let json = r#"{
+            "refreshToken": "test_refresh",
+            "authMethod": "social"
+        }"#;
+
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(creds.refresh_token, Some("test_refresh".to_string()));
+        assert_eq!(creds.region, None);
+    }
+
+    #[test]
+    fn test_region_field_serialization() {
+        // 测试序列化时正确输出 region 字段
+        let creds = KiroCredentials {
+            id: None,
+            access_token: None,
+            refresh_token: Some("test".to_string()),
+            profile_arn: None,
+            expires_at: None,
+            auth_method: None,
+            client_id: None,
+            client_secret: None,
+            priority: 0,
+            region: Some("eu-west-1".to_string()),
+            machine_id: None,
+        };
+
+        let json = creds.to_pretty_json().unwrap();
+        assert!(json.contains("region"));
+        assert!(json.contains("eu-west-1"));
+    }
+
+    #[test]
+    fn test_region_field_none_not_serialized() {
+        // 测试 region 为 None 时不序列化
+        let creds = KiroCredentials {
+            id: None,
+            access_token: None,
+            refresh_token: Some("test".to_string()),
+            profile_arn: None,
+            expires_at: None,
+            auth_method: None,
+            client_id: None,
+            client_secret: None,
+            priority: 0,
+            region: None,
+            machine_id: None,
+        };
+
+        let json = creds.to_pretty_json().unwrap();
+        assert!(!json.contains("region"));
+    }
+
+    // ============ MachineId 字段测试 ============
+
+    #[test]
+    fn test_machine_id_field_parsing() {
+        let machine_id = "a".repeat(64);
+        let json = format!(
+            r#"{{
+                "refreshToken": "test_refresh",
+                "machineId": "{machine_id}"
+            }}"#
+        );
+
+        let creds = KiroCredentials::from_json(&json).unwrap();
+        assert_eq!(creds.refresh_token, Some("test_refresh".to_string()));
+        assert_eq!(creds.machine_id, Some(machine_id));
+    }
+
+    #[test]
+    fn test_machine_id_field_serialization() {
+        let mut creds = KiroCredentials::default();
+        creds.refresh_token = Some("test".to_string());
+        creds.machine_id = Some("b".repeat(64));
+
+        let json = creds.to_pretty_json().unwrap();
+        assert!(json.contains("machineId"));
+    }
+
+    #[test]
+    fn test_machine_id_field_none_not_serialized() {
+        let mut creds = KiroCredentials::default();
+        creds.refresh_token = Some("test".to_string());
+        creds.machine_id = None;
+
+        let json = creds.to_pretty_json().unwrap();
+        assert!(!json.contains("machineId"));
+    }
+
+    #[test]
+    fn test_multiple_credentials_with_different_regions() {
+        // 测试多凭据场景下不同凭据使用各自的 region
+        let json = r#"[
+            {"refreshToken": "t1", "region": "us-east-1"},
+            {"refreshToken": "t2", "region": "eu-west-1"},
+            {"refreshToken": "t3"}
+        ]"#;
+
+        let config: CredentialsConfig = serde_json::from_str(json).unwrap();
+        let list = config.into_sorted_credentials();
+
+        assert_eq!(list[0].region, Some("us-east-1".to_string()));
+        assert_eq!(list[1].region, Some("eu-west-1".to_string()));
+        assert_eq!(list[2].region, None);
+    }
+
+    #[test]
+    fn test_region_field_with_all_fields() {
+        // 测试包含所有字段的完整 JSON
+        let json = r#"{
+            "id": 1,
+            "accessToken": "access",
+            "refreshToken": "refresh",
+            "profileArn": "arn:aws:test",
+            "expiresAt": "2025-12-31T00:00:00Z",
+            "authMethod": "idc",
+            "clientId": "client123",
+            "clientSecret": "secret456",
+            "priority": 5,
+            "region": "ap-northeast-1"
+        }"#;
+
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(creds.id, Some(1));
+        assert_eq!(creds.access_token, Some("access".to_string()));
+        assert_eq!(creds.refresh_token, Some("refresh".to_string()));
+        assert_eq!(creds.profile_arn, Some("arn:aws:test".to_string()));
+        assert_eq!(creds.expires_at, Some("2025-12-31T00:00:00Z".to_string()));
+        assert_eq!(creds.auth_method, Some("idc".to_string()));
+        assert_eq!(creds.client_id, Some("client123".to_string()));
+        assert_eq!(creds.client_secret, Some("secret456".to_string()));
+        assert_eq!(creds.priority, 5);
+        assert_eq!(creds.region, Some("ap-northeast-1".to_string()));
+    }
+
+    #[test]
+    fn test_region_roundtrip() {
+        // 测试序列化和反序列化的往返一致性
+        let original = KiroCredentials {
+            id: Some(42),
+            access_token: Some("token".to_string()),
+            refresh_token: Some("refresh".to_string()),
+            profile_arn: None,
+            expires_at: None,
+            auth_method: Some("social".to_string()),
+            client_id: None,
+            client_secret: None,
+            priority: 3,
+            region: Some("us-west-2".to_string()),
+            machine_id: Some("c".repeat(64)),
+        };
+
+        let json = original.to_pretty_json().unwrap();
+        let parsed = KiroCredentials::from_json(&json).unwrap();
+
+        assert_eq!(parsed.id, original.id);
+        assert_eq!(parsed.access_token, original.access_token);
+        assert_eq!(parsed.refresh_token, original.refresh_token);
+        assert_eq!(parsed.priority, original.priority);
+        assert_eq!(parsed.region, original.region);
+        assert_eq!(parsed.machine_id, original.machine_id);
     }
 }
