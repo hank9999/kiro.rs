@@ -1,3 +1,4 @@
+import { useQueryClient } from '@tanstack/react-query'
 import {
   Dialog,
   DialogContent,
@@ -16,7 +17,16 @@ interface BalanceDialogProps {
 }
 
 export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialogProps) {
+  const queryClient = useQueryClient()
   const { data: balance, isLoading, error } = useCredentialBalance(credentialId)
+
+  const handleOpenChange = (newOpen: boolean) => {
+    if (!newOpen && credentialId !== null) {
+      // 关闭对话框时，使账户信息查询失效，触发主账户信息卡片刷新
+      queryClient.invalidateQueries({ queryKey: ['credential-account', credentialId] })
+    }
+    onOpenChange(newOpen)
+  }
 
   const formatDate = (dateStr: string | null) => {
     if (!dateStr) return '未知'
@@ -34,7 +44,7 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>

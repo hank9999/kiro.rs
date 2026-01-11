@@ -58,6 +58,8 @@ export function useCredentialAccountInfo(id: number | null, enabled: boolean) {
     queryFn: () => getCredentialAccountInfo(id!),
     enabled: enabled && id !== null,
     retry: false,
+    refetchInterval: 10 * 60 * 1000, // 每 10 分钟刷新一次
+    staleTime: 5 * 60 * 1000, // 5 分钟内不重新请求
   })
 }
 

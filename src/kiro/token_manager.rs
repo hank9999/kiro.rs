@@ -8,9 +8,12 @@ use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
@@ -255,8 +258,9 @@ pub(crate) async fn refresh_token(
                         new_credentials.profile_arn = Some(profile_arn);
                     }
                     Ok(None) => {
-                        tracing::warn!(
-                            "ListAvailableProfiles 返回空 profiles（或无可用 arn），跳过写入 profileArn"
+                        // 可能是退避跳过、已达尝试次数、或真正的空列表，降级为 debug
+                        tracing::debug!(
+                            "未获取到 profileArn（可能为空列表/退避跳过），跳过写入 profileArn"
                         );
                     }
                     Err(e) => {
@@ -434,10 +438,73 @@ const LIST_PROFILES_MAX_PAGES: usize = 5;
 /// 错误响应 body 最大长度（用于日志截断）
 const ERROR_BODY_MAX_LEN: usize = 2048;
 
+/// 每个进程内对同一凭据最多尝试次数（避免在 profileArn 缺失/不可用时持续触发 API）
+const LIST_PROFILES_MAX_LOOKUP_ATTEMPTS: u8 = 2;
+
+/// 发生 429 限流后的退避时间（分钟）
+const LIST_PROFILES_RATE_LIMIT_BACKOFF_MINUTES: i64 = 30;
+
+/// 返回空 profiles/无 arn 时的退避时间（小时）
+const LIST_PROFILES_EMPTY_RESULT_BACKOFF_HOURS: i64 = 24;
+
+/// ListAvailableProfiles 缓存条目
+#[derive(Debug, Clone, Default)]
+struct ListProfilesCacheEntry {
+    /// 已缓存的 profile_arn（成功获取后缓存）
+    arn: Option<String>,
+    /// 尝试次数
+    attempts: u8,
+    /// 上次使用的 accessToken 哈希（避免同一 token 重复尝试）
+    last_access_token_hash: Option<String>,
+    /// 退避截止时间（在此时间之前不再尝试）
+    next_allowed_at: Option<DateTime<Utc>>,
+}
+
+/// 全局 ListAvailableProfiles 缓存
+static LIST_PROFILES_CACHE: OnceLock<Mutex<HashMap<String, ListProfilesCacheEntry>>> =
+    OnceLock::new();
+
+/// 获取 ListAvailableProfiles 缓存
+fn list_profiles_cache() -> &'static Mutex<HashMap<String, ListProfilesCacheEntry>> {
+    LIST_PROFILES_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 计算字符串的 SHA256 哈希（十六进制）
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let result = hasher.finalize();
+    hex::encode(result)
+}
+
+/// 生成 ListAvailableProfiles 缓存键
+fn list_profiles_cache_key(credentials: &KiroCredentials, config: &Config) -> Option<String> {
+    let refresh_token = credentials.refresh_token.as_deref()?;
+    if refresh_token.trim().is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}:{}",
+        config.region,
+        sha256_hex(&format!("list_available_profiles/{}", refresh_token))
+    ))
+}
+
+/// ListAvailableProfiles 请求体
+///
+/// 当 `next_token` 为 None 时序列化为 `{}`（而不是空 body）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListAvailableProfilesRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_token: Option<&'a str>,
+}
+
 /// 调用 ListAvailableProfiles API 获取可用的 profileArn（用于 IdC/builder-id 凭证）
 ///
 /// - 支持分页：循环请求直到找到第一个非空 arn 或 nextToken 为空
 /// - profiles 为空/无 arn 时返回 Ok(None)（降级，不阻断调用方流程）
+/// - 内置进程内缓存和退避机制，避免频繁调用 API
 pub(crate) async fn list_available_profiles(
     credentials: &KiroCredentials,
     config: &Config,
@@ -447,6 +514,55 @@ pub(crate) async fn list_available_profiles(
     use anyhow::Context;
 
     tracing::debug!("正在获取可用 Profiles...");
+
+    // ========================================================================
+    // 进程内缓存 / 退避：避免 profileArn 缺失时每次刷新都触发 ListAvailableProfiles
+    // 合并"检查缓存 + 预占本次尝试"到同一个锁，消除并发竞态
+    // ========================================================================
+    let cache_key = list_profiles_cache_key(credentials, config);
+    let access_token_hash = sha256_hex(access_token);
+
+    if let Some(ref key) = cache_key {
+        let now = Utc::now();
+        let mut cache = list_profiles_cache().lock();
+        let entry = cache.entry(key.clone()).or_default();
+
+        // 已缓存成功结果
+        if let Some(ref arn) = entry.arn {
+            tracing::debug!("profileArn 命中进程内缓存，跳过 ListAvailableProfiles 请求");
+            return Ok(Some(arn.clone()));
+        }
+        // 已达到最大尝试次数
+        if entry.attempts >= LIST_PROFILES_MAX_LOOKUP_ATTEMPTS {
+            tracing::debug!(
+                "profileArn 已尝试 {} 次，跳过 ListAvailableProfiles 请求",
+                entry.attempts
+            );
+            return Ok(None);
+        }
+        // 处于退避期
+        if let Some(next_allowed_at) = entry.next_allowed_at {
+            if next_allowed_at > now {
+                tracing::debug!(
+                    "profileArn 获取处于退避期（直到 {}），跳过 ListAvailableProfiles 请求",
+                    next_allowed_at
+                );
+                return Ok(None);
+            }
+        }
+        // 已用当前 accessToken 尝试过
+        if entry.last_access_token_hash.as_deref() == Some(access_token_hash.as_str()) {
+            tracing::debug!(
+                "profileArn 已用当前 accessToken 尝试过，跳过 ListAvailableProfiles 请求"
+            );
+            return Ok(None);
+        }
+
+        // 预占本次尝试（在同一个锁内完成，避免并发竞态）
+        entry.attempts = entry.attempts.saturating_add(1);
+        entry.last_access_token_hash = Some(access_token_hash.clone());
+        entry.next_allowed_at = None;
+    }
 
     let region = &config.region;
     let host = format!("q.{}.amazonaws.com", region);
@@ -475,10 +591,9 @@ pub(crate) async fn list_available_profiles(
 
     // 分页循环
     for page in 0..LIST_PROFILES_MAX_PAGES {
-        // 构建请求 body（带或不带 nextToken）
-        let body = match &next_token {
-            Some(token) => serde_json::json!({ "nextToken": token }),
-            None => serde_json::json!({}),
+        // 构建请求 body（next_token 为 None 时发送 `{}`）
+        let body = ListAvailableProfilesRequest {
+            next_token: next_token.as_deref(),
         };
 
         let response = client
@@ -498,6 +613,22 @@ pub(crate) async fn list_available_profiles(
 
         let status = response.status();
         if !status.is_success() {
+            // 429/5xx 做退避，避免下一次刷新立即重复请求
+            if let Some(ref key) = cache_key {
+                let backoff_until = match status.as_u16() {
+                    429 => Some(
+                        Utc::now() + Duration::minutes(LIST_PROFILES_RATE_LIMIT_BACKOFF_MINUTES),
+                    ),
+                    500..=599 => Some(Utc::now() + Duration::minutes(5)),
+                    _ => None,
+                };
+                if let Some(backoff_until) = backoff_until {
+                    let mut cache = list_profiles_cache().lock();
+                    let entry = cache.entry(key.clone()).or_default();
+                    entry.next_allowed_at = Some(backoff_until);
+                }
+            }
+
             let body_text = match response.text().await {
                 Ok(t) => truncate_string(&t, ERROR_BODY_MAX_LEN),
                 Err(e) => format!("<读取响应 body 失败: {}>", e),
@@ -528,6 +659,14 @@ pub(crate) async fn list_available_profiles(
             .find(|arn| !arn.is_empty());
 
         if let Some(selected_arn) = arn {
+            // 缓存成功结果
+            if let Some(ref key) = cache_key {
+                let mut cache = list_profiles_cache().lock();
+                let entry = cache.entry(key.clone()).or_default();
+                entry.arn = Some(selected_arn.clone());
+                entry.next_allowed_at = None;
+            }
+
             tracing::debug!(
                 "从 {} 个 profiles（第 {} 页）中选择了 arn: {}...{}",
                 total_profiles,
@@ -548,6 +687,15 @@ pub(crate) async fn list_available_profiles(
     }
 
     tracing::debug!("共检查 {} 个 profiles，无可用 arn", total_profiles);
+
+    // 空结果做退避，避免每次刷新都再次探测
+    if let Some(ref key) = cache_key {
+        let mut cache = list_profiles_cache().lock();
+        let entry = cache.entry(key.clone()).or_default();
+        entry.next_allowed_at =
+            Some(Utc::now() + Duration::hours(LIST_PROFILES_EMPTY_RESULT_BACKOFF_HOURS));
+    }
+
     Ok(None)
 }
 
