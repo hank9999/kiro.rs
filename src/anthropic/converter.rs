@@ -151,7 +151,11 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     let history = build_history(req, &model_id)?;
 
-    // 8. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
+    // 8. 验证并过滤 tool_use/tool_result 配对
+    // 移除孤立的 tool_result（没有对应的 tool_use）
+    let validated_tool_results = validate_tool_pairing(&history, &tool_results);
+
+    // 9. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
     // 注意：Kiro 匹配工具名称时忽略大小写，所以这里也需要忽略大小写比较
     let history_tool_names = collect_history_tool_names(&history);
@@ -166,16 +170,16 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         }
     }
 
-    // 9. 构建 UserInputMessageContext
+    // 10. 构建 UserInputMessageContext
     let mut context = UserInputMessageContext::new();
     if !tools.is_empty() {
         context = context.with_tools(tools);
     }
-    if !tool_results.is_empty() {
-        context = context.with_tool_results(tool_results.clone());
+    if !validated_tool_results.is_empty() {
+        context = context.with_tool_results(validated_tool_results);
     }
 
-    // 10. 构建当前消息
+    // 11. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
     let content = text_content;
 
@@ -189,7 +193,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     let current_message = CurrentMessage::new(user_input);
 
-    // 11. 构建 ConversationState
+    // 12. 构建 ConversationState
     let conversation_state = ConversationState::new(conversation_id)
         .with_agent_continuation_id(agent_continuation_id)
         .with_agent_task_type("vibe")
@@ -291,6 +295,62 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
         Some(v) => v.to_string(),
         None => String::new(),
     }
+}
+
+/// 验证并过滤 tool_use/tool_result 配对
+///
+/// 收集所有 tool_use_id，验证 tool_result 是否匹配
+/// 静默跳过孤立的 tool_use 和 tool_result，输出警告日志
+///
+/// # Arguments
+/// * `history` - 历史消息引用
+/// * `tool_results` - 当前消息中的 tool_result 列表
+///
+/// # Returns
+/// 经过验证和过滤后的 tool_result 列表
+fn validate_tool_pairing(history: &[Message], tool_results: &[ToolResult]) -> Vec<ToolResult> {
+    use std::collections::HashSet;
+
+    // 1. 收集所有历史中的 tool_use_id
+    let mut valid_tool_use_ids: HashSet<String> = HashSet::new();
+
+    for msg in history {
+        if let Message::Assistant(assistant_msg) = msg {
+            if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
+                for tool_use in tool_uses {
+                    valid_tool_use_ids.insert(tool_use.tool_use_id.clone());
+                }
+            }
+        }
+    }
+
+    // 2. 过滤并验证 tool_results
+    let mut filtered_results = Vec::new();
+
+    for result in tool_results {
+        if valid_tool_use_ids.contains(&result.tool_use_id) {
+            // 配对成功
+            filtered_results.push(result.clone());
+            // 从集合中移除，用于后续检测孤立 tool_use
+            valid_tool_use_ids.remove(&result.tool_use_id);
+        } else {
+            // 孤立 tool_result - 静默跳过并输出警告
+            tracing::warn!(
+                "跳过孤立的 tool_result：找不到对应的 tool_use，tool_use_id={}",
+                result.tool_use_id
+            );
+        }
+    }
+
+    // 3. 检测孤立的 tool_use（有 tool_use 但没有对应的 tool_result）
+    for orphaned_id in &valid_tool_use_ids {
+        tracing::warn!(
+            "检测到孤立的 tool_use：找不到对应的 tool_result，tool_use_id={}",
+            orphaned_id
+        );
+    }
+
+    filtered_results
 }
 
 /// 转换工具定义
@@ -797,5 +857,111 @@ mod tests {
                 .count(),
             4
         );
+    }
+
+    #[test]
+    fn test_validate_tool_pairing_orphaned_result() {
+        // 测试孤立的 tool_result 被过滤
+        // 历史中没有 tool_use，但 tool_results 中有 tool_result
+        let history = vec![
+            Message::User(HistoryUserMessage::new("Hello", "claude-sonnet-4.5")),
+            Message::Assistant(HistoryAssistantMessage::new("Hi there!")),
+        ];
+
+        let tool_results = vec![ToolResult::success("orphan-123", "some result")];
+
+        let filtered = validate_tool_pairing(&history, &tool_results);
+
+        // 孤立的 tool_result 应该被过滤掉
+        assert!(filtered.is_empty(), "孤立的 tool_result 应该被过滤");
+    }
+
+    #[test]
+    fn test_validate_tool_pairing_orphaned_use() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        // 测试孤立的 tool_use（有 tool_use 但没有对应的 tool_result）
+        let mut assistant_msg = AssistantMessage::new("I'll read the file.");
+        assistant_msg = assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-orphan", "read")
+            .with_input(serde_json::json!({"path": "/test.txt"}))]);
+
+        let history = vec![
+            Message::User(HistoryUserMessage::new(
+                "Read the file",
+                "claude-sonnet-4.5",
+            )),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: assistant_msg,
+            }),
+        ];
+
+        // 没有 tool_result
+        let tool_results: Vec<ToolResult> = vec![];
+
+        let filtered = validate_tool_pairing(&history, &tool_results);
+
+        // 结果应该为空（因为没有 tool_result）
+        // 同时应该输出警告日志（孤立的 tool_use）
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_validate_tool_pairing_valid() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        // 测试正常配对的情况
+        let mut assistant_msg = AssistantMessage::new("I'll read the file.");
+        assistant_msg = assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
+            .with_input(serde_json::json!({"path": "/test.txt"}))]);
+
+        let history = vec![
+            Message::User(HistoryUserMessage::new(
+                "Read the file",
+                "claude-sonnet-4.5",
+            )),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: assistant_msg,
+            }),
+        ];
+
+        let tool_results = vec![ToolResult::success("tool-1", "file content")];
+
+        let filtered = validate_tool_pairing(&history, &tool_results);
+
+        // 配对成功，应该保留
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].tool_use_id, "tool-1");
+    }
+
+    #[test]
+    fn test_validate_tool_pairing_mixed() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        // 测试混合情况：部分配对成功，部分孤立
+        let mut assistant_msg = AssistantMessage::new("I'll use two tools.");
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({})),
+            ToolUseEntry::new("tool-2", "write").with_input(serde_json::json!({})),
+        ]);
+
+        let history = vec![
+            Message::User(HistoryUserMessage::new("Do something", "claude-sonnet-4.5")),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: assistant_msg,
+            }),
+        ];
+
+        // tool_results: tool-1 配对，tool-3 孤立
+        let tool_results = vec![
+            ToolResult::success("tool-1", "result 1"),
+            ToolResult::success("tool-3", "orphan result"), // 孤立
+        ];
+
+        let filtered = validate_tool_pairing(&history, &tool_results);
+
+        // 只有 tool-1 应该保留
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].tool_use_id, "tool-1");
+        // tool-2 是孤立的 tool_use（无 result），tool-3 是孤立的 tool_result
     }
 }
