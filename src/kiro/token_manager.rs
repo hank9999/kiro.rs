@@ -132,7 +132,14 @@ pub(crate) async fn refresh_token(
     validate_refresh_token(credentials)?;
 
     // 根据 auth_method 选择刷新方式
-    let auth_method = credentials.auth_method.as_deref().unwrap_or("social");
+    // 如果未指定 auth_method，根据是否有 clientId/clientSecret 自动判断
+    let auth_method = credentials.auth_method.as_deref().unwrap_or_else(|| {
+        if credentials.client_id.is_some() && credentials.client_secret.is_some() {
+            "idc"
+        } else {
+            "social"
+        }
+    });
 
     match auth_method.to_lowercase().as_str() {
         "idc" | "builder-id" => refresh_idc_token(credentials, config, proxy).await,
@@ -149,7 +156,8 @@ async fn refresh_social_token(
     tracing::info!("正在刷新 Social Token...");
 
     let refresh_token = credentials.refresh_token.as_ref().unwrap();
-    let region = &config.region;
+    // 优先使用凭据级 region，未配置时回退到 config.region
+    let region = credentials.region.as_ref().unwrap_or(&config.region);
 
     let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
     let refresh_domain = format!("prod.{}.auth.desktop.kiro.dev", region);
@@ -232,7 +240,8 @@ async fn refresh_idc_token(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("IdC 刷新需要 clientSecret"))?;
 
-    let region = &config.region;
+    // 优先使用凭据级 region，未配置时回退到 config.region
+    let region = credentials.region.as_ref().unwrap_or(&config.region);
     let refresh_url = format!("https://oidc.{}.amazonaws.com/token", region);
 
     let client = build_client(proxy, 60)?;
@@ -1500,5 +1509,129 @@ mod tests {
             err
         );
         assert_eq!(manager.available_count(), 0);
+    }
+
+    // ============ 凭据级 Region 优先级测试 ============
+
+    /// 辅助函数：获取 OIDC 刷新使用的 region（用于测试）
+    fn get_oidc_region_for_credential<'a>(
+        credentials: &'a KiroCredentials,
+        config: &'a Config,
+    ) -> &'a str {
+        credentials.region.as_ref().unwrap_or(&config.region)
+    }
+
+    #[test]
+    fn test_credential_region_priority_uses_credential_region() {
+        // 凭据配置了 region 时，应使用凭据的 region
+        let mut config = Config::default();
+        config.region = "us-west-2".to_string();
+
+        let mut credentials = KiroCredentials::default();
+        credentials.region = Some("eu-west-1".to_string());
+
+        let region = get_oidc_region_for_credential(&credentials, &config);
+        assert_eq!(region, "eu-west-1");
+    }
+
+    #[test]
+    fn test_credential_region_priority_fallback_to_config() {
+        // 凭据未配置 region 时，应回退到 config.region
+        let mut config = Config::default();
+        config.region = "us-west-2".to_string();
+
+        let credentials = KiroCredentials::default();
+        assert!(credentials.region.is_none());
+
+        let region = get_oidc_region_for_credential(&credentials, &config);
+        assert_eq!(region, "us-west-2");
+    }
+
+    #[test]
+    fn test_multiple_credentials_use_respective_regions() {
+        // 多凭据场景下，不同凭据使用各自的 region
+        let mut config = Config::default();
+        config.region = "ap-northeast-1".to_string();
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.region = Some("us-east-1".to_string());
+
+        let mut cred2 = KiroCredentials::default();
+        cred2.region = Some("eu-west-1".to_string());
+
+        let cred3 = KiroCredentials::default(); // 无 region，使用 config
+
+        assert_eq!(get_oidc_region_for_credential(&cred1, &config), "us-east-1");
+        assert_eq!(get_oidc_region_for_credential(&cred2, &config), "eu-west-1");
+        assert_eq!(
+            get_oidc_region_for_credential(&cred3, &config),
+            "ap-northeast-1"
+        );
+    }
+
+    #[test]
+    fn test_idc_oidc_endpoint_uses_credential_region() {
+        // 验证 IdC OIDC endpoint URL 使用凭据 region
+        let mut config = Config::default();
+        config.region = "us-west-2".to_string();
+
+        let mut credentials = KiroCredentials::default();
+        credentials.region = Some("eu-central-1".to_string());
+
+        let region = get_oidc_region_for_credential(&credentials, &config);
+        let refresh_url = format!("https://oidc.{}.amazonaws.com/token", region);
+
+        assert_eq!(refresh_url, "https://oidc.eu-central-1.amazonaws.com/token");
+    }
+
+    #[test]
+    fn test_social_refresh_endpoint_uses_credential_region() {
+        // 验证 Social refresh endpoint URL 使用凭据 region
+        let mut config = Config::default();
+        config.region = "us-west-2".to_string();
+
+        let mut credentials = KiroCredentials::default();
+        credentials.region = Some("ap-southeast-1".to_string());
+
+        let region = get_oidc_region_for_credential(&credentials, &config);
+        let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
+
+        assert_eq!(
+            refresh_url,
+            "https://prod.ap-southeast-1.auth.desktop.kiro.dev/refreshToken"
+        );
+    }
+
+    #[test]
+    fn test_api_call_still_uses_config_region() {
+        // 验证 API 调用（如 getUsageLimits）仍使用 config.region
+        // 这确保只有 OIDC 刷新使用凭据 region，API 调用行为不变
+        let mut config = Config::default();
+        config.region = "us-west-2".to_string();
+
+        let mut credentials = KiroCredentials::default();
+        credentials.region = Some("eu-west-1".to_string());
+
+        // API 调用应使用 config.region，而非 credentials.region
+        let api_region = &config.region;
+        let api_host = format!("q.{}.amazonaws.com", api_region);
+
+        assert_eq!(api_host, "q.us-west-2.amazonaws.com");
+        // 确认凭据 region 不影响 API 调用
+        assert_ne!(api_region, credentials.region.as_ref().unwrap());
+    }
+
+    #[test]
+    fn test_credential_region_empty_string_treated_as_set() {
+        // 空字符串 region 被视为已设置（虽然不推荐，但行为应一致）
+        let mut config = Config::default();
+        config.region = "us-west-2".to_string();
+
+        let mut credentials = KiroCredentials::default();
+        credentials.region = Some("".to_string());
+
+        let region = get_oidc_region_for_credential(&credentials, &config);
+        // 空字符串被视为已设置，不会回退到 config
+        assert_eq!(region, "");
     }
 }

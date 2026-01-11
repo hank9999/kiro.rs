@@ -78,6 +78,14 @@ pub struct AddCredentialRequest {
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,
+
+    /// 凭据级 Region 配置（用于 OIDC token 刷新）
+    /// 未配置时回退到 config.json 的全局 region
+    pub region: Option<String>,
+
+    /// 凭据级 Machine ID（可选，64 位字符串）
+    /// 未配置时回退到 config.json 的 machineId
+    pub machine_id: Option<String>,
 }
 
 fn default_auth_method() -> String {

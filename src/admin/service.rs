@@ -128,6 +128,8 @@ impl AdminService {
             client_id: req.client_id,
             client_secret: req.client_secret,
             priority: req.priority,
+            region: req.region,
+            machine_id: req.machine_id,
         };
 
         // 调用 token_manager 添加凭据

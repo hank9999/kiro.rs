@@ -101,6 +101,7 @@ cargo build --release
       "authMethod": "idc",
       "clientId": "xxxxxxxxx",
       "clientSecret": "xxxxxxxxx",
+      "region": "us-east-2",
       "priority": 1
    }
 ]
@@ -111,6 +112,7 @@ cargo build --release
 > - 单凭据最多重试 3 次，单请求最多重试 9 次
 > - 自动故障转移到下一个可用凭据
 > - 多凭据格式下 Token 刷新后自动回写到源文件
+> - 可选的 `region` 字段：用于 OIDC token 刷新时指定 endpoint 区域，未配置时回退到 config.json 的 region
 
 最小启动配置(social):
 ```json
@@ -194,6 +196,8 @@ curl http://127.0.0.1:8990/v1/messages \
 | `clientId` | string | IdC 登录的客户端 ID（可选）      |
 | `clientSecret` | string | IdC 登录的客户端密钥（可选）      |
 | `priority` | number | 凭据优先级，数字越小越优先，默认为 0（多凭据格式时有效）|
+| `region` | string | 凭据级 region（可选），用于 OIDC token 刷新时指定 endpoint 的区域。未配置时回退到 config.json 的 region。注意：API 调用始终使用 config.json 的 region |
+| `machineId` | string | 凭据级机器码（可选，64位十六进制）。未配置时回退到 config.json 的 machineId；都未配置时由 refreshToken 派生 |
 
 ## 模型映射
 
