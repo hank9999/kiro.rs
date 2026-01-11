@@ -1820,4 +1820,69 @@ mod tests {
         );
         assert_eq!(manager.available_count(), 0);
     }
+
+    /// 测试 IdC Token 刷新功能
+    /// 从外部凭据文件加载 IdC 凭据并尝试刷新 Token
+    #[tokio::test]
+    #[ignore] // 需要有效的 IdC 凭据才能运行，使用 cargo test -- --ignored 运行
+    async fn test_refresh_idc_token_from_file() {
+        use std::path::Path;
+
+        // 从外部文件加载凭据
+        let credentials_path = Path::new(r"F:\working_ai\kiro2api-cc\credentials.json");
+        if !credentials_path.exists() {
+            println!("凭据文件不存在，跳过测试");
+            return;
+        }
+
+        let content = std::fs::read_to_string(credentials_path).expect("读取凭据文件失败");
+        let credentials_list: Vec<KiroCredentials> =
+            serde_json::from_str(&content).expect("解析凭据文件失败");
+
+        // 找到 IdC 凭据（id=14 或 id=15）
+        let idc_credentials: Vec<_> = credentials_list
+            .iter()
+            .filter(|c| {
+                c.auth_method
+                    .as_ref()
+                    .map(|m| m.to_lowercase() == "idc")
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        if idc_credentials.is_empty() {
+            println!("未找到 IdC 凭据，跳过测试");
+            return;
+        }
+
+        println!("找到 {} 个 IdC 凭据", idc_credentials.len());
+
+        let config = Config::default();
+
+        for cred in idc_credentials {
+            let id = cred.id.unwrap_or(0);
+            println!("\n========================================");
+            println!("测试凭据 #{}", id);
+            println!("clientId: {:?}", cred.client_id.as_ref().map(|s| &s[..20.min(s.len())]));
+            println!("refreshToken: {:?}", cred.refresh_token.as_ref().map(|s| &s[..20.min(s.len())]));
+            println!("当前 expiresAt: {:?}", cred.expires_at);
+
+            match refresh_idc_token(cred, &config, None).await {
+                Ok(new_cred) => {
+                    println!("刷新成功!");
+                    println!("新 accessToken: {:?}", new_cred.access_token.as_ref().map(|s| &s[..50.min(s.len())]));
+                    println!("新 expiresAt: {:?}", new_cred.expires_at);
+
+                    // 验证新 Token 有效
+                    assert!(new_cred.access_token.is_some(), "刷新后应有 accessToken");
+                    assert!(new_cred.expires_at.is_some(), "刷新后应有 expiresAt");
+                    assert!(!is_token_expired(&new_cred), "刷新后的 Token 不应过期");
+                }
+                Err(e) => {
+                    println!("刷新失败: {}", e);
+                    // 不 panic，继续测试其他凭据
+                }
+            }
+        }
+    }
 }
