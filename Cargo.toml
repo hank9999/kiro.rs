@@ -10,7 +10,7 @@ strip = true
 [dependencies]
 axum = "0.8"
 tokio = { version = "1.0", features = ["full"] }
-reqwest = { version = "0.12", features = ["stream", "json", "socks"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "socks", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"

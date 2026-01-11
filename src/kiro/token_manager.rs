@@ -491,6 +491,8 @@ impl MultiTokenManager {
         let max_existing_id = credentials.iter().filter_map(|c| c.id).max().unwrap_or(0);
         let mut next_id = max_existing_id + 1;
         let mut has_new_ids = false;
+        let mut has_new_machine_ids = false;
+        let config_ref = &config;
 
         let entries: Vec<CredentialEntry> = credentials
             .into_iter()
@@ -502,6 +504,14 @@ impl MultiTokenManager {
                     has_new_ids = true;
                     id
                 });
+                if cred.machine_id.is_none() {
+                    if let Some(machine_id) =
+                        machine_id::generate_from_credentials(&cred, config_ref)
+                    {
+                        cred.machine_id = Some(machine_id);
+                        has_new_machine_ids = true;
+                    }
+                }
                 CredentialEntry {
                     id,
                     credentials: cred,
@@ -541,12 +551,12 @@ impl MultiTokenManager {
             is_multiple_format,
         };
 
-        // 如果有新分配的 ID，立即持久化到配置文件
-        if has_new_ids {
+        // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
+        if has_new_ids || has_new_machine_ids {
             if let Err(e) = manager.persist_credentials() {
-                tracing::warn!("新分配 ID 后持久化失败: {}", e);
+                tracing::warn!("补全凭据 ID/machineId 后持久化失败: {}", e);
             } else {
-                tracing::info!("已为凭据分配新 ID 并写回配置文件");
+                tracing::info!("已补全凭据 ID/machineId 并写回配置文件");
             }
         }
 
