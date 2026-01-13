@@ -1,10 +1,13 @@
 //! 设备指纹生成器
 //!
+//! Input: KiroCredentials
+//! Output: 64位十六进制 machineId
+//! Pos: 设备指纹生成
 
 use sha2::{Digest, Sha256};
 
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::model::config::Config;
+use crate::model::runtime_config::RuntimeConfig;
 
 /// 标准化 machineId 格式
 ///
@@ -34,17 +37,10 @@ fn normalize_machine_id(machine_id: &str) -> Option<String> {
 
 /// 根据凭证信息生成唯一的 Machine ID
 ///
-/// 优先使用凭据级 machineId，其次使用 config.machineId，然后使用 refreshToken 生成
-pub fn generate_from_credentials(credentials: &KiroCredentials, config: &Config) -> Option<String> {
+/// 优先使用凭据级 machineId，否则使用 refreshToken 自动生成
+pub fn generate_from_credentials(credentials: &KiroCredentials, _config: &RuntimeConfig) -> Option<String> {
     // 如果配置了凭据级 machineId，优先使用
     if let Some(ref machine_id) = credentials.machine_id {
-        if let Some(normalized) = normalize_machine_id(machine_id) {
-            return Some(normalized);
-        }
-    }
-
-    // 如果配置了全局 machineId，作为默认值
-    if let Some(ref machine_id) = config.machine_id {
         if let Some(normalized) = normalize_machine_id(machine_id) {
             return Some(normalized);
         }
@@ -84,22 +80,11 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_with_custom_machine_id() {
-        let credentials = KiroCredentials::default();
-        let mut config = Config::default();
-        config.machine_id = Some("a".repeat(64));
-
-        let result = generate_from_credentials(&credentials, &config);
-        assert_eq!(result, Some("a".repeat(64)));
-    }
-
-    #[test]
-    fn test_generate_with_credential_machine_id_overrides_config() {
+    fn test_generate_with_credential_machine_id() {
         let mut credentials = KiroCredentials::default();
         credentials.machine_id = Some("b".repeat(64));
 
-        let mut config = Config::default();
-        config.machine_id = Some("a".repeat(64));
+        let config = RuntimeConfig::default();
 
         let result = generate_from_credentials(&credentials, &config);
         assert_eq!(result, Some("b".repeat(64)));
@@ -108,8 +93,8 @@ mod tests {
     #[test]
     fn test_generate_with_refresh_token() {
         let mut credentials = KiroCredentials::default();
-        credentials.refresh_token = Some("test_refresh_token".to_string());     
-        let config = Config::default();
+        credentials.refresh_token = Some("test_refresh_token".to_string());
+        let config = RuntimeConfig::default();
 
         let result = generate_from_credentials(&credentials, &config);
         assert!(result.is_some());
@@ -119,7 +104,7 @@ mod tests {
     #[test]
     fn test_generate_without_credentials() {
         let credentials = KiroCredentials::default();
-        let config = Config::default();
+        let config = RuntimeConfig::default();
 
         let result = generate_from_credentials(&credentials, &config);
         assert!(result.is_none());
@@ -158,7 +143,7 @@ mod tests {
         let mut credentials = KiroCredentials::default();
         credentials.machine_id = Some("2582956e-cc88-4669-b546-07adbffcb894".to_string());
 
-        let config = Config::default();
+        let config = RuntimeConfig::default();
 
         let result = generate_from_credentials(&credentials, &config);
         assert!(result.is_some());

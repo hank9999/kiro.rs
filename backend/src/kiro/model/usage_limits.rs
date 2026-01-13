@@ -19,6 +19,23 @@ pub struct UsageLimitsResponse {
     /// 使用量明细列表
     #[serde(default)]
     pub usage_breakdown_list: Vec<UsageBreakdown>,
+
+    /// 用户信息
+    #[serde(default)]
+    pub user_info: Option<UserInfo>,
+}
+
+/// 用户信息
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInfo {
+    /// 用户邮箱
+    #[serde(default)]
+    pub email: Option<String>,
+
+    /// 用户 ID
+    #[serde(default)]
+    pub user_id: Option<String>,
 }
 
 /// 订阅信息
@@ -105,6 +122,13 @@ impl UsageLimitsResponse {
         self.subscription_info
             .as_ref()
             .and_then(|info| info.subscription_title.as_deref())
+    }
+
+    /// 获取用户邮箱
+    pub fn user_email(&self) -> Option<&str> {
+        self.user_info
+            .as_ref()
+            .and_then(|info| info.email.as_deref())
     }
 
     /// 获取第一个使用量明细

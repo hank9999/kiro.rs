@@ -1,8 +1,8 @@
 //! Kiro API Provider
 //!
-//! 核心组件，负责与 Kiro API 通信
-//! 支持流式和非流式请求
-//! 支持多凭据故障转移和重试
+//! Input: MultiTokenManager, proxy_url
+//! Output: API 请求、流式响应
+//! Pos: 核心 API 通信层
 
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, HeaderMap, HeaderValue};
@@ -11,12 +11,10 @@ use std::time::Duration;
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::build_client;
 use crate::kiro::machine_id;
-use crate::kiro::token_manager::{CallContext, MultiTokenManager};
-
-#[cfg(test)]
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::token_manager::{CallContext, MultiTokenManager};
 
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
@@ -36,12 +34,12 @@ pub struct KiroProvider {
 impl KiroProvider {
     /// 创建新的 KiroProvider 实例
     pub fn new(token_manager: Arc<MultiTokenManager>) -> Self {
-        Self::with_proxy(token_manager, None)
+        Self::with_proxy_url(token_manager, None)
     }
 
     /// 创建带代理配置的 KiroProvider 实例
-    pub fn with_proxy(token_manager: Arc<MultiTokenManager>, proxy: Option<ProxyConfig>) -> Self {
-        let client = build_client(proxy.as_ref(), 720) // 12 分钟超时
+    pub fn with_proxy_url(token_manager: Arc<MultiTokenManager>, proxy_url: Option<&str>) -> Self {
+        let client = build_client(proxy_url, 720) // 12 分钟超时
             .expect("创建 HTTP 客户端失败");
 
         Self {
@@ -55,25 +53,25 @@ impl KiroProvider {
         &self.token_manager
     }
 
-    /// 获取 API 基础 URL
-    pub fn base_url(&self) -> String {
+    /// 获取 API 基础 URL（使用凭据级别的 region）
+    fn base_url_for(credentials: &KiroCredentials) -> String {
+        let region = credentials.region.as_deref().unwrap_or("us-east-1");
         format!(
             "https://q.{}.amazonaws.com/generateAssistantResponse",
-            self.token_manager.config().region
+            region
         )
     }
 
-    /// 获取 MCP API URL
-    pub fn mcp_url(&self) -> String {
-        format!(
-            "https://q.{}.amazonaws.com/mcp",
-            self.token_manager.config().region
-        )
+    /// 获取 MCP API URL（使用凭据级别的 region）
+    fn mcp_url_for(credentials: &KiroCredentials) -> String {
+        let region = credentials.region.as_deref().unwrap_or("us-east-1");
+        format!("https://q.{}.amazonaws.com/mcp", region)
     }
 
-    /// 获取 API 基础域名
-    pub fn base_domain(&self) -> String {
-        format!("q.{}.amazonaws.com", self.token_manager.config().region)
+    /// 获取 API 基础域名（使用凭据级别的 region）
+    fn base_domain_for(credentials: &KiroCredentials) -> String {
+        let region = credentials.region.as_deref().unwrap_or("us-east-1");
+        format!("q.{}.amazonaws.com", region)
     }
 
     /// 构建请求头
@@ -113,7 +111,7 @@ impl KiroProvider {
             reqwest::header::USER_AGENT,
             HeaderValue::from_str(&user_agent).unwrap(),
         );
-        headers.insert(HOST, HeaderValue::from_str(&self.base_domain()).unwrap());
+        headers.insert(HOST, HeaderValue::from_str(&Self::base_domain_for(&ctx.credentials)).unwrap());
         headers.insert(
             "amz-sdk-invocation-id",
             HeaderValue::from_str(&Uuid::new_v4().to_string()).unwrap(),
@@ -166,7 +164,7 @@ impl KiroProvider {
         );
         headers.insert(
             "host",
-            HeaderValue::from_str(&self.base_domain()).unwrap(),
+            HeaderValue::from_str(&Self::base_domain_for(&ctx.credentials)).unwrap(),
         );
         headers.insert(
             "amz-sdk-invocation-id",
@@ -248,7 +246,7 @@ impl KiroProvider {
                 }
             };
 
-            let url = self.mcp_url();
+            let url = Self::mcp_url_for(&ctx.credentials);
             let headers = match self.build_mcp_headers(&ctx) {
                 Ok(h) => h,
                 Err(e) => {
@@ -377,7 +375,7 @@ impl KiroProvider {
                 }
             };
 
-            let url = self.base_url();
+            let url = Self::base_url_for(&ctx.credentials);
             let headers = match self.build_headers(&ctx) {
                 Ok(h) => h,
                 Err(e) => {
@@ -562,40 +560,56 @@ impl KiroProvider {
 mod tests {
     use super::*;
     use crate::kiro::token_manager::CallContext;
-    use crate::model::config::Config;
+    use crate::model::runtime_config::RuntimeConfig;
 
-    fn create_test_provider(config: Config, credentials: KiroCredentials) -> KiroProvider {
-        let tm = MultiTokenManager::new(config, vec![credentials], None, None, false).unwrap();
+    fn create_test_provider(config: RuntimeConfig, credentials: KiroCredentials) -> KiroProvider {
+        let tm = MultiTokenManager::new(config, vec![credentials], None).unwrap();
         KiroProvider::new(Arc::new(tm))
     }
 
     #[test]
-    fn test_base_url() {
-        let config = Config::default();
+    fn test_base_url_for() {
+        // 测试默认 region
         let credentials = KiroCredentials::default();
-        let provider = create_test_provider(config, credentials);
-        assert!(provider.base_url().contains("amazonaws.com"));
-        assert!(provider.base_url().contains("generateAssistantResponse"));
+        let url = KiroProvider::base_url_for(&credentials);
+        assert!(url.contains("us-east-1"));
+        assert!(url.contains("amazonaws.com"));
+        assert!(url.contains("generateAssistantResponse"));
+
+        // 测试自定义 region
+        let mut credentials = KiroCredentials::default();
+        credentials.region = Some("eu-west-1".to_string());
+        let url = KiroProvider::base_url_for(&credentials);
+        assert!(url.contains("eu-west-1"));
     }
 
     #[test]
-    fn test_base_domain() {
-        let mut config = Config::default();
-        config.region = "us-east-1".to_string();
+    fn test_base_domain_for() {
+        // 测试默认 region
         let credentials = KiroCredentials::default();
-        let provider = create_test_provider(config, credentials);
-        assert_eq!(provider.base_domain(), "q.us-east-1.amazonaws.com");
+        assert_eq!(
+            KiroProvider::base_domain_for(&credentials),
+            "q.us-east-1.amazonaws.com"
+        );
+
+        // 测试自定义 region
+        let mut credentials = KiroCredentials::default();
+        credentials.region = Some("eu-west-1".to_string());
+        assert_eq!(
+            KiroProvider::base_domain_for(&credentials),
+            "q.eu-west-1.amazonaws.com"
+        );
     }
 
     #[test]
     fn test_build_headers() {
-        let mut config = Config::default();
-        config.region = "us-east-1".to_string();
+        let mut config = RuntimeConfig::default();
         config.kiro_version = "0.8.0".to_string();
 
         let mut credentials = KiroCredentials::default();
         credentials.profile_arn = Some("arn:aws:sso::123456789:profile/test".to_string());
         credentials.refresh_token = Some("a".repeat(150));
+        credentials.region = Some("us-east-1".to_string());
 
         let provider = create_test_provider(config, credentials.clone());
         let ctx = CallContext {

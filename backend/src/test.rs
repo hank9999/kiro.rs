@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use futures::StreamExt;
 
 use crate::debug::{print_event, print_event_verbose, debug_crc, print_hex};
@@ -6,7 +7,7 @@ use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::KiroRequest;
 use crate::kiro::parser::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
-use crate::kiro::token_manager::TokenManager;
+use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::Config;
 
 
@@ -36,12 +37,12 @@ pub(crate) async fn call_stream_api() -> anyhow::Result<()> {
     println!("已加载凭证");
 
     // 加载配置
-    let config = Config::load_default()?;
-    println!("API 区域: {}", config.region);
+    let config = Config::load(Config::default_config_path())?;
+    println!("已加载配置");
 
-    // 创建 TokenManager 和 KiroProvider
-    let token_manager = TokenManager::new(config, credentials);
-    let mut provider = KiroProvider::new(token_manager);
+    // 创建 MultiTokenManager 和 KiroProvider
+    let token_manager = MultiTokenManager::new(config, vec![credentials], None)?;
+    let provider = KiroProvider::new(Arc::new(token_manager));
 
     println!("\n开始调用流式 API...\n");
     println!("{}", "=".repeat(60));

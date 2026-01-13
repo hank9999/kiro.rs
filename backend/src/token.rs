@@ -1,16 +1,13 @@
 //! Token 计算模块
 //!
-//! 提供文本 token 数量计算功能。
-//!
-//! # 计算规则
-//! - 非西文字符：每个计 4.5 个字符单位
-//! - 西文字符：每个计 1 个字符单位
-//! - 4 个字符单位 = 1 token（四舍五入）
+//! Input: 文本、消息、工具定义
+//! Output: Token 数量估算
+//! Pos: Token 计算服务
 
 use crate::anthropic::types::{
     CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool,
 };
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::build_client;
 use std::sync::OnceLock;
 
 /// Count Tokens API 配置
@@ -22,8 +19,8 @@ pub struct CountTokensConfig {
     pub api_key: Option<String>,
     /// count_tokens API 认证类型（"x-api-key" 或 "bearer"）
     pub auth_type: String,
-    /// 代理配置
-    pub proxy: Option<ProxyConfig>,
+    /// 代理 URL
+    pub proxy_url: Option<String>,
 }
 
 /// 全局配置存储
@@ -143,7 +140,7 @@ async fn call_remote_count_tokens(
     messages: &Vec<Message>,
     tools: &Option<Vec<Tool>>,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-    let client = build_client(config.proxy.as_ref(), 300)?;
+    let client = build_client(config.proxy_url.as_deref(), 300)?;
 
     // 构建请求体
     let request = CountTokensRequest {
