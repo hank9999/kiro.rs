@@ -5,7 +5,7 @@ backend/target
 # 配置和凭证文件
 /config.json
 /credentials.json
-backend/.env
+.env
 *.db
 
 # IDE 和编辑器
@@ -39,3 +39,4 @@ frontend/tsconfig.tsbuildinfo
 .DS_Store
 ._*
 ._.git
+backend/Cargo.lock

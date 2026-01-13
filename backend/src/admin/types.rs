@@ -91,6 +91,8 @@ pub struct CredentialStatusItem {
     pub current_usage: f64,
     /// 使用限额
     pub usage_limit: f64,
+    /// 代理 URL
+    pub proxy_url: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -138,6 +140,9 @@ pub struct AddCredentialRequest {
 
     /// 凭据级 Machine ID（可选，64 位字符串）
     pub machine_id: Option<String>,
+
+    /// 代理 URL（可选，支持 http/https/socks5）
+    pub proxy_url: Option<String>,
 }
 
 fn default_auth_method() -> String {
@@ -179,6 +184,9 @@ pub struct UpdateCredentialRequest {
 
     /// Client Secret（可选，IdC 认证）
     pub client_secret: Option<String>,
+
+    /// 代理 URL（可选，支持 http/https/socks5）
+    pub proxy_url: Option<String>,
 }
 
 // ============ 余额查询 ============
@@ -297,7 +305,6 @@ pub struct SettingsResponse {
     pub system_version: String,
     pub node_version: String,
     pub min_usage_threshold: f64,
-    pub proxy_url: Option<String>,
     pub count_tokens_api_url: Option<String>,
     pub count_tokens_api_key: Option<String>,
     pub count_tokens_auth_type: String,
@@ -311,7 +318,6 @@ pub struct UpdateSettingsRequest {
     pub system_version: Option<String>,
     pub node_version: Option<String>,
     pub min_usage_threshold: Option<f64>,
-    pub proxy_url: Option<String>,
     pub count_tokens_api_url: Option<String>,
     pub count_tokens_api_key: Option<String>,
     pub count_tokens_auth_type: Option<String>,

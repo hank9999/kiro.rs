@@ -26,16 +26,14 @@ use crate::model::runtime_config::RuntimeConfig;
 pub struct TokenManager {
     config: RuntimeConfig,
     credentials: KiroCredentials,
-    proxy_url: Option<String>,
 }
 
 impl TokenManager {
     /// 创建新的 TokenManager 实例
-    pub fn new(config: RuntimeConfig, credentials: KiroCredentials, proxy_url: Option<String>) -> Self {
+    pub fn new(config: RuntimeConfig, credentials: KiroCredentials) -> Self {
         Self {
             config,
             credentials,
-            proxy_url,
         }
     }
 
@@ -55,7 +53,7 @@ impl TokenManager {
     pub async fn ensure_valid_token(&mut self) -> anyhow::Result<String> {
         if is_token_expired(&self.credentials) || is_token_expiring_soon(&self.credentials) {
             self.credentials =
-                refresh_token(&self.credentials, &self.config, self.proxy_url.as_deref()).await?;
+                refresh_token(&self.credentials, &self.config).await?;
 
             // 刷新后再次检查 token 时间有效性
             if is_token_expired(&self.credentials) {
@@ -74,7 +72,7 @@ impl TokenManager {
     /// 调用 getUsageLimits API 查询当前账户的使用额度
     pub async fn get_usage_limits(&mut self) -> anyhow::Result<UsageLimitsResponse> {
         let token = self.ensure_valid_token().await?;
-        get_usage_limits(&self.credentials, &self.config, &token, self.proxy_url.as_deref()).await
+        get_usage_limits(&self.credentials, &self.config, &token).await
     }
 }
 
@@ -127,9 +125,11 @@ pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::R
 pub(crate) async fn refresh_token(
     credentials: &KiroCredentials,
     config: &RuntimeConfig,
-    proxy_url: Option<&str>,
 ) -> anyhow::Result<KiroCredentials> {
     validate_refresh_token(credentials)?;
+
+    // 从凭据获取代理 URL
+    let proxy_url = credentials.proxy_url.as_deref();
 
     // 根据 auth_method 选择刷新方式
     // 如果未指定 auth_method，根据是否有 clientId/clientSecret 自动判断
@@ -307,9 +307,11 @@ pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
     config: &RuntimeConfig,
     token: &str,
-    proxy_url: Option<&str>,
 ) -> anyhow::Result<UsageLimitsResponse> {
     tracing::debug!("正在获取使用额度信息...");
+
+    // 从凭据获取代理 URL
+    let proxy_url = credentials.proxy_url.as_deref();
 
     // 使用凭据级 region，默认 us-east-1
     let default_region = "us-east-1".to_string();
@@ -445,6 +447,8 @@ pub struct CredentialEntrySnapshot {
     pub current_usage: f64,
     /// 使用限额
     pub usage_limit: f64,
+    /// 代理 URL
+    pub proxy_url: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -467,7 +471,6 @@ pub struct ManagerSnapshot {
 /// 故障统计基于 API 调用结果，而非 Token 刷新结果
 pub struct MultiTokenManager {
     config: RuntimeConfig,
-    proxy_url: Option<String>,
     /// 凭据条目列表
     entries: Mutex<Vec<CredentialEntry>>,
     /// 当前活动凭据 ID
@@ -501,12 +504,10 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `config` - 应用配置
     /// * `credentials` - 凭据列表
-    /// * `proxy_url` - 可选的代理 URL
     /// * `db` - 数据库连接
     pub fn new_with_db(
         config: RuntimeConfig,
         credentials: Vec<KiroCredentials>,
-        proxy_url: Option<&str>,
         db: Database,
     ) -> anyhow::Result<Self> {
         let config_ref = &config;
@@ -542,7 +543,6 @@ impl MultiTokenManager {
 
         Ok(Self {
             config,
-            proxy_url: proxy_url.map(|s| s.to_string()),
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
             refresh_lock: TokioMutex::new(()),
@@ -555,11 +555,9 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `config` - 应用配置
     /// * `credentials` - 凭据列表
-    /// * `proxy_url` - 可选的代理 URL
     pub fn new(
         config: RuntimeConfig,
         credentials: Vec<KiroCredentials>,
-        proxy_url: Option<&str>,
     ) -> anyhow::Result<Self> {
         let config_ref = &config;
 
@@ -608,7 +606,6 @@ impl MultiTokenManager {
 
         Ok(Self {
             config,
-            proxy_url: proxy_url.map(|s| s.to_string()),
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
             refresh_lock: TokioMutex::new(()),
@@ -811,7 +808,7 @@ impl MultiTokenManager {
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 // 确实需要刷新
                 let new_creds =
-                    refresh_token(&current_creds, &self.config, self.proxy_url.as_deref()).await?;
+                    refresh_token(&current_creds, &self.config).await?;
 
                 if is_token_expired(&new_creds) {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
@@ -1070,7 +1067,6 @@ impl MultiTokenManager {
             &ctx.credentials,
             &self.config,
             &ctx.token,
-            self.proxy_url.as_deref(),
         )
         .await
     }
@@ -1126,6 +1122,7 @@ impl MultiTokenManager {
                         subscription_title,
                         current_usage,
                         usage_limit,
+                        proxy_url: e.credentials.proxy_url.clone(),
                     }
                 })
                 .collect(),
@@ -1210,6 +1207,7 @@ impl MultiTokenManager {
         refresh_token: Option<String>,
         client_id: Option<String>,
         client_secret: Option<String>,
+        proxy_url: Option<String>,
     ) -> anyhow::Result<()> {
         {
             let mut entries = self.entries.lock();
@@ -1239,6 +1237,14 @@ impl MultiTokenManager {
             if let Some(ref cs) = client_secret {
                 entry.credentials.client_secret = Some(cs.clone());
             }
+            if let Some(ref pu) = proxy_url {
+                // 空字符串表示清除代理
+                if pu.is_empty() {
+                    entry.credentials.proxy_url = None;
+                } else {
+                    entry.credentials.proxy_url = Some(pu.clone());
+                }
+            }
         }
 
         // 如果更新了优先级，重新选择当前凭据
@@ -1256,6 +1262,7 @@ impl MultiTokenManager {
                 refresh_token,
                 client_id,
                 client_secret,
+                proxy_url,
             )?;
         }
         Ok(())
@@ -1288,7 +1295,7 @@ impl MultiTokenManager {
 
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 let new_creds =
-                    refresh_token(&current_creds, &self.config, self.proxy_url.as_deref()).await?;
+                    refresh_token(&current_creds, &self.config).await?;
                 {
                     let mut entries = self.entries.lock();
                     if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -1322,7 +1329,7 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
-        get_usage_limits(&credentials, &self.config, &token, self.proxy_url.as_deref()).await
+        get_usage_limits(&credentials, &self.config, &token).await
     }
 
     /// 添加新凭据（Admin API）
@@ -1343,7 +1350,7 @@ impl MultiTokenManager {
 
         // 2. 尝试刷新 Token 验证凭据有效性
         let mut validated_cred =
-            refresh_token(&new_cred, &self.config, self.proxy_url.as_deref()).await?;
+            refresh_token(&new_cred, &self.config).await?;
 
         // 3. 自动生成 machineId（如果未提供）
         let machine_id = if new_cred.machine_id.is_some() {
@@ -1361,6 +1368,7 @@ impl MultiTokenManager {
             validated_cred.client_secret = new_cred.client_secret.clone();
             validated_cred.region = new_cred.region.clone();
             validated_cred.machine_id = machine_id.clone();
+            validated_cred.proxy_url = new_cred.proxy_url.clone();
 
             let db_id = db.add_credential(&validated_cred)?;
             db_id as u64
@@ -1378,6 +1386,7 @@ impl MultiTokenManager {
         validated_cred.client_secret = new_cred.client_secret;
         validated_cred.region = new_cred.region;
         validated_cred.machine_id = machine_id;
+        validated_cred.proxy_url = new_cred.proxy_url;
 
         {
             let mut entries = self.entries.lock();

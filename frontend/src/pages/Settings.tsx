@@ -20,7 +20,6 @@ export default function SettingsPage() {
   const [saving, setSaving] = useState(false);
   const [form, setForm] = useState({
     minUsageThreshold: 5,
-    proxyUrl: '',
     countTokensApiUrl: '',
     countTokensApiKey: '',
     countTokensAuthType: 'x-api-key',
@@ -38,7 +37,6 @@ export default function SettingsPage() {
         const res = await settingsApi.get();
         setForm({
           minUsageThreshold: res.minUsageThreshold,
-          proxyUrl: res.proxyUrl || '',
           countTokensApiUrl: res.countTokensApiUrl || '',
           countTokensApiKey: res.countTokensApiKey || '',
           countTokensAuthType: res.countTokensAuthType,
@@ -112,27 +110,6 @@ export default function SettingsPage() {
               />
               <p className="text-xs text-muted-foreground">
                 当剩余额度低于此值时自动切换到下一个账号
-              </p>
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* 代理设置 */}
-        <Card>
-          <CardHeader>
-            <CardTitle>代理设置</CardTitle>
-            <CardDescription>配置网络代理</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="space-y-2">
-              <Label>Proxy URL</Label>
-              <Input
-                placeholder="http://127.0.0.1:7890"
-                value={form.proxyUrl}
-                onChange={(e) => setForm({ ...form, proxyUrl: e.target.value })}
-              />
-              <p className="text-xs text-muted-foreground">
-                HTTP/HTTPS 代理地址，留空则不使用代理
               </p>
             </div>
           </CardContent>

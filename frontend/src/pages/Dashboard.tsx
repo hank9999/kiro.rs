@@ -55,6 +55,7 @@ export default function DashboardPage() {
     clientSecret: '',
     priority: 0,
     region: 'us-east-1',
+    proxyUrl: '',
   });
   const [editForm, setEditForm] = useState({
     priority: 0,
@@ -63,6 +64,7 @@ export default function DashboardPage() {
     refreshToken: '',
     clientId: '',
     clientSecret: '',
+    proxyUrl: '',
   });
   const [passwordForm, setPasswordForm] = useState({
     oldPassword: '',
@@ -185,10 +187,11 @@ export default function DashboardPage() {
         clientSecret: addForm.clientSecret || undefined,
         priority: addForm.priority,
         region: addForm.region,
+        proxyUrl: addForm.proxyUrl || undefined,
       });
       toast.success('添加成功');
       setShowAddDialog(false);
-      setAddForm({ refreshToken: '', authMethod: 'social', clientId: '', clientSecret: '', priority: 0, region: 'us-east-1' });
+      setAddForm({ refreshToken: '', authMethod: 'social', clientId: '', clientSecret: '', priority: 0, region: 'us-east-1', proxyUrl: '' });
       refreshCredentials();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '添加失败');
@@ -239,6 +242,7 @@ export default function DashboardPage() {
       refreshToken: '',
       clientId: '',
       clientSecret: '',
+      proxyUrl: cred.proxyUrl || '',
     });
     setShowEditDialog(true);
   };
@@ -254,6 +258,7 @@ export default function DashboardPage() {
         refreshToken: editForm.refreshToken || undefined,
         clientId: editForm.clientId || undefined,
         clientSecret: editForm.clientSecret || undefined,
+        proxyUrl: editForm.proxyUrl,
       });
       toast.success('更新成功');
       setShowEditDialog(false);
@@ -524,6 +529,15 @@ export default function DashboardPage() {
                 <option value="eu-west-1">eu-west-1 (Ireland)</option>
               </select>
             </div>
+            <div className="space-y-2">
+              <Label>代理 URL</Label>
+              <Input
+                placeholder="http://proxy:port 或 socks5://proxy:port（可选）"
+                value={addForm.proxyUrl}
+                onChange={(e) => setAddForm({ ...addForm, proxyUrl: e.target.value })}
+              />
+              <p className="text-xs text-muted-foreground">支持 http/https/socks5 代理，留空则不使用代理</p>
+            </div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setShowAddDialog(false)}>
@@ -627,6 +641,15 @@ export default function DashboardPage() {
                 </Button>
               </div>
               <p className="text-xs text-muted-foreground">留空则使用自动生成的值</p>
+            </div>
+            <div className="space-y-2">
+              <Label>代理 URL</Label>
+              <Input
+                placeholder="http://proxy:port 或 socks5://proxy:port（可选）"
+                value={editForm.proxyUrl}
+                onChange={(e) => setEditForm({ ...editForm, proxyUrl: e.target.value })}
+              />
+              <p className="text-xs text-muted-foreground">支持 http/https/socks5 代理，留空则不使用代理</p>
             </div>
           </div>
           <DialogFooter>

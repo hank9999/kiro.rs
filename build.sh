@@ -83,7 +83,12 @@ build_backend() {
     echo_info "执行 cargo build --release..."
     cargo build --release
 
-    echo_info "后端编译完成，输出文件: $BACKEND_DIR/target/release/kiro-rs"
+    # 移动可执行文件到项目根目录
+    echo_info "移动可执行文件到项目根目录..."
+    cp "$BACKEND_DIR/target/release/kiro-rs" "$SCRIPT_DIR/kiro.rs"
+    chmod +x "$SCRIPT_DIR/kiro.rs"
+
+    echo_info "后端编译完成，输出文件: $SCRIPT_DIR/kiro.rs"
 }
 
 # 主流程
@@ -107,7 +112,7 @@ main() {
     echo_info "构建完成!"
     echo_info "=========================================="
     echo_info "前端产物: $FRONTEND_DIR/dist"
-    echo_info "后端产物: $BACKEND_DIR/target/release/kiro-rs"
+    echo_info "后端产物: $SCRIPT_DIR/kiro.rs"
 }
 
 # 支持参数

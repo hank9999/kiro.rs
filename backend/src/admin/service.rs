@@ -46,6 +46,7 @@ impl AdminService {
                 subscription_title: entry.subscription_title,
                 current_usage: entry.current_usage,
                 usage_limit: entry.usage_limit,
+                proxy_url: entry.proxy_url,
             })
             .collect();
 
@@ -137,6 +138,7 @@ impl AdminService {
             priority: req.priority,
             region: Some(req.region),
             machine_id: req.machine_id,
+            proxy_url: req.proxy_url,
         };
 
         // 调用 token_manager 添加凭据
@@ -168,6 +170,7 @@ impl AdminService {
                 req.refresh_token,
                 req.client_id,
                 req.client_secret,
+                req.proxy_url,
             )
             .map_err(|e| self.classify_error(e, id))
     }

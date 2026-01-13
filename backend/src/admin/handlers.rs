@@ -286,10 +286,6 @@ pub async fn get_settings(State(state): State<AdminState>) -> impl IntoResponse 
         .flatten()
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(5.0);
-    let proxy_url = state.db.get_setting("proxy_url")
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty());
     let count_tokens_api_url = state.db.get_setting("count_tokens_api_url")
         .ok()
         .flatten()
@@ -308,7 +304,6 @@ pub async fn get_settings(State(state): State<AdminState>) -> impl IntoResponse 
         system_version,
         node_version,
         min_usage_threshold,
-        proxy_url,
         count_tokens_api_url,
         count_tokens_api_key,
         count_tokens_auth_type,
@@ -334,9 +329,6 @@ pub async fn update_settings(
     }
     if let Some(v) = payload.min_usage_threshold {
         updates.push(("min_usage_threshold", v.to_string()));
-    }
-    if let Some(ref v) = payload.proxy_url {
-        updates.push(("proxy_url", v.clone()));
     }
     if let Some(ref v) = payload.count_tokens_api_url {
         updates.push(("count_tokens_api_url", v.clone()));

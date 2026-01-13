@@ -57,6 +57,11 @@ pub struct KiroCredentials {
     /// 未配置时回退到 config.json 的 machineId；都未配置时由 refreshToken 派生
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
+
+    /// 凭据级代理 URL 配置（可选）
+    /// 支持 http/https/socks5 代理
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -211,6 +216,7 @@ mod tests {
             priority: 0,
             region: None,
             machine_id: None,
+            proxy_url: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -321,6 +327,7 @@ mod tests {
             priority: 0,
             region: Some("eu-west-1".to_string()),
             machine_id: None,
+            proxy_url: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -343,6 +350,7 @@ mod tests {
             priority: 0,
             region: None,
             machine_id: None,
+            proxy_url: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -447,6 +455,7 @@ mod tests {
             priority: 3,
             region: Some("us-west-2".to_string()),
             machine_id: Some("c".repeat(64)),
+            proxy_url: None,
         };
 
         let json = original.to_pretty_json().unwrap();

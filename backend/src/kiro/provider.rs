@@ -1,11 +1,13 @@
 //! Kiro API Provider
 //!
-//! Input: MultiTokenManager, proxy_url
+//! Input: MultiTokenManager
 //! Output: API 请求、流式响应
-//! Pos: 核心 API 通信层
+//! Pos: 核心 API 通信层，支持每凭据独立代理
 
+use parking_lot::RwLock;
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, HeaderMap, HeaderValue};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -22,35 +24,65 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
 
+/// API 请求超时时间（秒）
+const API_TIMEOUT_SECS: u64 = 720;
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
 /// 支持多凭据故障转移和重试机制
+/// 支持每凭据独立代理配置（动态缓存）
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
-    client: Client,
+    /// 代理 URL -> Client 的缓存
+    /// None 键表示无代理的 Client
+    client_cache: RwLock<HashMap<Option<String>, Client>>,
 }
 
 impl KiroProvider {
     /// 创建新的 KiroProvider 实例
     pub fn new(token_manager: Arc<MultiTokenManager>) -> Self {
-        Self::with_proxy_url(token_manager, None)
-    }
-
-    /// 创建带代理配置的 KiroProvider 实例
-    pub fn with_proxy_url(token_manager: Arc<MultiTokenManager>, proxy_url: Option<&str>) -> Self {
-        let client = build_client(proxy_url, 720) // 12 分钟超时
-            .expect("创建 HTTP 客户端失败");
-
         Self {
             token_manager,
-            client,
+            client_cache: RwLock::new(HashMap::new()),
         }
     }
 
     /// 获取 token_manager 的引用
     pub fn token_manager(&self) -> &MultiTokenManager {
         &self.token_manager
+    }
+
+    /// 获取或创建指定代理的 HTTP Client
+    ///
+    /// 使用缓存避免重复创建 Client
+    fn get_or_create_client(&self, proxy_url: Option<&str>) -> anyhow::Result<Client> {
+        let key = proxy_url.map(|s| s.to_string());
+
+        // 先尝试读取缓存
+        {
+            let cache = self.client_cache.read();
+            if let Some(client) = cache.get(&key) {
+                return Ok(client.clone());
+            }
+        }
+
+        // 缓存未命中，创建新 Client
+        let client = build_client(proxy_url, API_TIMEOUT_SECS)?;
+
+        // 写入缓存
+        {
+            let mut cache = self.client_cache.write();
+            cache.insert(key, client.clone());
+        }
+
+        if let Some(url) = proxy_url {
+            tracing::debug!("创建新的 HTTP Client（代理: {}）", url);
+        } else {
+            tracing::debug!("创建新的 HTTP Client（无代理）");
+        }
+
+        Ok(client)
     }
 
     /// 获取 API 基础 URL（使用凭据级别的 region）
@@ -255,9 +287,17 @@ impl KiroProvider {
                 }
             };
 
+            // 获取或创建 HTTP Client（根据凭据的代理配置）
+            let client = match self.get_or_create_client(ctx.credentials.proxy_url.as_deref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+
             // 发送请求
-            let response = match self
-                .client
+            let response = match client
                 .post(&url)
                 .headers(headers)
                 .body(request_body.to_string())
@@ -384,9 +424,17 @@ impl KiroProvider {
                 }
             };
 
+            // 获取或创建 HTTP Client（根据凭据的代理配置）
+            let client = match self.get_or_create_client(ctx.credentials.proxy_url.as_deref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+
             // 发送请求
-            let response = match self
-                .client
+            let response = match client
                 .post(&url)
                 .headers(headers)
                 .body(request_body.to_string())

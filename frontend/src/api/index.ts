@@ -84,6 +84,7 @@ export interface CredentialItem {
   subscriptionTitle?: string;
   currentUsage: number;
   usageLimit: number;
+  proxyUrl?: string;
 }
 
 export interface CredentialsResponse {
@@ -101,6 +102,7 @@ export interface AddCredentialRequest {
   priority?: number;
   region?: string;
   machineId?: string;
+  proxyUrl?: string;
 }
 
 export interface BalanceResponse {
@@ -120,6 +122,7 @@ export interface UpdateCredentialRequest {
   refreshToken?: string;
   clientId?: string;
   clientSecret?: string;
+  proxyUrl?: string;
 }
 
 export interface RefreshAllResponse {
@@ -180,7 +183,6 @@ export interface SettingsResponse {
   systemVersion: string;
   nodeVersion: string;
   minUsageThreshold: number;
-  proxyUrl?: string;
   countTokensApiUrl?: string;
   countTokensApiKey?: string;
   countTokensAuthType: string;
@@ -191,7 +193,6 @@ export interface UpdateSettingsRequest {
   systemVersion?: string;
   nodeVersion?: string;
   minUsageThreshold?: number;
-  proxyUrl?: string;
   countTokensApiUrl?: string;
   countTokensApiKey?: string;
   countTokensAuthType?: string;

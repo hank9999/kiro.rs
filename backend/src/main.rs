@@ -84,17 +84,10 @@ async fn main() {
         std::process::exit(1);
     });
 
-    // 获取代理 URL（从数据库运行时配置）
-    let proxy_url = runtime_config.proxy_url.clone();
-    if proxy_url.is_some() {
-        tracing::info!("已配置 HTTP 代理: {}", proxy_url.as_ref().unwrap());
-    }
-
     // 创建 MultiTokenManager 和 KiroProvider
     let token_manager = MultiTokenManager::new_with_db(
         runtime_config.clone(),
         credentials_list,
-        proxy_url.as_deref(),
         db.clone(),
     )
     .unwrap_or_else(|e| {
@@ -102,14 +95,14 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
-    let kiro_provider = KiroProvider::with_proxy_url(token_manager.clone(), proxy_url.as_deref());
+    let kiro_provider = KiroProvider::new(token_manager.clone());
 
     // 初始化 count_tokens 配置（从数据库运行时配置）
     token::init_config(token::CountTokensConfig {
         api_url: runtime_config.count_tokens_api_url.clone(),
         api_key: runtime_config.count_tokens_api_key.clone(),
         auth_type: runtime_config.count_tokens_auth_type.clone(),
-        proxy_url: proxy_url.clone(),
+        proxy_url: None,
     });
 
     // 构建 Anthropic API 路由（从第一个凭据获取 profile_arn）

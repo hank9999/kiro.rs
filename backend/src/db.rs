@@ -99,6 +99,7 @@ impl Database {
                 usage_limit REAL DEFAULT 0,
                 disabled INTEGER NOT NULL DEFAULT 0,
                 failure_count INTEGER NOT NULL DEFAULT 0,
+                proxy_url TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )",
@@ -160,40 +161,13 @@ impl Database {
 
     /// 迁移凭据表（添加新字段）
     fn migrate_credentials_table(&self, conn: &Connection) -> anyhow::Result<()> {
-        // 检查并添加 email 字段
-        let has_email: bool = conn
-            .prepare("SELECT email FROM credentials LIMIT 1")
+        // 检查并添加 proxy_url 字段
+        let has_proxy_url: bool = conn
+            .prepare("SELECT proxy_url FROM credentials LIMIT 1")
             .is_ok();
-        if !has_email {
-            conn.execute("ALTER TABLE credentials ADD COLUMN email TEXT", [])?;
-            tracing::info!("数据库迁移：添加 email 字段");
-        }
-
-        // 检查并添加 subscription_title 字段
-        let has_subscription: bool = conn
-            .prepare("SELECT subscription_title FROM credentials LIMIT 1")
-            .is_ok();
-        if !has_subscription {
-            conn.execute("ALTER TABLE credentials ADD COLUMN subscription_title TEXT", [])?;
-            tracing::info!("数据库迁移：添加 subscription_title 字段");
-        }
-
-        // 检查并添加 current_usage 字段
-        let has_current_usage: bool = conn
-            .prepare("SELECT current_usage FROM credentials LIMIT 1")
-            .is_ok();
-        if !has_current_usage {
-            conn.execute("ALTER TABLE credentials ADD COLUMN current_usage REAL DEFAULT 0", [])?;
-            tracing::info!("数据库迁移：添加 current_usage 字段");
-        }
-
-        // 检查并添加 usage_limit 字段
-        let has_usage_limit: bool = conn
-            .prepare("SELECT usage_limit FROM credentials LIMIT 1")
-            .is_ok();
-        if !has_usage_limit {
-            conn.execute("ALTER TABLE credentials ADD COLUMN usage_limit REAL DEFAULT 0", [])?;
-            tracing::info!("数据库迁移：添加 usage_limit 字段");
+        if !has_proxy_url {
+            conn.execute("ALTER TABLE credentials ADD COLUMN proxy_url TEXT", [])?;
+            tracing::info!("数据库迁移：添加 proxy_url 字段");
         }
 
         Ok(())
@@ -254,7 +228,7 @@ impl Database {
             "SELECT id, access_token, refresh_token, profile_arn, expires_at,
                     auth_method, client_id, client_secret, priority, region,
                     machine_id, email, subscription_title, current_usage, usage_limit,
-                    disabled, failure_count
+                    disabled, failure_count, proxy_url
              FROM credentials ORDER BY priority ASC"
         )?;
 
@@ -277,6 +251,7 @@ impl Database {
                 usage_limit: row.get::<_, Option<f64>>(14)?.unwrap_or(0.0),
                 disabled: row.get(15)?,
                 failure_count: row.get(16)?,
+                proxy_url: row.get(17)?,
             })
         })?;
 
@@ -294,8 +269,8 @@ impl Database {
         let region = cred.region.as_deref().unwrap_or("us-east-1");
         conn.execute(
             "INSERT INTO credentials (access_token, refresh_token, profile_arn, expires_at,
-                                      auth_method, client_id, client_secret, priority, region, machine_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                      auth_method, client_id, client_secret, priority, region, machine_id, proxy_url)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 cred.access_token,
                 cred.refresh_token,
@@ -307,6 +282,7 @@ impl Database {
                 cred.priority,
                 region,
                 cred.machine_id,
+                cred.proxy_url,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -321,8 +297,8 @@ impl Database {
             "UPDATE credentials SET
                 access_token = ?1, refresh_token = ?2, profile_arn = ?3, expires_at = ?4,
                 auth_method = ?5, client_id = ?6, client_secret = ?7, priority = ?8,
-                region = ?9, machine_id = ?10, updated_at = datetime('now')
-             WHERE id = ?11",
+                region = ?9, machine_id = ?10, proxy_url = ?11, updated_at = datetime('now')
+             WHERE id = ?12",
             params![
                 cred.access_token,
                 cred.refresh_token,
@@ -334,6 +310,7 @@ impl Database {
                 cred.priority,
                 region,
                 cred.machine_id,
+                cred.proxy_url,
                 id,
             ],
         )?;
@@ -380,7 +357,7 @@ impl Database {
         Ok(rows > 0)
     }
 
-    /// 更新凭据元数据（优先级、region、machineId、refreshToken、clientId、clientSecret）
+    /// 更新凭据元数据（优先级、region、machineId、refreshToken、clientId、clientSecret、proxyUrl）
     pub fn update_credential_metadata(
         &self,
         id: i64,
@@ -390,6 +367,7 @@ impl Database {
         refresh_token: Option<String>,
         client_id: Option<String>,
         client_secret: Option<String>,
+        proxy_url: Option<String>,
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
 
@@ -422,6 +400,15 @@ impl Database {
         if let Some(cs) = client_secret {
             updates.push("client_secret = ?");
             params_vec.push(Box::new(cs));
+        }
+        if let Some(pu) = proxy_url {
+            updates.push("proxy_url = ?");
+            // 空字符串转为 NULL
+            if pu.is_empty() {
+                params_vec.push(Box::new(None::<String>));
+            } else {
+                params_vec.push(Box::new(pu));
+            }
         }
 
         if updates.is_empty() {
@@ -473,7 +460,7 @@ impl Database {
             "SELECT id, access_token, refresh_token, profile_arn, expires_at,
                     auth_method, client_id, client_secret, priority, region,
                     machine_id, email, subscription_title, current_usage, usage_limit,
-                    disabled, failure_count
+                    disabled, failure_count, proxy_url
              FROM credentials WHERE id = ?1",
             params![id],
             |row| {
@@ -495,6 +482,7 @@ impl Database {
                     usage_limit: row.get::<_, Option<f64>>(14)?.unwrap_or(0.0),
                     disabled: row.get(15)?,
                     failure_count: row.get(16)?,
+                    proxy_url: row.get(17)?,
                 })
             },
         );
@@ -604,10 +592,6 @@ impl Database {
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "v22.12.0".to_string()),
-            proxy_url: self.get_setting("proxy_url")
-                .ok()
-                .flatten()
-                .filter(|s| !s.is_empty()),
             count_tokens_api_url: self.get_setting("count_tokens_api_url")
                 .ok()
                 .flatten()
@@ -657,6 +641,7 @@ pub struct CredentialRow {
     pub usage_limit: f64,
     pub disabled: i32,
     pub failure_count: u32,
+    pub proxy_url: Option<String>,
 }
 
 impl From<CredentialRow> for KiroCredentials {
@@ -673,6 +658,7 @@ impl From<CredentialRow> for KiroCredentials {
             priority: row.priority,
             region: row.region,
             machine_id: row.machine_id,
+            proxy_url: row.proxy_url,
         }
     }
 }
