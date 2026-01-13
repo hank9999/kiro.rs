@@ -648,7 +648,8 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
 
 /// 检查是否为不支持的工具
 fn is_unsupported_tool(name: &str) -> bool {
-    matches!(name.to_lowercase().as_str(), "web_search" | "websearch")
+    // matches!(name.to_lowercase().as_str(), "web_search" | "websearch")
+    false
 }
 
 /// 生成thinking标签前缀

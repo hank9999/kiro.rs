@@ -124,11 +124,36 @@ pub struct SystemMessage {
 }
 
 /// 工具定义
+///
+/// 支持两种格式：
+/// 1. 普通工具：{ name, description, input_schema }
+/// 2. WebSearch 工具：{ type: "web_search_20250305", name: "web_search", max_uses: 8 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Tool {
+    /// 工具类型，如 "web_search_20250305"（可选，仅 WebSearch 工具）
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub tool_type: Option<String>,
+    /// 工具名称
+    #[serde(default)]
     pub name: String,
+    /// 工具描述（普通工具必需，WebSearch 工具可选）
+    #[serde(default)]
     pub description: String,
+    /// 输入参数 schema（普通工具必需，WebSearch 工具无此字段）
+    #[serde(default)]
     pub input_schema: HashMap<String, serde_json::Value>,
+    /// 最大使用次数（仅 WebSearch 工具）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<i32>,
+}
+
+impl Tool {
+    /// 检查是否为 WebSearch 工具
+    pub fn is_web_search(&self) -> bool {
+        self.tool_type
+            .as_ref()
+            .is_some_and(|t| t.starts_with("web_search"))
+    }
 }
 
 /// 内容块

@@ -28,6 +28,7 @@ use super::stream::{SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
 };
+use super::websearch;
 
 /// GET /v1/models
 ///
@@ -100,6 +101,21 @@ pub async fn post_messages(
                 .into_response();
         }
     };
+
+    // 检查是否为 WebSearch 请求
+    if websearch::has_web_search_tool(&payload) {
+        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
+
+        // 估算输入 tokens
+        let input_tokens = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i32;
+
+        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+    }
 
     // 转换请求
     let conversion_result = match convert_request(&payload) {

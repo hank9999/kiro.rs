@@ -84,6 +84,14 @@ impl KiroProvider {
         )
     }
 
+    /// 获取 MCP API URL
+    pub fn mcp_url(&self) -> String {
+        format!(
+            "https://q.{}.amazonaws.com/mcp",
+            self.token_manager.config().region
+        )
+    }
+
     /// 获取 API 基础域名
     pub fn base_domain(&self) -> String {
         format!("q.{}.amazonaws.com", self.token_manager.config().region)
@@ -152,6 +160,60 @@ impl KiroProvider {
         Ok(headers)
     }
 
+    /// 构建 MCP 请求头
+    fn build_mcp_headers(&self, ctx: &CallContext) -> anyhow::Result<HeaderMap> {
+        let config = self.token_manager.config();
+
+        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config)
+            .ok_or_else(|| anyhow::anyhow!("无法生成 machine_id，请检查凭证配置"))?;
+
+        let kiro_version = &config.kiro_version;
+        let os_name = &config.system_version;
+        let node_version = &config.node_version;
+
+        let x_amz_user_agent = format!("aws-sdk-js/1.0.27 KiroIDE-{}-{}", kiro_version, machine_id);
+
+        let user_agent = format!(
+            "aws-sdk-js/1.0.27 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.27 m/E KiroIDE-{}-{}",
+            os_name, node_version, kiro_version, machine_id
+        );
+
+        let mut headers = HeaderMap::new();
+
+        // 按照严格顺序添加请求头
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            "x-amz-user-agent",
+            HeaderValue::from_str(&x_amz_user_agent).unwrap(),
+        );
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_str(&user_agent).unwrap(),
+        );
+        headers.insert(
+            "host",
+            HeaderValue::from_str(&self.base_domain()).unwrap(),
+        );
+        headers.insert(
+            "amz-sdk-invocation-id",
+            HeaderValue::from_str(&Uuid::new_v4().to_string()).unwrap(),
+        );
+        headers.insert(
+            "amz-sdk-request",
+            HeaderValue::from_static("attempt=1; max=3"),
+        );
+        headers.insert(
+            "Authorization",
+            HeaderValue::from_str(&format!("Bearer {}", ctx.token)).unwrap(),
+        );
+        headers.insert("Connection", HeaderValue::from_static("close"));
+
+        Ok(headers)
+    }
+
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移：
@@ -204,6 +266,138 @@ impl KiroProvider {
         model: Option<&str>,
     ) -> anyhow::Result<(u64, reqwest::Response)> {
         self.call_api_with_retry(request_body, true, model).await
+    }
+
+    /// 发送 MCP API 请求
+    ///
+    /// 用于 WebSearch 等工具调用
+    ///
+    /// # Arguments
+    /// * `request_body` - JSON 格式的 MCP 请求体字符串
+    ///
+    /// # Returns
+    /// 返回原始的 HTTP Response
+    pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+        self.call_mcp_with_retry(request_body).await
+    }
+
+    /// 内部方法：带重试逻辑的 MCP API 调用
+    async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+        let total_credentials = self.token_manager.total_count();
+        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let mut last_error: Option<anyhow::Error> = None;
+
+        for attempt in 0..max_retries {
+            // 获取调用上下文
+            let ctx = match self.token_manager.acquire_context().await {
+                Ok(c) => c,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+
+            let url = self.mcp_url();
+            let headers = match self.build_mcp_headers(&ctx) {
+                Ok(h) => h,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+
+            // 发送请求
+            let response = match self
+                .client
+                .post(&url)
+                .headers(headers)
+                .body(request_body.to_string())
+                .send()
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    tracing::warn!(
+                        "MCP 请求发送失败（尝试 {}/{}）: {}",
+                        attempt + 1,
+                        max_retries,
+                        e
+                    );
+                    last_error = Some(e.into());
+                    if attempt + 1 < max_retries {
+                        sleep(Self::retry_delay(attempt)).await;
+                    }
+                    continue;
+                }
+            };
+
+            let status = response.status();
+
+            // 成功响应
+            if status.is_success() {
+                self.token_manager.report_success(ctx.id);
+                return Ok(response);
+            }
+
+            // 失败响应
+            let body = response.text().await.unwrap_or_default();
+
+            // 402 额度用尽
+            if status.as_u16() == 402 && Self::is_monthly_request_limit(&body) {
+                let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                if !has_available {
+                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                }
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                continue;
+            }
+
+            // 400 Bad Request
+            if status.as_u16() == 400 {
+                anyhow::bail!("MCP 请求失败: {} {}", status, body);
+            }
+
+            // 401/403 凭据问题
+            if matches!(status.as_u16(), 401 | 403) {
+                let has_available = self.token_manager.report_failure(ctx.id);
+                if !has_available {
+                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                }
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                continue;
+            }
+
+            // 瞬态错误
+            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+                tracing::warn!(
+                    "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                if attempt + 1 < max_retries {
+                    sleep(Self::retry_delay(attempt)).await;
+                }
+                continue;
+            }
+
+            // 其他 4xx
+            if status.is_client_error() {
+                anyhow::bail!("MCP 请求失败: {} {}", status, body);
+            }
+
+            // 兜底
+            last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+            if attempt + 1 < max_retries {
+                sleep(Self::retry_delay(attempt)).await;
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            anyhow::anyhow!("MCP 请求失败：已达到最大重试次数（{}次）", max_retries)
+        }))
     }
 
     /// 内部方法：带重试逻辑的 API 调用

@@ -2,6 +2,13 @@
 
 一个用 Rust 编写的 Anthropic Claude API 兼容代理服务，将 Anthropic API 请求转换为 Kiro API 请求。
 
+## 免责声明
+本项目仅供研究使用, Use at your own risk, 使用本项目所导致的任何后果由使用人承担, 与本项目无关。
+本项目与 AWS/KIRO/Anthropic/Claude 等官方无关, 本项目不代表官方立场。
+
+## 注意！
+因 tls 库从 native-tls 切换至 rustls, 你可能需要专门安装证书后才能配置 HTTP PROXY
+
 ## 功能特性
 
 - **Anthropic API 兼容**: 完整支持 Anthropic Claude API 格式
