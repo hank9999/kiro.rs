@@ -150,6 +150,14 @@ pub struct AddCredentialRequest {
 
     /// 身份提供商（BuilderId / Github / Google）
     pub provider: Option<String>,
+
+    /// 凭据级 Region 配置（用于 OIDC token 刷新）
+    /// 未配置时回退到 config.json 的全局 region
+    pub region: Option<String>,
+
+    /// 凭据级 Machine ID（可选，64 位字符串）
+    /// 未配置时回退到 config.json 的 machineId
+    pub machine_id: Option<String>,
 }
 
 fn default_auth_method() -> String {

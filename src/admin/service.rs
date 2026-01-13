@@ -297,6 +297,8 @@ impl AdminService {
             account_email: None,
             user_id: None,
             provider: req.provider,
+            region: req.region,
+            machine_id: req.machine_id,
         };
 
         // 调用 token_manager 添加凭据

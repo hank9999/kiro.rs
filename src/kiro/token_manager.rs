@@ -4,26 +4,20 @@
 //! 支持单凭据 (TokenManager) 和多凭据 (MultiTokenManager) 管理
 
 use anyhow::bail;
-use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
-use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::kiro::web_portal;
 use crate::model::config::Config;
 
 /// Token 管理器
@@ -129,107 +123,6 @@ pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::R
     Ok(())
 }
 
-fn looks_like_email(s: &str) -> bool {
-    // 极简但实用：避免误判过多，也不做 RFC 复杂校验
-    if s.is_empty() || s.len() > 254 {
-        return false;
-    }
-    if s.contains(' ') {
-        return false;
-    }
-
-    let at = match s.find('@') {
-        Some(v) => v,
-        None => return false,
-    };
-
-    // 至少要有 local@domain.tld
-    if at == 0 || at + 3 >= s.len() {
-        return false;
-    }
-
-    let domain = &s[at + 1..];
-    domain.contains('.')
-}
-
-/// 尽力从凭据中提取账户邮箱，仅用于管理面板展示。
-///
-/// 优先级：
-/// 1. 已保存的 account_email（从 API 获取并持久化）
-/// 2. 从 access_token JWT payload 中解析
-///
-/// 注意：
-/// - 不验证 JWT 签名（展示用途足够）。
-/// - 解析失败返回 None。
-fn extract_account_email(credentials: &KiroCredentials) -> Option<String> {
-    // 优先使用已保存的邮箱
-    if let Some(email) = credentials.account_email.as_ref() {
-        if !email.is_empty() {
-            return Some(email.clone());
-        }
-    }
-
-    let access_token = match credentials.access_token.as_deref() {
-        Some(t) => t,
-        None => return None,
-    };
-
-    // JWT: header.payload.signature
-    let mut parts = access_token.split('.');
-    let _header = parts.next();
-    let payload_b64 = match parts.next() {
-        Some(v) => v,
-        None => return None,
-    };
-    let _sig = parts.next();
-
-    // 如果还有更多段，说明不是标准 JWT
-    if parts.next().is_some() {
-        return None;
-    }
-
-    let payload_bytes = match general_purpose::URL_SAFE_NO_PAD.decode(payload_b64) {
-        Ok(v) => v,
-        Err(_) => return None,
-    };
-
-    let payload_json: serde_json::Value = match serde_json::from_slice(&payload_bytes) {
-        Ok(v) => v,
-        Err(_) => return None,
-    };
-
-    let obj = match payload_json.as_object() {
-        Some(o) => o,
-        None => return None,
-    };
-
-    // 常见 claim 名称（按优先级）
-    const CANDIDATES: &[&str] = &[
-        "email",
-        "email_address",
-        "preferred_username",
-        "upn",
-        "username",
-        "user_name",
-    ];
-
-    for k in CANDIDATES {
-        let v = match obj.get(*k) {
-            Some(v) => v,
-            None => continue,
-        };
-        let s = match v.as_str() {
-            Some(s) => s.trim(),
-            None => continue,
-        };
-        if looks_like_email(s) {
-            return Some(s.to_string());
-        }
-    }
-
-    None
-}
-
 /// 刷新 Token
 pub(crate) async fn refresh_token(
     credentials: &KiroCredentials,
@@ -239,38 +132,17 @@ pub(crate) async fn refresh_token(
     validate_refresh_token(credentials)?;
 
     // 根据 auth_method 选择刷新方式
-    let auth_method = credentials.auth_method.as_deref().unwrap_or("social");
+    // 如果未指定 auth_method，根据是否有 clientId/clientSecret 自动判断
+    let auth_method = credentials.auth_method.as_deref().unwrap_or_else(|| {
+        if credentials.client_id.is_some() && credentials.client_secret.is_some() {
+            "idc"
+        } else {
+            "social"
+        }
+    });
 
     match auth_method.to_lowercase().as_str() {
-        "idc" | "builder-id" => {
-            let mut new_credentials = refresh_idc_token(credentials, config, proxy).await?;
-
-            // 仅当 profile_arn 为空时才调用 ListAvailableProfiles（降级：失败/空列表不阻断刷新）
-            if new_credentials.profile_arn.is_none() {
-                let token = new_credentials
-                    .access_token
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("刷新 IdC Token 成功但缺少 accessToken"))?;
-
-                match list_available_profiles(&new_credentials, config, token, proxy).await {
-                    Ok(Some(profile_arn)) => {
-                        tracing::info!("成功获取 IdC profileArn");
-                        new_credentials.profile_arn = Some(profile_arn);
-                    }
-                    Ok(None) => {
-                        // 可能是退避跳过、已达尝试次数、或真正的空列表，降级为 debug
-                        tracing::debug!(
-                            "未获取到 profileArn（可能为空列表/退避跳过），跳过写入 profileArn"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("获取 profileArn 失败（不影响 IdC Token 刷新结果）: {}", e);
-                    }
-                }
-            }
-
-            Ok(new_credentials)
-        }
+        "idc" | "builder-id" => refresh_idc_token(credentials, config, proxy).await,
         _ => refresh_social_token(credentials, config, proxy).await,
     }
 }
@@ -283,11 +155,9 @@ async fn refresh_social_token(
 ) -> anyhow::Result<KiroCredentials> {
     tracing::info!("正在刷新 Social Token...");
 
-    let refresh_token = credentials
-        .refresh_token
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("缺少 refreshToken"))?;
-    let region = &config.region;
+    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    // 优先使用凭据级 region，未配置时回退到 config.region
+    let region = credentials.region.as_ref().unwrap_or(&config.region);
 
     let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
     let refresh_domain = format!("prod.{}.auth.desktop.kiro.dev", region);
@@ -341,19 +211,10 @@ async fn refresh_social_token(
         new_credentials.profile_arn = Some(profile_arn);
     }
 
-    // Social Token 默认有效期为 1 小时（3600 秒）
-    // 如果响应中没有 expires_in，使用默认值确保 expires_at 总是被正确设置
-    // 否则会导致 is_token_expired 始终返回 true，造成疯狂刷新
-    const SOCIAL_DEFAULT_EXPIRES_IN_SECONDS: i64 = 3600;
-    let expires_in = data.expires_in.unwrap_or(SOCIAL_DEFAULT_EXPIRES_IN_SECONDS);
-    let expires_at = Utc::now() + Duration::seconds(expires_in);
-    new_credentials.expires_at = Some(expires_at.to_rfc3339());
-
-    tracing::debug!(
-        "Social Token 刷新成功，有效期 {} 秒，过期时间: {}",
-        expires_in,
-        new_credentials.expires_at.as_deref().unwrap_or("unknown")
-    );
+    if let Some(expires_in) = data.expires_in {
+        let expires_at = Utc::now() + Duration::seconds(expires_in);
+        new_credentials.expires_at = Some(expires_at.to_rfc3339());
+    }
 
     Ok(new_credentials)
 }
@@ -369,10 +230,7 @@ async fn refresh_idc_token(
 ) -> anyhow::Result<KiroCredentials> {
     tracing::info!("正在刷新 IdC Token...");
 
-    let refresh_token = credentials
-        .refresh_token
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("缺少 refreshToken"))?;
+    let refresh_token = credentials.refresh_token.as_ref().unwrap();
     let client_id = credentials
         .client_id
         .as_ref()
@@ -382,7 +240,8 @@ async fn refresh_idc_token(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("IdC 刷新需要 clientSecret"))?;
 
-    let region = &config.region;
+    // 优先使用凭据级 region，未配置时回退到 config.region
+    let region = credentials.region.as_ref().unwrap_or(&config.region);
     let refresh_url = format!("https://oidc.{}.amazonaws.com/token", region);
 
     let client = build_client(proxy, 60)?;
@@ -430,299 +289,12 @@ async fn refresh_idc_token(
         new_credentials.refresh_token = Some(new_refresh_token);
     }
 
-    // IdC Token 默认有效期为 1 小时（3600 秒）
-    // 如果响应中没有 expires_in，使用默认值确保 expires_at 总是被正确设置
-    const IDC_DEFAULT_EXPIRES_IN_SECONDS: i64 = 3600;
-    let expires_in = data.expires_in.unwrap_or(IDC_DEFAULT_EXPIRES_IN_SECONDS);
-    let expires_at = Utc::now() + Duration::seconds(expires_in);
-    new_credentials.expires_at = Some(expires_at.to_rfc3339());
-
-    tracing::debug!(
-        "IdC Token 刷新成功，有效期 {} 秒，过期时间: {}",
-        expires_in,
-        new_credentials.expires_at.as_deref().unwrap_or("unknown")
-    );
+    if let Some(expires_in) = data.expires_in {
+        let expires_at = Utc::now() + Duration::seconds(expires_in);
+        new_credentials.expires_at = Some(expires_at.to_rfc3339());
+    }
 
     Ok(new_credentials)
-}
-
-/// ListAvailableProfiles API 所需的 x-amz-user-agent header 前缀
-const LIST_PROFILES_AMZ_USER_AGENT_PREFIX: &str = "aws-sdk-js/1.0.0";
-
-/// 最大分页请求次数（防止无限循环）
-const LIST_PROFILES_MAX_PAGES: usize = 5;
-
-/// 错误响应 body 最大长度（用于日志截断）
-const ERROR_BODY_MAX_LEN: usize = 2048;
-
-/// 每个进程内对同一凭据最多尝试次数（避免在 profileArn 缺失/不可用时持续触发 API）
-const LIST_PROFILES_MAX_LOOKUP_ATTEMPTS: u8 = 2;
-
-/// 发生 429 限流后的退避时间（分钟）
-const LIST_PROFILES_RATE_LIMIT_BACKOFF_MINUTES: i64 = 30;
-
-/// 返回空 profiles/无 arn 时的退避时间（小时）
-const LIST_PROFILES_EMPTY_RESULT_BACKOFF_HOURS: i64 = 24;
-
-/// ListAvailableProfiles 缓存条目
-#[derive(Debug, Clone, Default)]
-struct ListProfilesCacheEntry {
-    /// 已缓存的 profile_arn（成功获取后缓存）
-    arn: Option<String>,
-    /// 尝试次数
-    attempts: u8,
-    /// 上次使用的 accessToken 哈希（避免同一 token 重复尝试）
-    last_access_token_hash: Option<String>,
-    /// 退避截止时间（在此时间之前不再尝试）
-    next_allowed_at: Option<DateTime<Utc>>,
-}
-
-/// 全局 ListAvailableProfiles 缓存
-static LIST_PROFILES_CACHE: OnceLock<Mutex<HashMap<String, ListProfilesCacheEntry>>> =
-    OnceLock::new();
-
-/// 获取 ListAvailableProfiles 缓存
-fn list_profiles_cache() -> &'static Mutex<HashMap<String, ListProfilesCacheEntry>> {
-    LIST_PROFILES_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// 计算字符串的 SHA256 哈希（十六进制）
-fn sha256_hex(input: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    let result = hasher.finalize();
-    hex::encode(result)
-}
-
-/// 生成 ListAvailableProfiles 缓存键
-fn list_profiles_cache_key(credentials: &KiroCredentials, config: &Config) -> Option<String> {
-    let refresh_token = credentials.refresh_token.as_deref()?;
-    if refresh_token.trim().is_empty() {
-        return None;
-    }
-    Some(format!(
-        "{}:{}",
-        config.region,
-        sha256_hex(&format!("list_available_profiles/{}", refresh_token))
-    ))
-}
-
-/// ListAvailableProfiles 请求体
-///
-/// 当 `next_token` 为 None 时序列化为 `{}`（而不是空 body）
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ListAvailableProfilesRequest<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    next_token: Option<&'a str>,
-}
-
-/// 调用 ListAvailableProfiles API 获取可用的 profileArn（用于 IdC/builder-id 凭证）
-///
-/// - 支持分页：循环请求直到找到第一个非空 arn 或 nextToken 为空
-/// - profiles 为空/无 arn 时返回 Ok(None)（降级，不阻断调用方流程）
-/// - 内置进程内缓存和退避机制，避免频繁调用 API
-pub(crate) async fn list_available_profiles(
-    credentials: &KiroCredentials,
-    config: &Config,
-    access_token: &str,
-    proxy: Option<&ProxyConfig>,
-) -> anyhow::Result<Option<String>> {
-    use anyhow::Context;
-
-    tracing::debug!("正在获取可用 Profiles...");
-
-    // ========================================================================
-    // 进程内缓存 / 退避：避免 profileArn 缺失时每次刷新都触发 ListAvailableProfiles
-    // 合并"检查缓存 + 预占本次尝试"到同一个锁，消除并发竞态
-    // ========================================================================
-    let cache_key = list_profiles_cache_key(credentials, config);
-    let access_token_hash = sha256_hex(access_token);
-
-    if let Some(ref key) = cache_key {
-        let now = Utc::now();
-        let mut cache = list_profiles_cache().lock();
-        let entry = cache.entry(key.clone()).or_default();
-
-        // 已缓存成功结果
-        if let Some(ref arn) = entry.arn {
-            tracing::debug!("profileArn 命中进程内缓存，跳过 ListAvailableProfiles 请求");
-            return Ok(Some(arn.clone()));
-        }
-        // 已达到最大尝试次数
-        if entry.attempts >= LIST_PROFILES_MAX_LOOKUP_ATTEMPTS {
-            tracing::debug!(
-                "profileArn 已尝试 {} 次，跳过 ListAvailableProfiles 请求",
-                entry.attempts
-            );
-            return Ok(None);
-        }
-        // 处于退避期
-        if let Some(next_allowed_at) = entry.next_allowed_at {
-            if next_allowed_at > now {
-                tracing::debug!(
-                    "profileArn 获取处于退避期（直到 {}），跳过 ListAvailableProfiles 请求",
-                    next_allowed_at
-                );
-                return Ok(None);
-            }
-        }
-        // 已用当前 accessToken 尝试过
-        if entry.last_access_token_hash.as_deref() == Some(access_token_hash.as_str()) {
-            tracing::debug!(
-                "profileArn 已用当前 accessToken 尝试过，跳过 ListAvailableProfiles 请求"
-            );
-            return Ok(None);
-        }
-
-        // 预占本次尝试（在同一个锁内完成，避免并发竞态）
-        entry.attempts = entry.attempts.saturating_add(1);
-        entry.last_access_token_hash = Some(access_token_hash.clone());
-        entry.next_allowed_at = None;
-    }
-
-    let region = &config.region;
-    let host = format!("q.{}.amazonaws.com", region);
-    let url = format!("https://{}/ListAvailableProfiles", host);
-
-    let machine_id = machine_id::generate_from_credentials(credentials, config)
-        .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
-    let kiro_version = &config.kiro_version;
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
-
-    // 构建 User-Agent headers（按抓包格式）
-    let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        os_name, node_version, kiro_version, machine_id
-    );
-    let amz_user_agent = format!(
-        "{} KiroIDE-{}-{}",
-        LIST_PROFILES_AMZ_USER_AGENT_PREFIX, kiro_version, machine_id
-    );
-
-    let client = build_client(proxy, 60)?;
-
-    let mut next_token: Option<String> = None;
-    let mut total_profiles = 0usize;
-
-    // 分页循环
-    for page in 0..LIST_PROFILES_MAX_PAGES {
-        // 构建请求 body（next_token 为 None 时发送 `{}`）
-        let body = ListAvailableProfilesRequest {
-            next_token: next_token.as_deref(),
-        };
-
-        let response = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("x-amz-user-agent", &amz_user_agent)
-            .header("User-Agent", &user_agent)
-            .header("host", &host)
-            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=1")
-            .header("Authorization", format!("Bearer {}", access_token))
-            .header("Connection", "close")
-            .json(&body)
-            .send()
-            .await
-            .context("发送 ListAvailableProfiles 请求失败")?;
-
-        let status = response.status();
-        if !status.is_success() {
-            // 429/5xx 做退避，避免下一次刷新立即重复请求
-            if let Some(ref key) = cache_key {
-                let backoff_until = match status.as_u16() {
-                    429 => Some(
-                        Utc::now() + Duration::minutes(LIST_PROFILES_RATE_LIMIT_BACKOFF_MINUTES),
-                    ),
-                    500..=599 => Some(Utc::now() + Duration::minutes(5)),
-                    _ => None,
-                };
-                if let Some(backoff_until) = backoff_until {
-                    let mut cache = list_profiles_cache().lock();
-                    let entry = cache.entry(key.clone()).or_default();
-                    entry.next_allowed_at = Some(backoff_until);
-                }
-            }
-
-            let body_text = match response.text().await {
-                Ok(t) => truncate_string(&t, ERROR_BODY_MAX_LEN),
-                Err(e) => format!("<读取响应 body 失败: {}>", e),
-            };
-            let error_msg = match status.as_u16() {
-                401 => "认证失败，Token 无效或已过期",
-                403 => "权限不足，无法获取可用 Profiles",
-                429 => "请求过于频繁，已被限流",
-                500..=599 => "服务器错误，AWS 服务暂时不可用",
-                _ => "获取可用 Profiles 失败",
-            };
-            bail!("{}: {} {}", error_msg, status, body_text);
-        }
-
-        let data: ListAvailableProfilesResponse = response
-            .json()
-            .await
-            .context("解析 ListAvailableProfiles 响应失败")?;
-
-        let profiles = data.profiles.unwrap_or_default();
-        total_profiles += profiles.len();
-
-        // 查找第一个非空 arn
-        let arn = profiles
-            .into_iter()
-            .filter_map(|p| p.arn)
-            .map(|s| s.trim().to_string())
-            .find(|arn| !arn.is_empty());
-
-        if let Some(selected_arn) = arn {
-            // 缓存成功结果
-            if let Some(ref key) = cache_key {
-                let mut cache = list_profiles_cache().lock();
-                let entry = cache.entry(key.clone()).or_default();
-                entry.arn = Some(selected_arn.clone());
-                entry.next_allowed_at = None;
-            }
-
-            tracing::debug!(
-                "从 {} 个 profiles（第 {} 页）中选择了 arn: {}...{}",
-                total_profiles,
-                page + 1,
-                &selected_arn[..20.min(selected_arn.len())],
-                &selected_arn[selected_arn.len().saturating_sub(10)..]
-            );
-            return Ok(Some(selected_arn));
-        }
-
-        // 检查是否有下一页
-        next_token = data.next_token.filter(|t| !t.trim().is_empty());
-        if next_token.is_none() {
-            break;
-        }
-
-        tracing::debug!("第 {} 页无可用 arn，继续翻页...", page + 1);
-    }
-
-    tracing::debug!("共检查 {} 个 profiles，无可用 arn", total_profiles);
-
-    // 空结果做退避，避免每次刷新都再次探测
-    if let Some(ref key) = cache_key {
-        let mut cache = list_profiles_cache().lock();
-        let entry = cache.entry(key.clone()).or_default();
-        entry.next_allowed_at =
-            Some(Utc::now() + Duration::hours(LIST_PROFILES_EMPTY_RESULT_BACKOFF_HOURS));
-    }
-
-    Ok(None)
-}
-
-/// 截断字符串到指定长度
-fn truncate_string(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...(truncated)", &s[..max_len])
-    }
 }
 
 /// getUsageLimits API 所需的 x-amz-user-agent header 前缀
@@ -904,167 +476,6 @@ pub struct CallContext {
 }
 
 impl MultiTokenManager {
-    async fn get_access_token_for(&self, id: u64) -> anyhow::Result<(KiroCredentials, String)> {
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
-
-        // 检查是否需要刷新 token
-        let needs_refresh = is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
-
-        let token = if needs_refresh {
-            let _guard = self.refresh_lock.lock().await;
-            let current_creds = {
-                let entries = self.entries.lock();
-                entries
-                    .iter()
-                    .find(|e| e.id == id)
-                    .map(|e| e.credentials.clone())
-                    .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-            };
-
-            if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                let new_creds =
-                    refresh_token(&current_creds, &self.config, self.proxy.as_ref()).await?;
-                {
-                    let mut entries = self.entries.lock();
-                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                        entry.credentials = new_creds.clone();
-                    }
-                }
-                // 持久化失败只记录警告，不影响本次请求
-                if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
-                }
-                new_creds
-                    .access_token
-                    .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
-            } else {
-                current_creds
-                    .access_token
-                    .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-            }
-        } else {
-            credentials
-                .access_token
-                .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-        };
-
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
-
-        Ok((credentials, token))
-    }
-
-    fn candidate_idps(credentials: &KiroCredentials) -> &'static [&'static str] {
-        // 优先使用保存的 provider（Github/Google/BuilderId）
-        if let Some(provider) = credentials.provider.as_deref() {
-            match provider.to_lowercase().as_str() {
-                "github" => return &["Github", "Google", "BuilderId"],
-                "google" => return &["Google", "Github", "BuilderId"],
-                "builderid" | "builder-id" => return &["BuilderId", "Github", "Google"],
-                _ => {}
-            }
-        }
-        
-        // 兼容性：按 auth_method 做一个"尽力猜测 + 多候选重试"
-        let auth = credentials
-            .auth_method
-            .as_deref()
-            .unwrap_or("social")
-            .to_ascii_lowercase();
-
-        match auth.as_str() {
-            // social 更可能是 Github/Google
-            "social" => &["Github", "Google", "BuilderId"],
-            // builder-id / idc 默认 BuilderId
-            "builder-id" | "idc" => &["BuilderId", "Github", "Google"],
-            _ => &["BuilderId", "Github", "Google"],
-        }
-    }
-    /// 获取指定凭据的“账号信息 + 套餐 + 用量明细”（通过 Kiro Web Portal API）
-    ///
-    /// 成功后会自动更新凭据的 account_email、user_id、provider 字段并持久化
-    pub async fn get_account_info_for(
-        &self,
-        id: u64,
-    ) -> anyhow::Result<web_portal::AccountAggregateInfo> {
-        let (credentials, token) = self.get_access_token_for(id).await?;
-
-        let proxy = self.proxy.as_ref();
-
-        let mut last_err: Option<anyhow::Error> = None;
-        for idp in Self::candidate_idps(&credentials) {
-            // 并行请求：GetUserInfo & GetUserUsageAndLimits
-            let (user_info, usage) = tokio::join!(
-                web_portal::get_user_info(&token, idp, proxy),
-                web_portal::get_user_usage_and_limits(&token, idp, proxy)
-            );
-
-            match usage {
-                Ok(u) => {
-                    // 尝试从 usage.user_info 获取邮箱和用户 ID，并更新凭据
-                    let mut should_persist = false;
-                    {
-                        let mut entries = self.entries.lock();
-                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            // 更新 account_email
-                            if entry.credentials.account_email.is_none() {
-                                if let Some(ref ui) = u.user_info {
-                                    if let Some(ref email) = ui.email {
-                                        entry.credentials.account_email = Some(email.clone());
-                                        should_persist = true;
-                                    }
-                                }
-                            }
-                            // 更新 user_id
-                            if entry.credentials.user_id.is_none() {
-                                if let Some(ref ui) = u.user_info {
-                                    if let Some(ref uid) = ui.user_id {
-                                        entry.credentials.user_id = Some(uid.clone());
-                                        should_persist = true;
-                                    }
-                                }
-                            }
-                            // 更新 provider
-                            if entry.credentials.provider.is_none() {
-                                entry.credentials.provider = Some(idp.to_string());
-                                should_persist = true;
-                            }
-                        }
-                    }
-                    // 持久化（在锁外执行以避免死锁）
-                    if should_persist {
-                        if let Err(e) = self.persist_credentials() {
-                            tracing::warn!("自动更新账户信息后持久化失败: {}", e);
-                        }
-                    }
-                    // GetUserInfo 失败不应阻断（参考 Kiro-account-manager 的行为）
-                    return Ok(web_portal::aggregate_account_info(user_info.ok(), u));
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                    continue;
-                }
-            }
-        }
-
-        Err(match last_err {
-            Some(e) => e,
-            None => anyhow::anyhow!("获取账号信息失败：没有可用的 Idp 候选"),
-        })
-    }
     /// 创建多凭据 Token 管理器
     ///
     /// # Arguments
@@ -1084,6 +495,8 @@ impl MultiTokenManager {
         let max_existing_id = credentials.iter().filter_map(|c| c.id).max().unwrap_or(0);
         let mut next_id = max_existing_id + 1;
         let mut has_new_ids = false;
+        let mut has_new_machine_ids = false;
+        let config_ref = &config;
 
         let entries: Vec<CredentialEntry> = credentials
             .into_iter()
@@ -1095,6 +508,14 @@ impl MultiTokenManager {
                     has_new_ids = true;
                     id
                 });
+                if cred.machine_id.is_none() {
+                    if let Some(machine_id) =
+                        machine_id::generate_from_credentials(&cred, config_ref)
+                    {
+                        cred.machine_id = Some(machine_id);
+                        has_new_machine_ids = true;
+                    }
+                }
                 CredentialEntry {
                     id,
                     credentials: cred,
@@ -1134,12 +555,12 @@ impl MultiTokenManager {
             is_multiple_format,
         };
 
-        // 如果有新分配的 ID，立即持久化到配置文件
-        if has_new_ids {
+        // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
+        if has_new_ids || has_new_machine_ids {
             if let Err(e) = manager.persist_credentials() {
-                tracing::warn!("新分配 ID 后持久化失败: {}", e);
+                tracing::warn!("补全凭据 ID/machineId 后持久化失败: {}", e);
             } else {
-                tracing::info!("已为凭据分配新 ID 并写回配置文件");
+                tracing::info!("已补全凭据 ID/machineId 并写回配置文件");
             }
         }
 
@@ -1206,7 +627,7 @@ impl MultiTokenManager {
                         .filter(|e| !e.disabled)
                         .min_by_key(|e| e.credentials.priority);
 
-                    // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
+                    // 没有可用凭据：如果是“自动禁用导致全灭”，做一次类似重启的自愈
                     if best.is_none()
                         && entries.iter().any(|e| {
                             e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
@@ -1384,17 +805,21 @@ impl MultiTokenManager {
 
     /// 将凭据列表回写到源文件
     ///
-    /// 回写规则：
-    /// - credentials_path 未设置：跳过写入
-    /// - 如果启动时读取的是多凭据格式（数组），或当前凭据数量 != 1：写回数组格式
-    /// - 否则（单凭据且启动时为单对象格式）：写回单对象格式
+    /// 仅在以下条件满足时回写：
+    /// - 源文件是多凭据格式（数组）
+    /// - credentials_path 已设置
     ///
     /// # Returns
     /// - `Ok(true)` - 成功写入文件
-    /// - `Ok(false)` - 跳过写入（无路径配置）
+    /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
     /// - `Err(_)` - 写入失败
     fn persist_credentials(&self) -> anyhow::Result<bool> {
         use anyhow::Context;
+
+        // 仅多凭据格式才回写
+        if !self.is_multiple_format {
+            return Ok(false);
+        }
 
         let path = match &self.credentials_path {
             Some(p) => p,
@@ -1402,23 +827,13 @@ impl MultiTokenManager {
         };
 
         // 收集所有凭据
-        let mut credentials: Vec<KiroCredentials> = {
+        let credentials: Vec<KiroCredentials> = {
             let entries = self.entries.lock();
             entries.iter().map(|e| e.credentials.clone()).collect()
         };
 
-        // 稳定输出：按 priority、id 排序
-        credentials.sort_by_key(|c| (c.priority, c.id.unwrap_or(u64::MAX)));
-
         // 序列化为 pretty JSON
-        let json = if self.is_multiple_format || credentials.len() != 1 {
-            serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?
-        } else {
-            let only = credentials
-                .get(0)
-                .ok_or_else(|| anyhow::anyhow!("序列化凭据失败：凭据数量异常"))?;
-            serde_json::to_string_pretty(only).context("序列化凭据失败")?
-        };
+        let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
 
         // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
         if tokio::runtime::Handle::try_current().is_ok() {
@@ -1606,7 +1021,7 @@ impl MultiTokenManager {
                     auth_method: e.credentials.auth_method.clone(),
                     has_profile_arn: e.credentials.profile_arn.is_some(),
                     expires_at: e.credentials.expires_at.clone(),
-                    account_email: extract_account_email(&e.credentials),
+                    account_email: e.credentials.account_email.clone(),
                     user_id: e.credentials.user_id.clone(),
                 })
                 .collect(),
@@ -1614,52 +1029,6 @@ impl MultiTokenManager {
             total: entries.len(),
             available,
         }
-    }
-
-    /// 删除指定凭据（Admin API）
-    ///
-    /// 删除后会：
-    /// - 从内存 entries 移除
-    /// - 如果当前凭据被删除或当前凭据不可用，则选择一个可用凭据作为新的 current_id（否则为 0）
-    /// - 回写到凭据文件（credentials_path 必须已配置）
-    pub fn remove_credential(&self, id: u64) -> anyhow::Result<()> {
-        if id == 0 {
-            anyhow::bail!("无效的凭据 ID: 0");
-        }
-
-        {
-            let mut entries = self.entries.lock();
-            let mut current_id = self.current_id.lock();
-
-            let idx = entries
-                .iter()
-                .position(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-
-            entries.remove(idx);
-
-            // 如果 current_id 指向被删除/不存在/已禁用，则重新选择一个可用凭据
-            let current_exists_and_enabled = entries
-                .iter()
-                .any(|e| e.id == *current_id && !e.disabled);
-
-            if !current_exists_and_enabled {
-                *current_id = entries
-                    .iter()
-                    .filter(|e| !e.disabled)
-                    .min_by_key(|e| e.credentials.priority)
-                    .map(|e| e.id)
-                    .unwrap_or(0);
-            }
-        }
-
-        // 必须持久化（否则“删除”会在重启后回滚）
-        let wrote = self.persist_credentials()?;
-        if !wrote {
-            anyhow::bail!("凭据文件路径未配置，无法持久化删除操作");
-        }
-
-        Ok(())
     }
 
     /// 设置凭据禁用状态（Admin API）
@@ -1723,8 +1092,167 @@ impl MultiTokenManager {
 
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
-        let (credentials, token) = self.get_access_token_for(id).await?;
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        // 检查是否需要刷新 token
+        let needs_refresh = is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
+
+        let token = if needs_refresh {
+            let _guard = self.refresh_lock.lock().await;
+            let current_creds = {
+                let entries = self.entries.lock();
+                entries
+                    .iter()
+                    .find(|e| e.id == id)
+                    .map(|e| e.credentials.clone())
+                    .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+            };
+
+            if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
+                let new_creds =
+                    refresh_token(&current_creds, &self.config, self.proxy.as_ref()).await?;
+                {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                        entry.credentials = new_creds.clone();
+                    }
+                }
+                // 持久化失败只记录警告，不影响本次请求
+                if let Err(e) = self.persist_credentials() {
+                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
+                }
+                new_creds
+                    .access_token
+                    .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
+            } else {
+                current_creds
+                    .access_token
+                    .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
+            }
+        } else {
+            credentials
+                .access_token
+                .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
+        };
+
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
         get_usage_limits(&credentials, &self.config, &token, self.proxy.as_ref()).await
+    }
+
+    /// 获取指定凭据的账号信息（Admin API）
+    ///
+    /// 调用 Kiro Web Portal API 获取账号聚合信息（用量、邮箱、订阅等）
+    pub async fn get_account_info_for(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<crate::kiro::web_portal::AccountAggregateInfo> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        // 检查是否需要刷新 token
+        let needs_refresh = is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
+
+        let (token, updated_creds) = if needs_refresh {
+            let _guard = self.refresh_lock.lock().await;
+            let current_creds = {
+                let entries = self.entries.lock();
+                entries
+                    .iter()
+                    .find(|e| e.id == id)
+                    .map(|e| e.credentials.clone())
+                    .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+            };
+
+            if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
+                let new_creds =
+                    refresh_token(&current_creds, &self.config, self.proxy.as_ref()).await?;
+                {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                        entry.credentials = new_creds.clone();
+                    }
+                }
+                if let Err(e) = self.persist_credentials() {
+                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
+                }
+                let token = new_creds
+                    .access_token
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?;
+                (token, new_creds)
+            } else {
+                let token = current_creds
+                    .access_token
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?;
+                (token, current_creds)
+            }
+        } else {
+            let token = credentials
+                .access_token
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?;
+            (token, credentials)
+        };
+
+        // 获取 IDP（身份提供商）
+        let idp = updated_creds
+            .provider
+            .as_deref()
+            .unwrap_or("Github");
+
+        // 调用 Web Portal API
+        let info = crate::kiro::web_portal::get_account_aggregate_info(
+            &token,
+            idp,
+            self.proxy.as_ref(),
+        )
+        .await?;
+
+        // 更新凭据中的 email 和 user_id（如果 API 返回了这些信息）
+        if info.email.is_some() || info.user_id.is_some() {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                if info.email.is_some() {
+                    entry.credentials.account_email = info.email.clone();
+                }
+                if info.user_id.is_some() {
+                    entry.credentials.user_id = info.user_id.clone();
+                }
+            }
+            drop(entries);
+            if let Err(e) = self.persist_credentials() {
+                tracing::warn!("更新账号信息后持久化失败: {}", e);
+            }
+        }
+
+        Ok(info)
+    }
+
+    /// 删除凭据（别名，用于兼容 Admin Service）
+    pub fn remove_credential(&self, id: u64) -> anyhow::Result<()> {
+        self.delete_credential(id)
     }
 
     /// 添加新凭据（Admin API）
@@ -1734,8 +1262,7 @@ impl MultiTokenManager {
     /// 2. 尝试刷新 Token 验证凭据有效性
     /// 3. 分配新 ID（当前最大 ID + 1）
     /// 4. 添加到 entries 列表
-    /// 5. 调用 API 获取账户信息（邮箱等）
-    /// 6. 持久化到配置文件
+    /// 5. 持久化到配置文件
     ///
     /// # 返回
     /// - `Ok(u64)` - 新凭据 ID
@@ -1757,42 +1284,9 @@ impl MultiTokenManager {
         // 4. 设置 ID 并保留用户输入的元数据
         validated_cred.id = Some(new_id);
         validated_cred.priority = new_cred.priority;
-        validated_cred.auth_method = new_cred.auth_method.clone();
+        validated_cred.auth_method = new_cred.auth_method;
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;
-        validated_cred.provider = new_cred.provider.clone();
-
-        // 5. 调用 API 获取账户信息（邮箱、用户 ID 等）
-        if let Some(token) = validated_cred.access_token.as_ref() {
-            let proxy = self.proxy.as_ref();
-            // 尝试多个 idp 候选
-            for idp in Self::candidate_idps(&validated_cred) {
-                match web_portal::get_user_usage_and_limits(token, idp, proxy).await {
-                    Ok(usage) => {
-                        // 从 usage.user_info 获取邮箱和用户 ID
-                        if let Some(user_info) = &usage.user_info {
-                            if validated_cred.account_email.is_none() {
-                                validated_cred.account_email = user_info.email.clone();
-                            }
-                            if validated_cred.user_id.is_none() {
-                                validated_cred.user_id = user_info.user_id.clone();
-                            }
-                        }
-                        // 记录提供商（如果从 API 能推断）
-                        if validated_cred.provider.is_none() {
-                            validated_cred.provider = Some(idp.to_string());
-                        }
-                        tracing::debug!("获取到账户信息: email={:?}, userId={:?}",
-                            validated_cred.account_email, validated_cred.user_id);
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::debug!("使用 idp={} 获取账户信息失败: {}", idp, e);
-                        continue;
-                    }
-                }
-            }
-        }
 
         {
             let mut entries = self.entries.lock();
@@ -1805,7 +1299,7 @@ impl MultiTokenManager {
             });
         }
 
-        // 6. 持久化
+        // 5. 持久化
         self.persist_credentials()?;
 
         tracing::info!("成功添加凭据 #{}", new_id);
@@ -1958,10 +1452,8 @@ mod tests {
         let mut cred2 = KiroCredentials::default();
         cred2.priority = 1;
 
-        let manager = match MultiTokenManager::new(config, vec![cred1, cred2], None, None, false) {
-            Ok(v) => v,
-            Err(e) => panic!("{:?}", e),
-        };
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
         assert_eq!(manager.total_count(), 2);
         assert_eq!(manager.available_count(), 2);
     }
@@ -1972,10 +1464,7 @@ mod tests {
         let result = MultiTokenManager::new(config, vec![], None, None, false);
         // 支持 0 个凭据启动（可通过管理面板添加）
         assert!(result.is_ok());
-        let manager = match result {
-            Ok(v) => v,
-            Err(e) => panic!("{:?}", e),
-        };
+        let manager = result.unwrap();
         assert_eq!(manager.total_count(), 0);
         assert_eq!(manager.available_count(), 0);
     }
@@ -1990,10 +1479,7 @@ mod tests {
 
         let result = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false);
         assert!(result.is_err());
-        let err_msg = match result.err() {
-            Some(e) => e.to_string(),
-            None => String::new(),
-        };
+        let err_msg = result.err().unwrap().to_string();
         assert!(
             err_msg.contains("重复的凭据 ID"),
             "错误消息应包含 '重复的凭据 ID'，实际: {}",
@@ -2007,10 +1493,8 @@ mod tests {
         let cred1 = KiroCredentials::default();
         let cred2 = KiroCredentials::default();
 
-        let manager = match MultiTokenManager::new(config, vec![cred1, cred2], None, None, false) {
-            Ok(v) => v,
-            Err(e) => panic!("{:?}", e),
-        };
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
         // 凭据会自动分配 ID（从 1 开始）
         // 前两次失败不会禁用（使用 ID 1）
@@ -2034,10 +1518,7 @@ mod tests {
         let config = Config::default();
         let cred = KiroCredentials::default();
 
-        let manager = match MultiTokenManager::new(config, vec![cred], None, None, false) {
-            Ok(v) => v,
-            Err(e) => panic!("{:?}", e),
-        };
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
 
         // 失败两次（使用 ID 1）
         manager.report_failure(1);
@@ -2060,10 +1541,8 @@ mod tests {
         let mut cred2 = KiroCredentials::default();
         cred2.refresh_token = Some("token2".to_string());
 
-        let manager = match MultiTokenManager::new(config, vec![cred1, cred2], None, None, false) {
-            Ok(v) => v,
-            Err(e) => panic!("{:?}", e),
-        };
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
         // 初始是第一个凭据
         assert_eq!(
@@ -2090,7 +1569,7 @@ mod tests {
         cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
         let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).expect("创建管理器失败");
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
         // 凭据会自动分配 ID（从 1 开始）
         for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
@@ -2103,7 +1582,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context().await.expect("获取上下文失败");
+        let ctx = manager.acquire_context().await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -2115,7 +1594,7 @@ mod tests {
         let cred2 = KiroCredentials::default();
 
         let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).expect("创建管理器失败");
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
         // 凭据会自动分配 ID（从 1 开始）
         assert_eq!(manager.available_count(), 2);
@@ -2134,13 +1613,13 @@ mod tests {
         let cred2 = KiroCredentials::default();
 
         let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).expect("创建管理器失败");
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
         manager.report_quota_exhausted(1);
         manager.report_quota_exhausted(2);
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context().await.err().expect("应返回错误").to_string();
+        let err = manager.acquire_context().await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -2149,887 +1628,127 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
     }
 
-    /// 测试 IdC Token 刷新功能
-    /// 从外部凭据文件加载 IdC 凭据并尝试刷新 Token
-    #[tokio::test]
-    #[ignore] // 需要有效的 IdC 凭据才能运行，使用 cargo test -- --ignored 运行
-    async fn test_refresh_idc_token_from_file() {
-        use std::path::Path;
+    // ============ 凭据级 Region 优先级测试 ============
 
-        // 从外部文件加载凭据
-        let credentials_path = Path::new(r"F:\working_ai\kiro2api-cc\credentials.json");
-        if !credentials_path.exists() {
-            println!("凭据文件不存在，跳过测试");
-            return;
-        }
-
-        let content = std::fs::read_to_string(credentials_path).expect("读取凭据文件失败");
-        let credentials_list: Vec<KiroCredentials> =
-            serde_json::from_str(&content).expect("解析凭据文件失败");
-
-        // 找到 IdC 凭据（id=14 或 id=15）
-        let idc_credentials: Vec<_> = credentials_list
-            .iter()
-            .filter(|c| {
-                c.auth_method
-                    .as_ref()
-                    .map(|m| m.to_lowercase() == "idc")
-                    .unwrap_or(false)
-            })
-            .collect();
-
-        if idc_credentials.is_empty() {
-            println!("未找到 IdC 凭据，跳过测试");
-            return;
-        }
-
-        println!("找到 {} 个 IdC 凭据", idc_credentials.len());
-
-        let config = Config::default();
-
-        for cred in idc_credentials {
-            let id = cred.id.unwrap_or(0);
-            println!("\n========================================");
-            println!("测试凭据 #{}", id);
-            println!("clientId: {:?}", cred.client_id.as_ref().map(|s| &s[..20.min(s.len())]));
-            println!("refreshToken: {:?}", cred.refresh_token.as_ref().map(|s| &s[..20.min(s.len())]));
-            println!("当前 expiresAt: {:?}", cred.expires_at);
-
-            match refresh_idc_token(cred, &config, None).await {
-                Ok(new_cred) => {
-                    println!("刷新成功!");
-                    println!("新 accessToken: {:?}", new_cred.access_token.as_ref().map(|s| &s[..50.min(s.len())]));
-                    println!("新 expiresAt: {:?}", new_cred.expires_at);
-
-                    // 验证新 Token 有效
-                    assert!(new_cred.access_token.is_some(), "刷新后应有 accessToken");
-                    assert!(new_cred.expires_at.is_some(), "刷新后应有 expiresAt");
-                    assert!(!is_token_expired(&new_cred), "刷新后的 Token 不应过期");
-                }
-                Err(e) => {
-                    println!("刷新失败: {}", e);
-                    // 不 panic，继续测试其他凭据
-                }
-            }
-        }
+    /// 辅助函数：获取 OIDC 刷新使用的 region（用于测试）
+    fn get_oidc_region_for_credential<'a>(
+        credentials: &'a KiroCredentials,
+        config: &'a Config,
+    ) -> &'a str {
+        credentials.region.as_ref().unwrap_or(&config.region)
     }
 
-    /// 测试 IdC 凭据发送"你好"请求
-    /// 打印完整的请求信息以便调试 403 错误
-    #[tokio::test]
-    #[ignore] // 需要有效的 IdC 凭据才能运行，使用 cargo test -- --ignored 运行
-    async fn test_idc_send_hello_request() {
-        use crate::http_client::build_client;
-        use crate::kiro::machine_id;
-        use crate::kiro::model::requests::conversation::{
-            ConversationState, CurrentMessage, UserInputMessage,
-        };
-        use crate::kiro::model::requests::kiro::KiroRequest;
-        use reqwest::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, HeaderValue};
-        use std::path::Path;
+    #[test]
+    fn test_credential_region_priority_uses_credential_region() {
+        // 凭据配置了 region 时，应使用凭据的 region
+        let mut config = Config::default();
+        config.region = "us-west-2".to_string();
 
-        // 从外部文件加载凭据
-        let credentials_path = Path::new(r"F:\working_ai\kiro2api-cc\credentials.json");
-        if !credentials_path.exists() {
-            println!("凭据文件不存在，跳过测试");
-            return;
-        }
+        let mut credentials = KiroCredentials::default();
+        credentials.region = Some("eu-west-1".to_string());
 
-        let content = std::fs::read_to_string(credentials_path).expect("读取凭据文件失败");
-        let credentials_list: Vec<KiroCredentials> =
-            serde_json::from_str(&content).expect("解析凭据文件失败");
-
-        // 找到 IdC 凭据（id=14 或 id=15）
-        let idc_credentials: Vec<_> = credentials_list
-            .iter()
-            .filter(|c| {
-                c.auth_method
-                    .as_ref()
-                    .map(|m| m.to_lowercase() == "idc")
-                    .unwrap_or(false)
-            })
-            .collect();
-
-        if idc_credentials.is_empty() {
-            println!("未找到 IdC 凭据，跳过测试");
-            return;
-        }
-
-        println!("找到 {} 个 IdC 凭据", idc_credentials.len());
-
-        let config = Config::default();
-
-        for cred in idc_credentials {
-            let id = cred.id.unwrap_or(0);
-            println!("\n========================================");
-            println!("测试凭据 #{}", id);
-            println!("========================================");
-
-            // 先刷新 Token
-            let refreshed_cred = match refresh_idc_token(cred, &config, None).await {
-                Ok(c) => {
-                    println!("Token 刷新成功");
-                    c
-                }
-                Err(e) => {
-                    println!("Token 刷新失败: {}", e);
-                    continue;
-                }
-            };
-
-            let access_token = match refreshed_cred.access_token.as_ref() {
-                Some(t) => t,
-                None => {
-                    println!("刷新后无 accessToken");
-                    continue;
-                }
-            };
-
-            // 构建请求 - 使用 Kiro 的模型 ID 格式
-            let model_ids = [
-                "simple-task",           // 简单任务/意图分类
-                "claude-sonnet-4.5",     // Sonnet 模型
-                "claude-opus-4.5",       // Opus 模型
-                "claude-haiku-4.5",      // Haiku 模型
-            ];
-
-            for model_id in model_ids {
-                println!("\n--- 尝试模型: {} ---", model_id);
-
-                let conversation_id = uuid::Uuid::new_v4().to_string();
-                let user_message = UserInputMessage::new("你好", model_id)
-                    .with_origin("AI_EDITOR");
-                let current_message = CurrentMessage::new(user_message);
-                let conversation_state = ConversationState::new(&conversation_id)
-                    .with_agent_task_type("vibe")
-                    .with_chat_trigger_type("MANUAL")
-                    .with_current_message(current_message);
-
-                let request = KiroRequest {
-                    conversation_state,
-                    profile_arn: refreshed_cred.profile_arn.clone(),
-                };
-
-                let request_body = serde_json::to_string_pretty(&request).expect("序列化请求失败");
-
-                // 构建请求头
-                let machine_id = machine_id::generate_from_credentials(&refreshed_cred, &config)
-                    .unwrap_or_else(|| "unknown".to_string());
-                let kiro_version = &config.kiro_version;
-                let os_name = &config.system_version;
-                let node_version = &config.node_version;
-
-                let x_amz_user_agent = format!("aws-sdk-js/1.0.27 KiroIDE-{}-{}", kiro_version, machine_id);
-                let user_agent = format!(
-                    "aws-sdk-js/1.0.27 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.27 m/E KiroIDE-{}-{}",
-                    os_name, node_version, kiro_version, machine_id
-                );
-
-                let region = &config.region;
-                let url = format!("https://q.{}.amazonaws.com/generateAssistantResponse", region);
-                let host = format!("q.{}.amazonaws.com", region);
-
-                // 打印请求信息
-                println!("\n--- 请求 URL ---");
-                println!("{}", url);
-
-                println!("\n--- 请求头 ---");
-                println!("Content-Type: application/json");
-                println!("Host: {}", host);
-                println!("x-amzn-codewhisperer-optout: true");
-                println!("x-amzn-kiro-agent-mode: vibe");
-                println!("x-amz-user-agent: {}", x_amz_user_agent);
-                println!("User-Agent: {}", user_agent);
-                println!("amz-sdk-invocation-id: <uuid>");
-                println!("amz-sdk-request: attempt=1; max=3");
-                println!("Authorization: Bearer {}...", &access_token[..50.min(access_token.len())]);
-                println!("Connection: close");
-
-                println!("\n--- 请求体 ---");
-                println!("{}", request_body);
-
-                println!("\n--- profileArn ---");
-                println!("{:?}", refreshed_cred.profile_arn);
-
-                // 发送请求
-                let client = build_client(None, 60).expect("构建 HTTP Client 失败");
-
-                let response = client
-                    .post(&url)
-                    .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-                    .header("x-amzn-codewhisperer-optout", HeaderValue::from_static("true"))
-                    .header("x-amzn-kiro-agent-mode", HeaderValue::from_static("vibe"))
-                    .header("x-amz-user-agent", HeaderValue::from_str(&x_amz_user_agent).expect("header"))
-                    .header(reqwest::header::USER_AGENT, HeaderValue::from_str(&user_agent).expect("header"))
-                    .header(HOST, HeaderValue::from_str(&host).expect("header"))
-                    .header("amz-sdk-invocation-id", HeaderValue::from_str(&uuid::Uuid::new_v4().to_string()).expect("header"))
-                    .header("amz-sdk-request", HeaderValue::from_static("attempt=1; max=3"))
-                    .header(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {}", access_token)).expect("header"))
-                    .header(CONNECTION, HeaderValue::from_static("close"))
-                    .body(request_body.clone())
-                    .send()
-                    .await;
-
-                match response {
-                    Ok(resp) => {
-                        let status = resp.status();
-                        println!("\n--- 响应状态 ---");
-                        println!("{}", status);
-
-                        println!("\n--- 响应头 ---");
-                        for (name, value) in resp.headers() {
-                            println!("{}: {:?}", name, value);
-                        }
-
-                        let body = resp.text().await.unwrap_or_default();
-                        println!("\n--- 响应体 ---");
-                        println!("{}", body);
-
-                        // 如果成功，跳出循环
-                        if status.is_success() {
-                            println!("\n!!! 成功 !!!");
-                            break;
-                        }
-
-                        if status.as_u16() == 403 {
-                            println!("\n!!! 403 错误分析 !!!");
-                            println!("可能原因:");
-                            println!("1. profileArn 不正确或缺失");
-                            println!("2. accessToken 权限不足");
-                            println!("3. 请求头格式不正确");
-                            println!("4. IdC 凭据需要特殊的 profileArn");
-                        }
-                    }
-                    Err(e) => {
-                        println!("\n--- 请求失败 ---");
-                        println!("{}", e);
-                    }
-                }
-            } // end for model_id
-        }
+        let region = get_oidc_region_for_credential(&credentials, &config);
+        assert_eq!(region, "eu-west-1");
     }
 
-    /// 完整诊断 IdC 403 错误
-    /// 测试完整的 IdC 认证流程：Token 刷新 -> 获取 profileArn -> 发送 API 请求
-    #[tokio::test]
-    #[ignore] // 需要有效的 IdC 凭据才能运行，使用 cargo test -- --ignored 运行
-    async fn test_idc_full_flow_diagnosis() {
-        use crate::http_client::build_client;
-        use crate::kiro::machine_id;
-        use crate::kiro::model::requests::conversation::{
-            ConversationState, CurrentMessage, UserInputMessage,
-        };
-        use crate::kiro::model::requests::kiro::KiroRequest;
-        use reqwest::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, HeaderValue};
-        use std::path::Path;
+    #[test]
+    fn test_credential_region_priority_fallback_to_config() {
+        // 凭据未配置 region 时，应回退到 config.region
+        let mut config = Config::default();
+        config.region = "us-west-2".to_string();
 
-        println!("\n");
-        println!("╔══════════════════════════════════════════════════════════════╗");
-        println!("║           IdC 403 错误完整诊断测试                           ║");
-        println!("╚══════════════════════════════════════════════════════════════╝");
+        let credentials = KiroCredentials::default();
+        assert!(credentials.region.is_none());
 
-        // 从外部文件加载凭据
-        let credentials_path = Path::new(r"F:\working_ai\kiro2api-cc\credentials.json");
-        if !credentials_path.exists() {
-            println!("凭据文件不存在，跳过测试");
-            return;
-        }
-
-        let content = std::fs::read_to_string(credentials_path).expect("读取凭据文件失败");
-        let credentials_list: Vec<KiroCredentials> =
-            serde_json::from_str(&content).expect("解析凭据文件失败");
-
-        // 找到 IdC 凭据
-        let idc_credentials: Vec<_> = credentials_list
-            .iter()
-            .filter(|c| {
-                c.auth_method
-                    .as_ref()
-                    .map(|m| m.to_lowercase() == "idc")
-                    .unwrap_or(false)
-            })
-            .collect();
-
-        if idc_credentials.is_empty() {
-            println!("未找到 IdC 凭据，跳过测试");
-            return;
-        }
-
-        println!("找到 {} 个 IdC 凭据\n", idc_credentials.len());
-
-        let config = Config::default();
-
-        for cred in idc_credentials {
-            let id = cred.id.unwrap_or(0);
-            println!("════════════════════════════════════════════════════════════════");
-            println!("测试凭据 #{}", id);
-            println!("════════════════════════════════════════════════════════════════");
-
-            // ========== 步骤 1: 检查原始凭据 ==========
-            println!("\n【步骤 1】检查原始凭据");
-            println!("  - clientId: {:?}", cred.client_id.as_ref().map(|s| format!("{}...", &s[..20.min(s.len())])));
-            println!("  - clientSecret: {:?}", cred.client_secret.as_ref().map(|s| format!("{}...", &s[..30.min(s.len())])));
-            println!("  - refreshToken: {:?}", cred.refresh_token.as_ref().map(|s| format!("{}...", &s[..30.min(s.len())])));
-            println!("  - 原始 profileArn: {:?}", cred.profile_arn);
-            println!("  - 原始 expiresAt: {:?}", cred.expires_at);
-            println!("  - authMethod: {:?}", cred.auth_method);
-
-            // ========== 步骤 2: 刷新 IdC Token ==========
-            println!("\n【步骤 2】刷新 IdC Token");
-            let refreshed_cred = match refresh_idc_token(cred, &config, None).await {
-                Ok(c) => {
-                    println!("  ✓ Token 刷新成功");
-                    println!("  - 新 accessToken: {}...", &c.access_token.as_ref().map(|s| &s[..50.min(s.len())]).unwrap_or(&"<无>"));
-                    println!("  - 新 expiresAt: {:?}", c.expires_at);
-                    println!("  - Token 是否过期: {}", is_token_expired(&c));
-                    println!("  - Token 是否即将过期: {}", is_token_expiring_soon(&c));
-                    c
-                }
-                Err(e) => {
-                    println!("  ✗ Token 刷新失败: {}", e);
-                    continue;
-                }
-            };
-
-            let access_token = match refreshed_cred.access_token.as_ref() {
-                Some(t) => t,
-                None => {
-                    println!("  ✗ 刷新后无 accessToken");
-                    continue;
-                }
-            };
-
-            // ========== 步骤 3: 获取 profileArn ==========
-            println!("\n【步骤 3】获取 profileArn (ListAvailableProfiles)");
-            let profile_arn = if let Some(arn) = &refreshed_cred.profile_arn {
-                println!("  - 使用原始 profileArn: {}", arn);
-                Some(arn.clone())
-            } else {
-                println!("  - 原始 profileArn 为空，尝试调用 ListAvailableProfiles...");
-                match list_available_profiles(&refreshed_cred, &config, access_token, None).await {
-                    Ok(Some(arn)) => {
-                        println!("  ✓ 成功获取 profileArn: {}", arn);
-                        Some(arn)
-                    }
-                    Ok(None) => {
-                        println!("  ⚠ ListAvailableProfiles 返回空（可能是退避/缓存/空列表）");
-                        None
-                    }
-                    Err(e) => {
-                        println!("  ✗ ListAvailableProfiles 失败: {}", e);
-                        None
-                    }
-                }
-            };
-
-            // ========== 步骤 4: 构建并发送 API 请求 ==========
-            println!("\n【步骤 4】发送 API 请求");
-
-            let conversation_id = uuid::Uuid::new_v4().to_string();
-            let user_message = UserInputMessage::new("你好", "claude-sonnet-4.5")
-                .with_origin("AI_EDITOR");
-            let current_message = CurrentMessage::new(user_message);
-            let conversation_state = ConversationState::new(&conversation_id)
-                .with_agent_task_type("vibe")
-                .with_chat_trigger_type("MANUAL")
-                .with_current_message(current_message);
-
-            let request = KiroRequest {
-                conversation_state,
-                profile_arn: profile_arn.clone(),
-            };
-
-            let request_body = serde_json::to_string_pretty(&request).expect("序列化请求失败");
-
-            // 构建请求头
-            let machine_id = machine_id::generate_from_credentials(&refreshed_cred, &config)
-                .unwrap_or_else(|| "unknown".to_string());
-            let kiro_version = &config.kiro_version;
-            let os_name = &config.system_version;
-            let node_version = &config.node_version;
-
-            let x_amz_user_agent = format!("aws-sdk-js/1.0.27 KiroIDE-{}-{}", kiro_version, machine_id);
-            let user_agent = format!(
-                "aws-sdk-js/1.0.27 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.27 m/E KiroIDE-{}-{}",
-                os_name, node_version, kiro_version, machine_id
-            );
-
-            let region = &config.region;
-            let url = format!("https://q.{}.amazonaws.com/generateAssistantResponse", region);
-            let host = format!("q.{}.amazonaws.com", region);
-
-            println!("  - URL: {}", url);
-            println!("  - profileArn in request: {:?}", profile_arn);
-            println!("  - machineId: {}", machine_id);
-            println!("  - Authorization: Bearer {}...", &access_token[..50.min(access_token.len())]);
-
-            // 发送请求
-            let client = build_client(None, 60).expect("构建 HTTP Client 失败");
-
-            let response = client
-                .post(&url)
-                .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-                .header("x-amzn-codewhisperer-optout", HeaderValue::from_static("true"))
-                .header("x-amzn-kiro-agent-mode", HeaderValue::from_static("vibe"))
-                .header("x-amz-user-agent", HeaderValue::from_str(&x_amz_user_agent).expect("header"))
-                .header(reqwest::header::USER_AGENT, HeaderValue::from_str(&user_agent).expect("header"))
-                .header(HOST, HeaderValue::from_str(&host).expect("header"))
-                .header("amz-sdk-invocation-id", HeaderValue::from_str(&uuid::Uuid::new_v4().to_string()).expect("header"))
-                .header("amz-sdk-request", HeaderValue::from_static("attempt=1; max=3"))
-                .header(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {}", access_token)).expect("header"))
-                .header(CONNECTION, HeaderValue::from_static("close"))
-                .body(request_body.clone())
-                .send()
-                .await;
-
-            match response {
-                Ok(resp) => {
-                    let status = resp.status();
-                    println!("\n【响应结果】");
-                    println!("  - 状态码: {}", status);
-
-                    if status.is_success() {
-                        println!("  ✓ 请求成功！");
-                        let body = resp.text().await.unwrap_or_default();
-                        println!("  - 响应体前 500 字符: {}", &body[..500.min(body.len())]);
-                    } else {
-                        let body = resp.text().await.unwrap_or_default();
-                        println!("  ✗ 请求失败");
-                        println!("  - 响应体: {}", body);
-
-                        if status.as_u16() == 403 {
-                            println!("\n【403 错误诊断】");
-                            if profile_arn.is_none() {
-                                println!("  ⚠ profileArn 为空！这很可能是 403 的原因");
-                                println!("  → 建议：检查 ListAvailableProfiles 为何返回空");
-                            }
-                            if body.contains("bearer token") || body.contains("invalid") {
-                                println!("  ⚠ Token 被认为无效");
-                                println!("  → 可能原因：");
-                                println!("    1. IdC Token 需要配合正确的 profileArn 使用");
-                                println!("    2. Token 权限不足（scope 问题）");
-                                println!("    3. Token 已被撤销");
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    println!("\n【网络错误】");
-                    println!("  ✗ 请求发送失败: {}", e);
-                }
-            }
-
-            println!("\n");
-        }
-
-        println!("════════════════════════════════════════════════════════════════");
-        println!("诊断测试完成");
-        println!("════════════════════════════════════════════════════════════════");
+        let region = get_oidc_region_for_credential(&credentials, &config);
+        assert_eq!(region, "us-west-2");
     }
 
-    /// 诊断 call_api_with_retry 在 IdC 模式下的 403 错误
-    ///
-    /// 此测试模拟实际的 API 调用流程，对比以下两种情况：
-    /// 1. 使用凭据中的 profileArn（可能为空或过期）
-    /// 2. 使用 ListAvailableProfiles 获取的最新 profileArn
-    ///
-    /// 输出完整的请求体 DUMP 以便诊断
-    #[tokio::test]
-    #[ignore] // 需要有效的 IdC 凭据才能运行，使用 cargo test -- --ignored 运行
-    async fn test_idc_call_api_with_retry_diagnosis() {
-        use crate::http_client::build_client;
-        use crate::kiro::machine_id;
-        use crate::kiro::model::requests::conversation::{
-            ConversationState, CurrentMessage, UserInputMessage,
-        };
-        use crate::kiro::model::requests::kiro::KiroRequest;
-        use crate::kiro::provider::KiroProvider;
-        use crate::model::config::Config;
-        use reqwest::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, HeaderValue};
-        use std::path::Path;
-        use std::sync::Arc;
+    #[test]
+    fn test_multiple_credentials_use_respective_regions() {
+        // 多凭据场景下，不同凭据使用各自的 region
+        let mut config = Config::default();
+        config.region = "ap-northeast-1".to_string();
 
-        println!("\n");
-        println!("╔══════════════════════════════════════════════════════════════╗");
-        println!("║     call_api_with_retry IdC 403 错误诊断测试                 ║");
-        println!("╚══════════════════════════════════════════════════════════════╝");
+        let mut cred1 = KiroCredentials::default();
+        cred1.region = Some("us-east-1".to_string());
 
-        // 从外部文件加载凭据
-        let credentials_path = Path::new(r"F:\working_ai\kiro2api-cc\credentials.json");
-        if !credentials_path.exists() {
-            println!("凭据文件不存在，跳过测试");
-            return;
-        }
+        let mut cred2 = KiroCredentials::default();
+        cred2.region = Some("eu-west-1".to_string());
 
-        let content = std::fs::read_to_string(credentials_path).expect("读取凭据文件失败");
-        let credentials_list: Vec<KiroCredentials> =
-            serde_json::from_str(&content).expect("解析凭据文件失败");
+        let cred3 = KiroCredentials::default(); // 无 region，使用 config
 
-        // 找到 IdC 凭据
-        let idc_credentials: Vec<KiroCredentials> = credentials_list
-            .into_iter()
-            .filter(|c| {
-                c.auth_method
-                    .as_ref()
-                    .map(|m| m.to_lowercase() == "idc")
-                    .unwrap_or(false)
-            })
-            .collect();
-
-        if idc_credentials.is_empty() {
-            println!("未找到 IdC 凭据，跳过测试");
-            return;
-        }
-
-        println!("找到 {} 个 IdC 凭据\n", idc_credentials.len());
-
-        let config = Config::default();
-
-        // ========== 测试 1: 使用 MultiTokenManager + KiroProvider（模拟实际流程）==========
-        println!("════════════════════════════════════════════════════════════════");
-        println!("【测试 1】使用 MultiTokenManager + KiroProvider（模拟实际流程）");
-        println!("════════════════════════════════════════════════════════════════");
-
-        let token_manager = match MultiTokenManager::new(
-            config.clone(),
-            idc_credentials.clone(),
-            None,
-            None,
-            false,
-        ) {
-            Ok(tm) => Arc::new(tm),
-            Err(e) => {
-                println!("创建 MultiTokenManager 失败: {}", e);
-                return;
-            }
-        };
-
-        let provider = match KiroProvider::new(token_manager.clone()) {
-            Ok(p) => Arc::new(p),
-            Err(e) => {
-                println!("创建 KiroProvider 失败: {}", e);
-                return;
-            }
-        };
-
-        // 获取调用上下文
-        println!("\n【步骤 1.1】获取调用上下文 (acquire_context)");
-        let ctx = match token_manager.acquire_context().await {
-            Ok(c) => {
-                println!("  ✓ 获取上下文成功");
-                println!("  - credential_id: {}", c.id);
-                println!("  - token: {}...", &c.token[..50.min(c.token.len())]);
-                println!("  - credentials.profile_arn: {:?}", c.credentials.profile_arn);
-                println!("  - credentials.auth_method: {:?}", c.credentials.auth_method);
-                c
-            }
-            Err(e) => {
-                println!("  ✗ 获取上下文失败: {}", e);
-                return;
-            }
-        };
-
-        // 构建请求体（模拟 handlers.rs 的行为）
-        println!("\n【步骤 1.2】构建请求体（模拟 handlers.rs）");
-        let conversation_id = uuid::Uuid::new_v4().to_string();
-        let user_message = UserInputMessage::new("你好", "claude-sonnet-4.5")
-            .with_origin("AI_EDITOR");
-        let current_message = CurrentMessage::new(user_message);
-        let conversation_state = ConversationState::new(&conversation_id)
-            .with_agent_task_type("vibe")
-            .with_chat_trigger_type("MANUAL")
-            .with_current_message(current_message);
-
-        // 关键：这里使用凭据中的 profile_arn（模拟 handlers.rs 的行为）
-        let request_with_cred_arn = KiroRequest {
-            conversation_state: conversation_state.clone(),
-            profile_arn: ctx.credentials.profile_arn.clone(),
-        };
-
-        let request_body_with_cred_arn = serde_json::to_string_pretty(&request_with_cred_arn)
-            .expect("序列化请求失败");
-
-        println!("  - 使用凭据中的 profileArn: {:?}", ctx.credentials.profile_arn);
-        println!("\n【请求体 DUMP（使用凭据 profileArn）】");
-        println!("{}", request_body_with_cred_arn);
-
-        // 发送请求
-        println!("\n【步骤 1.3】发送 API 请求（使用凭据 profileArn）");
-        match provider.call_api(&request_body_with_cred_arn).await {
-            Ok(resp) => {
-                let status = resp.status();
-                println!("  - 状态码: {}", status);
-                if status.is_success() {
-                    println!("  ✓ 请求成功！");
-                    let body = resp.text().await.unwrap_or_default();
-                    println!("  - 响应体前 500 字符: {}", &body[..500.min(body.len())]);
-                } else {
-                    let body = resp.text().await.unwrap_or_default();
-                    println!("  ✗ 请求失败");
-                    println!("  - 响应体: {}", body);
-                }
-            }
-            Err(e) => {
-                println!("  ✗ 请求失败: {}", e);
-            }
-        }
-
-        // ========== 测试 2: 手动获取最新 profileArn 后发送请求 ==========
-        println!("\n════════════════════════════════════════════════════════════════");
-        println!("【测试 2】手动获取最新 profileArn 后发送请求");
-        println!("════════════════════════════════════════════════════════════════");
-
-        // 重新获取上下文（确保 token 有效）
-        let ctx2 = match token_manager.acquire_context().await {
-            Ok(c) => c,
-            Err(e) => {
-                println!("获取上下文失败: {}", e);
-                return;
-            }
-        };
-
-        // 调用 ListAvailableProfiles 获取最新的 profileArn
-        println!("\n【步骤 2.1】调用 ListAvailableProfiles 获取最新 profileArn");
-        let fresh_profile_arn = match list_available_profiles(
-            &ctx2.credentials,
-            &config,
-            &ctx2.token,
-            None,
-        ).await {
-            Ok(Some(arn)) => {
-                println!("  ✓ 成功获取 profileArn: {}", arn);
-                Some(arn)
-            }
-            Ok(None) => {
-                println!("  ⚠ ListAvailableProfiles 返回空");
-                None
-            }
-            Err(e) => {
-                println!("  ✗ ListAvailableProfiles 失败: {}", e);
-                None
-            }
-        };
-
-        // 对比两个 profileArn
-        println!("\n【步骤 2.2】对比 profileArn");
-        println!("  - 凭据中的 profileArn: {:?}", ctx2.credentials.profile_arn);
-        println!("  - 新获取的 profileArn: {:?}", fresh_profile_arn);
-
-        let are_same = match (&ctx2.credentials.profile_arn, &fresh_profile_arn) {
-            (Some(a), Some(b)) => a == b,
-            (None, None) => true,
-            _ => false,
-        };
-        println!("  - 两者是否相同: {}", are_same);
-
-        // 使用新获取的 profileArn 构建请求
-        println!("\n【步骤 2.3】使用新获取的 profileArn 构建请求");
-        let conversation_id2 = uuid::Uuid::new_v4().to_string();
-        let user_message2 = UserInputMessage::new("你好", "claude-sonnet-4.5")
-            .with_origin("AI_EDITOR");
-        let current_message2 = CurrentMessage::new(user_message2);
-        let conversation_state2 = ConversationState::new(&conversation_id2)
-            .with_agent_task_type("vibe")
-            .with_chat_trigger_type("MANUAL")
-            .with_current_message(current_message2);
-
-        let request_with_fresh_arn = KiroRequest {
-            conversation_state: conversation_state2,
-            profile_arn: fresh_profile_arn.clone(),
-        };
-
-        let request_body_with_fresh_arn = serde_json::to_string_pretty(&request_with_fresh_arn)
-            .expect("序列化请求失败");
-
-        println!("  - 使用新获取的 profileArn: {:?}", fresh_profile_arn);
-        println!("\n【请求体 DUMP（使用新获取的 profileArn）】");
-        println!("{}", request_body_with_fresh_arn);
-
-        // 发送请求
-        println!("\n【步骤 2.4】发送 API 请求（使用新获取的 profileArn）");
-        match provider.call_api(&request_body_with_fresh_arn).await {
-            Ok(resp) => {
-                let status = resp.status();
-                println!("  - 状态码: {}", status);
-                if status.is_success() {
-                    println!("  ✓ 请求成功！");
-                    let body = resp.text().await.unwrap_or_default();
-                    println!("  - 响应体前 500 字符: {}", &body[..500.min(body.len())]);
-                } else {
-                    let body = resp.text().await.unwrap_or_default();
-                    println!("  ✗ 请求失败");
-                    println!("  - 响应体: {}", body);
-                }
-            }
-            Err(e) => {
-                println!("  ✗ 请求失败: {}", e);
-            }
-        }
-
-        // ========== 测试 3: 直接使用 HTTP Client 发送请求（完整 DUMP）==========
-        println!("\n════════════════════════════════════════════════════════════════");
-        println!("【测试 3】直接使用 HTTP Client 发送请求（完整请求头 DUMP）");
-        println!("════════════════════════════════════════════════════════════════");
-
-        let ctx3 = match token_manager.acquire_context().await {
-            Ok(c) => c,
-            Err(e) => {
-                println!("获取上下文失败: {}", e);
-                return;
-            }
-        };
-
-        let machine_id = machine_id::generate_from_credentials(&ctx3.credentials, &config)
-            .unwrap_or_else(|| "unknown".to_string());
-        let kiro_version = &config.kiro_version;
-        let os_name = &config.system_version;
-        let node_version = &config.node_version;
-
-        let x_amz_user_agent = format!("aws-sdk-js/1.0.27 KiroIDE-{}-{}", kiro_version, machine_id);
-        let user_agent = format!(
-            "aws-sdk-js/1.0.27 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.27 m/E KiroIDE-{}-{}",
-            os_name, node_version, kiro_version, machine_id
+        assert_eq!(get_oidc_region_for_credential(&cred1, &config), "us-east-1");
+        assert_eq!(get_oidc_region_for_credential(&cred2, &config), "eu-west-1");
+        assert_eq!(
+            get_oidc_region_for_credential(&cred3, &config),
+            "ap-northeast-1"
         );
+    }
 
-        let region = &config.region;
-        let url = format!("https://q.{}.amazonaws.com/generateAssistantResponse", region);
-        let host = format!("q.{}.amazonaws.com", region);
+    #[test]
+    fn test_idc_oidc_endpoint_uses_credential_region() {
+        // 验证 IdC OIDC endpoint URL 使用凭据 region
+        let mut config = Config::default();
+        config.region = "us-west-2".to_string();
 
-        println!("\n【完整请求信息 DUMP】");
-        println!("URL: {}", url);
-        println!("\n请求头:");
-        println!("  Content-Type: application/json");
-        println!("  Host: {}", host);
-        println!("  x-amzn-codewhisperer-optout: true");
-        println!("  x-amzn-kiro-agent-mode: vibe");
-        println!("  x-amz-user-agent: {}", x_amz_user_agent);
-        println!("  User-Agent: {}", user_agent);
-        println!("  amz-sdk-invocation-id: <uuid>");
-        println!("  amz-sdk-request: attempt=1; max=3");
-        println!("  Authorization: Bearer {}...", &ctx3.token[..50.min(ctx3.token.len())]);
-        println!("  Connection: close");
+        let mut credentials = KiroCredentials::default();
+        credentials.region = Some("eu-central-1".to_string());
 
-        // 测试 3.1: 使用凭据中的 profileArn
-        println!("\n【测试 3.1】使用凭据中的 profileArn");
-        let conversation_id3 = uuid::Uuid::new_v4().to_string();
-        let user_message3 = UserInputMessage::new("你好", "claude-sonnet-4.5")
-            .with_origin("AI_EDITOR");
-        let current_message3 = CurrentMessage::new(user_message3);
-        let conversation_state3 = ConversationState::new(&conversation_id3)
-            .with_agent_task_type("vibe")
-            .with_chat_trigger_type("MANUAL")
-            .with_current_message(current_message3);
+        let region = get_oidc_region_for_credential(&credentials, &config);
+        let refresh_url = format!("https://oidc.{}.amazonaws.com/token", region);
 
-        let request3a = KiroRequest {
-            conversation_state: conversation_state3.clone(),
-            profile_arn: ctx3.credentials.profile_arn.clone(),
-        };
-        let request_body3a = serde_json::to_string(&request3a).expect("序列化失败");
+        assert_eq!(refresh_url, "https://oidc.eu-central-1.amazonaws.com/token");
+    }
 
-        println!("请求体: {}", request_body3a);
+    #[test]
+    fn test_social_refresh_endpoint_uses_credential_region() {
+        // 验证 Social refresh endpoint URL 使用凭据 region
+        let mut config = Config::default();
+        config.region = "us-west-2".to_string();
 
-        let client = build_client(None, 60).expect("构建 HTTP Client 失败");
-        let response3a = client
-            .post(&url)
-            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-            .header("x-amzn-codewhisperer-optout", HeaderValue::from_static("true"))
-            .header("x-amzn-kiro-agent-mode", HeaderValue::from_static("vibe"))
-            .header("x-amz-user-agent", HeaderValue::from_str(&x_amz_user_agent).expect("header"))
-            .header(reqwest::header::USER_AGENT, HeaderValue::from_str(&user_agent).expect("header"))
-            .header(HOST, HeaderValue::from_str(&host).expect("header"))
-            .header("amz-sdk-invocation-id", HeaderValue::from_str(&uuid::Uuid::new_v4().to_string()).expect("header"))
-            .header("amz-sdk-request", HeaderValue::from_static("attempt=1; max=3"))
-            .header(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {}", ctx3.token)).expect("header"))
-            .header(CONNECTION, HeaderValue::from_static("close"))
-            .body(request_body3a)
-            .send()
-            .await;
+        let mut credentials = KiroCredentials::default();
+        credentials.region = Some("ap-southeast-1".to_string());
 
-        match response3a {
-            Ok(resp) => {
-                let status = resp.status();
-                println!("\n响应状态: {}", status);
-                println!("响应头:");
-                for (name, value) in resp.headers() {
-                    println!("  {}: {:?}", name, value);
-                }
-                let body = resp.text().await.unwrap_or_default();
-                println!("响应体: {}", body);
-            }
-            Err(e) => {
-                println!("请求失败: {}", e);
-            }
-        }
+        let region = get_oidc_region_for_credential(&credentials, &config);
+        let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
 
-        // 测试 3.2: 使用新获取的 profileArn
-        if fresh_profile_arn.is_some() && fresh_profile_arn != ctx3.credentials.profile_arn {
-            println!("\n【测试 3.2】使用新获取的 profileArn");
-            let conversation_id3b = uuid::Uuid::new_v4().to_string();
-            let user_message3b = UserInputMessage::new("你好", "claude-sonnet-4.5")
-                .with_origin("AI_EDITOR");
-            let current_message3b = CurrentMessage::new(user_message3b);
-            let conversation_state3b = ConversationState::new(&conversation_id3b)
-                .with_agent_task_type("vibe")
-                .with_chat_trigger_type("MANUAL")
-                .with_current_message(current_message3b);
+        assert_eq!(
+            refresh_url,
+            "https://prod.ap-southeast-1.auth.desktop.kiro.dev/refreshToken"
+        );
+    }
 
-            let request3b = KiroRequest {
-                conversation_state: conversation_state3b,
-                profile_arn: fresh_profile_arn.clone(),
-            };
-            let request_body3b = serde_json::to_string(&request3b).expect("序列化失败");
+    #[test]
+    fn test_api_call_still_uses_config_region() {
+        // 验证 API 调用（如 getUsageLimits）仍使用 config.region
+        // 这确保只有 OIDC 刷新使用凭据 region，API 调用行为不变
+        let mut config = Config::default();
+        config.region = "us-west-2".to_string();
 
-            println!("请求体: {}", request_body3b);
+        let mut credentials = KiroCredentials::default();
+        credentials.region = Some("eu-west-1".to_string());
 
-            let response3b = client
-                .post(&url)
-                .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-                .header("x-amzn-codewhisperer-optout", HeaderValue::from_static("true"))
-                .header("x-amzn-kiro-agent-mode", HeaderValue::from_static("vibe"))
-                .header("x-amz-user-agent", HeaderValue::from_str(&x_amz_user_agent).expect("header"))
-                .header(reqwest::header::USER_AGENT, HeaderValue::from_str(&user_agent).expect("header"))
-                .header(HOST, HeaderValue::from_str(&host).expect("header"))
-                .header("amz-sdk-invocation-id", HeaderValue::from_str(&uuid::Uuid::new_v4().to_string()).expect("header"))
-                .header("amz-sdk-request", HeaderValue::from_static("attempt=1; max=3"))
-                .header(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {}", ctx3.token)).expect("header"))
-                .header(CONNECTION, HeaderValue::from_static("close"))
-                .body(request_body3b)
-                .send()
-                .await;
+        // API 调用应使用 config.region，而非 credentials.region
+        let api_region = &config.region;
+        let api_host = format!("q.{}.amazonaws.com", api_region);
 
-            match response3b {
-                Ok(resp) => {
-                    let status = resp.status();
-                    println!("\n响应状态: {}", status);
-                    println!("响应头:");
-                    for (name, value) in resp.headers() {
-                        println!("  {}: {:?}", name, value);
-                    }
-                    let body = resp.text().await.unwrap_or_default();
-                    println!("响应体: {}", body);
-                }
-                Err(e) => {
-                    println!("请求失败: {}", e);
-                }
-            }
-        }
+        assert_eq!(api_host, "q.us-west-2.amazonaws.com");
+        // 确认凭据 region 不影响 API 调用
+        assert_ne!(api_region, credentials.region.as_ref().unwrap());
+    }
 
-        // ========== 诊断总结 ==========
-        println!("\n════════════════════════════════════════════════════════════════");
-        println!("【诊断总结】");
-        println!("════════════════════════════════════════════════════════════════");
-        println!("1. test_idc_full_flow_diagnosis 成功的原因:");
-        println!("   - 每次都调用 ListAvailableProfiles 获取最新的 profileArn");
-        println!("   - 将获取到的 profileArn 直接放入请求体");
-        println!("");
-        println!("2. call_api_with_retry 可能失败的原因:");
-        println!("   - handlers.rs 使用 state.profile_arn（全局配置）");
-        println!("   - 而不是从当前凭据中动态获取 profileArn");
-        println!("   - 对于 IdC 凭据，每个凭据可能有不同的 profileArn");
-        println!("");
-        println!("3. 建议修复方案:");
-        println!("   - 在 acquire_context 时确保 profileArn 是最新的");
-        println!("   - 或者在 handlers.rs 中使用凭据的 profileArn 而非全局配置");
-        println!("════════════════════════════════════════════════════════════════");
+    #[test]
+    fn test_credential_region_empty_string_treated_as_set() {
+        // 空字符串 region 被视为已设置（虽然不推荐，但行为应一致）
+        let mut config = Config::default();
+        config.region = "us-west-2".to_string();
+
+        let mut credentials = KiroCredentials::default();
+        credentials.region = Some("".to_string());
+
+        let region = get_oidc_region_for_credential(&credentials, &config);
+        // 空字符串被视为已设置，不会回退到 config
+        assert_eq!(region, "");
     }
 }

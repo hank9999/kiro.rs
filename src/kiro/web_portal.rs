@@ -460,6 +460,27 @@ pub async fn get_user_usage_and_limits(
     .await
 }
 
+/// 获取聚合账号信息（包括用户信息、用量、订阅等）
+///
+/// 这是一个便捷函数，组合调用 GetUserInfo 和 GetUserUsageAndLimits API
+pub async fn get_account_aggregate_info(
+    access_token: &str,
+    idp: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<AccountAggregateInfo> {
+    // 并行获取用户信息和用量限额
+    let (user_info_result, usage_result) = tokio::join!(
+        get_user_info(access_token, idp, proxy),
+        get_user_usage_and_limits(access_token, idp, proxy)
+    );
+
+    // 用户信息可选，用量信息必须成功
+    let user_info = user_info_result.ok();
+    let usage = usage_result?;
+
+    Ok(aggregate_account_info(user_info, usage))
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreditBonus {
