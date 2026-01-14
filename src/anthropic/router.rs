@@ -1,7 +1,9 @@
 //! Anthropic API 路由配置
 
 use axum::{
-    Router, middleware,
+    Router,
+    extract::DefaultBodyLimit,
+    middleware,
     routing::{get, post},
 };
 
@@ -11,6 +13,9 @@ use super::{
     handlers::{count_tokens, get_models, post_messages},
     middleware::{AppState, auth_middleware, cors_layer},
 };
+
+/// 请求体最大大小限制 (50MB)
+const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 
 /// 创建 Anthropic API 路由
 ///
@@ -55,5 +60,6 @@ pub fn create_router_with_provider(
     Router::new()
         .nest("/v1", v1_routes)
         .layer(cors_layer())
+        .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
         .with_state(state)
 }
