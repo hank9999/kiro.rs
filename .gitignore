@@ -1,12 +1,43 @@
+# Rust 构建产物
 /target
-/CLAUDE.md
-/AGENTS.md
+backend/target
+
+# 配置和凭证文件
 /config.json
 /credentials.json
+.env
+*.db
+
+# IDE 和编辑器
 /.idea
+.vscode
+
+# Claude 配置
+/.claude
+/CLAUDE.md
+/AGENTS.md
+
+# 测试文件
 /test.json
+
+# Cargo lock (可选)
 /Cargo.lock
+
+# 前端依赖和构建产物
+frontend/node_modules/
+frontend/dist/
+frontend/pnpm-lock.yaml
+frontend/tsconfig.tsbuildinfo
+
+# 旧的 admin-ui 路径 (兼容)
 /admin-ui/node_modules/
 /admin-ui/dist/
 /admin-ui/pnpm-lock.yaml
 /admin-ui/tsconfig.tsbuildinfo
+
+# macOS 生成的文件
+.DS_Store
+._*
+._.git
+backend/Cargo.lock
+kiro.rs

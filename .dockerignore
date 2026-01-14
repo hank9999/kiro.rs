@@ -1,13 +1,12 @@
 # Rust build artifacts
-target/
-Cargo.lock
+backend/target/
 
 # Node.js dependencies and build artifacts
-admin-ui/node_modules/
-admin-ui/dist/
-admin-ui/pnpm-lock.yaml
-admin-ui/tsconfig.tsbuildinfo
-admin-ui/.vite/
+frontend/node_modules/
+frontend/dist/
+frontend/pnpm-lock.yaml
+frontend/tsconfig.tsbuildinfo
+frontend/.vite/
 
 # Version control
 .git/
@@ -28,27 +27,25 @@ AGENTS.md
 # CI/CD
 .github/
 
-# Documentation and examples
+# Documentation
 *.md
-README.md
-config.example.json
-credentials.example.*.json
 
 # Development and test files
-src/test.rs
-src/debug.rs
-test.json
-tools/
+backend/tools/
 
 # OS-specific files
 .DS_Store
+._*
 Thumbs.db
 
-# Local configuration (keep templates only)
-config.json
-credentials.json
+# Local configuration
+.env
+*.db
 
 # Docker files
 Dockerfile
 .dockerignore
 docker-compose*.yml
+
+# Build output
+kiro.rs
