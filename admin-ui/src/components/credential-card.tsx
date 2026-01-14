@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2 } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Trash2 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -20,14 +20,15 @@ import {
   useSetPriority,
   useResetFailure,
   useDeleteCredential,
+  useCredentialBalance,
 } from '@/hooks/use-credentials'
+import { Progress } from '@/components/ui/progress'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
-  onViewBalance: (id: number) => void
 }
 
-export function CredentialCard({ credential, onViewBalance }: CredentialCardProps) {
+export function CredentialCard({ credential }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
@@ -36,6 +37,16 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
   const setPriority = useSetPriority()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
+  const { data: balance, isLoading: balanceLoading, isFetching } = useCredentialBalance(
+    credential.id,
+    !credential.disabled // 仅启用的凭据自动刷新余额
+  )
+  // 只在初次加载时显示 loading，自动刷新时不显示
+  const showBalanceLoading = balanceLoading && !isFetching
+
+  const formatNumber = (num: number) => {
+    return num.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  }
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -190,12 +201,33 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
               <span className="text-muted-foreground">Token 有效期：</span>
               <span className="font-medium">{formatExpiry(credential.expiresAt)}</span>
             </div>
-            {credential.hasProfileArn && (
-              <div className="col-span-2">
-                <Badge variant="secondary">有 Profile ARN</Badge>
-              </div>
-            )}
           </div>
+
+          {/* 余额信息 */}
+          {showBalanceLoading && (
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-primary"></div>
+              加载余额中...
+            </div>
+          )}
+          {balance && (
+            <div className="space-y-2">
+              <div className="flex justify-between text-sm">
+                <span className="text-muted-foreground">
+                  {balance.subscriptionTitle || '订阅'}
+                </span>
+                <span className="font-medium text-green-600">
+                  剩余 ${formatNumber(balance.remaining)}
+                </span>
+              </div>
+              <Progress value={balance.usagePercentage} className="h-2" />
+              <div className="flex justify-between text-xs text-muted-foreground">
+                <span>已用 ${formatNumber(balance.currentUsage)}</span>
+                <span>{balance.usagePercentage.toFixed(1)}%</span>
+                <span>限额 ${formatNumber(balance.usageLimit)}</span>
+              </div>
+            </div>
+          )}
 
           {/* 操作按钮 */}
           <div className="flex flex-wrap gap-2 pt-2 border-t">
@@ -243,14 +275,6 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
             >
               <ChevronDown className="h-4 w-4 mr-1" />
               降低优先级
-            </Button>
-            <Button
-              size="sm"
-              variant="default"
-              onClick={() => onViewBalance(credential.id)}
-            >
-              <Wallet className="h-4 w-4 mr-1" />
-              查看余额
             </Button>
             <Button
               size="sm"

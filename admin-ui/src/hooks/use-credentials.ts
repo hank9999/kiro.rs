@@ -1,3 +1,4 @@
+import { useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   getCredentials,
@@ -20,12 +21,20 @@ export function useCredentials() {
 }
 
 // 查询凭据余额
-export function useCredentialBalance(id: number | null) {
+// enabled: 是否启用自动刷新（仅对启用的凭据自动刷新）
+export function useCredentialBalance(id: number | null, autoRefresh: boolean = false) {
+  // 生成 1-2 分钟之间的随机刷新间隔，每个凭据固定一个值避免重复计算
+  const refetchInterval = useMemo(() => {
+    if (!autoRefresh) return false
+    return 60000 + Math.random() * 60000 // 60000ms ~ 120000ms
+  }, [autoRefresh])
+
   return useQuery({
     queryKey: ['credential-balance', id],
     queryFn: () => getCredentialBalance(id!),
     enabled: id !== null,
     retry: false, // 余额查询失败时不重试（避免重复请求被封禁的账号）
+    refetchInterval,
   })
 }
 
