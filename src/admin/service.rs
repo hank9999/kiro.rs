@@ -396,3 +396,61 @@ impl AdminService {
         serde_json::to_string(&request).unwrap_or_default()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_map_validate_model() {
+        assert_eq!(
+            AdminService::map_validate_model("sonnet"),
+            "claude-sonnet-4.5"
+        );
+        assert_eq!(AdminService::map_validate_model("opus"), "claude-opus-4.5");
+        assert_eq!(
+            AdminService::map_validate_model("haiku"),
+            "claude-haiku-4.5"
+        );
+        assert_eq!(
+            AdminService::map_validate_model("unknown"),
+            "claude-sonnet-4.5"
+        );
+    }
+
+    #[test]
+    fn test_classify_status_code() {
+        let (status, _) = AdminService::classify_status_code(200);
+        assert_eq!(status, ValidationStatus::Ok);
+
+        let (status, _) = AdminService::classify_status_code(401);
+        assert_eq!(status, ValidationStatus::Denied);
+
+        let (status, _) = AdminService::classify_status_code(400);
+        assert_eq!(status, ValidationStatus::Invalid);
+
+        let (status, _) = AdminService::classify_status_code(429);
+        assert_eq!(status, ValidationStatus::Transient);
+
+        let (status, _) = AdminService::classify_status_code(500);
+        assert_eq!(status, ValidationStatus::Transient);
+    }
+
+    #[test]
+    fn test_build_minimal_request() {
+        let json = AdminService::build_minimal_request("claude-opus-4.5");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        let conversation = &value["conversationState"];
+        assert_eq!(conversation["agentTaskType"], "vibe");
+        assert_eq!(conversation["chatTriggerType"], "MANUAL");
+        assert_eq!(
+            conversation["currentMessage"]["userInputMessage"]["content"],
+            "ping"
+        );
+        assert_eq!(
+            conversation["currentMessage"]["userInputMessage"]["modelId"],
+            "claude-opus-4.5"
+        );
+    }
+}

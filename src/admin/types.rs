@@ -276,3 +276,18 @@ impl AdminErrorResponse {
         Self::new("internal_error", message)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_credentials_request_defaults() {
+        let json = r#"{ "credentialIds": [1, 2, 3] }"#;
+        let req: ValidateCredentialsRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.model, "sonnet");
+        assert_eq!(req.timeout_ms, 30000);
+        assert_eq!(req.max_concurrency, 3);
+        assert_eq!(req.credential_ids, vec![1, 2, 3]);
+    }
+}

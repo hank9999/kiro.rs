@@ -1545,6 +1545,24 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
     }
 
+    #[tokio::test]
+    async fn test_acquire_context_for_missing_id() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+
+        let err = manager
+            .acquire_context_for(99)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("不存在"),
+            "错误应提示凭据不存在，实际: {}",
+            err
+        );
+    }
+
     // ============ 凭据级 Region 优先级测试 ============
 
     /// 辅助函数：获取 OIDC 刷新使用的 region（用于测试）
