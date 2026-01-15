@@ -381,15 +381,34 @@ impl AdminService {
         }
     }
 
-    /// 按 provider 映射 authMethod
+    /// 按 provider 或 authMethod 映射认证方式
+    ///
+    /// 优先使用 provider 字段（官方 token.json 格式），
+    /// 回退到 authMethod 字段（kiro-rs credentials.json 格式）
     fn map_provider_to_auth_method(item: &TokenJsonItem) -> Option<String> {
-        let provider = item.provider.as_ref()?.to_lowercase();
-        match provider.as_str() {
-            "builderid" | "builder-id" => Some("builder-id".to_string()),
-            "idc" => Some("idc".to_string()),
-            "social" => Some("social".to_string()),
-            _ => None,
+        // 优先使用 provider 字段（官方 token.json 格式）
+        if let Some(provider) = &item.provider {
+            let p = provider.to_lowercase();
+            return match p.as_str() {
+                "builderid" | "builder-id" => Some("builder-id".to_string()),
+                "idc" => Some("idc".to_string()),
+                "social" => Some("social".to_string()),
+                _ => None,
+            };
         }
+
+        // 回退到 authMethod 字段（kiro-rs credentials.json 格式）
+        if let Some(auth_method) = &item.auth_method {
+            let am = auth_method.to_lowercase();
+            return match am.as_str() {
+                "builder-id" | "builderid" => Some("builder-id".to_string()),
+                "idc" => Some("idc".to_string()),
+                "social" => Some("social".to_string()),
+                _ => None,
+            };
+        }
+
+        None
     }
 
     /// 生成 token 指纹（不暴露完整 token）

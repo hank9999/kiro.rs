@@ -108,7 +108,7 @@ mod tests {
     #[test]
     fn test_generate_with_refresh_token() {
         let mut credentials = KiroCredentials::default();
-        credentials.refresh_token = Some("test_refresh_token".to_string());     
+        credentials.refresh_token = Some("test_refresh_token".to_string());
         let config = Config::default();
 
         let result = generate_from_credentials(&credentials, &config);
@@ -134,7 +134,10 @@ mod tests {
         let normalized = result.unwrap();
         assert_eq!(normalized.len(), 64);
         // UUID 去掉连字符后重复一次
-        assert_eq!(normalized, "2582956ecc884669b54607adbffcb8942582956ecc884669b54607adbffcb894");
+        assert_eq!(
+            normalized,
+            "2582956ecc884669b54607adbffcb8942582956ecc884669b54607adbffcb894"
+        );
     }
 
     #[test]
