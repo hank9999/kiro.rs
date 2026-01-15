@@ -44,17 +44,6 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ github.token }}
 
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            ghcr.io/${{ github.repository_owner }}/kiro-rs
-          tags: |
-            type=raw,value=${{ github.event.inputs.version || github.ref_name }}-${{ matrix.arch }}
-            type=ref,event=tag
-            type=raw,value=latest
-
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -63,7 +52,35 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ghcr.io/${{ github.repository_owner }}/kiro-rs:${{ github.event.inputs.version || github.ref_name }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=Kiro.rs Docker Image
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Create and push multi-arch manifest
+        run: |
+          VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          IMAGE="ghcr.io/${{ github.repository_owner }}/kiro-rs"
+
+          # Create manifest for version tag
+          docker manifest create ${IMAGE}:${VERSION} \
+            ${IMAGE}:${VERSION}-amd64 \
+            ${IMAGE}:${VERSION}-arm64
+          docker manifest push ${IMAGE}:${VERSION}
+
+          # Create manifest for latest tag
+          docker manifest create ${IMAGE}:latest \
+            ${IMAGE}:${VERSION}-amd64 \
+            ${IMAGE}:${VERSION}-arm64
+          docker manifest push ${IMAGE}:latest
