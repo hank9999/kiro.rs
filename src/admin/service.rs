@@ -8,7 +8,8 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse,
+    CredentialsStatusResponse, ImportAction, ImportItemResult, ImportSummary,
+    ImportTokenJsonRequest, ImportTokenJsonResponse, TokenJsonItem,
 };
 
 /// Admin 服务
@@ -230,5 +231,180 @@ impl AdminService {
         } else {
             AdminServiceError::InternalError(msg)
         }
+    }
+
+    /// 批量导入 token.json
+    ///
+    /// # 流程
+    /// 1. 解析每个 token.json 项
+    /// 2. 按 provider 映射 authMethod
+    /// 3. 验证必填字段
+    /// 4. dry_run=true 时只返回预览，不实际添加
+    /// 5. dry_run=false 时逐个添加凭据
+    pub async fn import_token_json(
+        &self,
+        req: ImportTokenJsonRequest,
+    ) -> Result<ImportTokenJsonResponse, AdminServiceError> {
+        let items = req.items.into_vec();
+        let mut results = Vec::with_capacity(items.len());
+        let mut added = 0usize;
+        let mut skipped = 0usize;
+        let mut invalid = 0usize;
+
+        for (index, item) in items.into_iter().enumerate() {
+            let result = self.process_token_json_item(index, item, req.dry_run).await;
+            match result.action {
+                ImportAction::Added => added += 1,
+                ImportAction::Skipped => skipped += 1,
+                ImportAction::Invalid => invalid += 1,
+            }
+            results.push(result);
+        }
+
+        Ok(ImportTokenJsonResponse {
+            summary: ImportSummary {
+                parsed: results.len(),
+                added,
+                skipped,
+                invalid,
+            },
+            items: results,
+        })
+    }
+
+    /// 处理单个 token.json 项
+    async fn process_token_json_item(
+        &self,
+        index: usize,
+        item: TokenJsonItem,
+        dry_run: bool,
+    ) -> ImportItemResult {
+        // 生成 fingerprint（不暴露完整 token）
+        let fingerprint = Self::generate_fingerprint(&item);
+
+        // 验证 refresh_token 存在
+        let refresh_token = match &item.refresh_token {
+            Some(rt) if !rt.trim().is_empty() => rt.clone(),
+            _ => {
+                return ImportItemResult {
+                    index,
+                    fingerprint,
+                    action: ImportAction::Invalid,
+                    reason: Some("缺少 refreshToken".to_string()),
+                    credential_id: None,
+                };
+            }
+        };
+
+        // 按 provider 映射 authMethod
+        let auth_method = match Self::map_provider_to_auth_method(&item) {
+            Some(method) => method,
+            None => {
+                return ImportItemResult {
+                    index,
+                    fingerprint,
+                    action: ImportAction::Invalid,
+                    reason: Some("不支持的 provider".to_string()),
+                    credential_id: None,
+                };
+            }
+        };
+
+        // 验证 IdC/BuilderId 需要 clientId 和 clientSecret
+        if (auth_method == "idc" || auth_method == "builder-id")
+            && (item.client_id.is_none() || item.client_secret.is_none())
+        {
+            return ImportItemResult {
+                index,
+                fingerprint,
+                action: ImportAction::Invalid,
+                reason: Some(format!("{} 认证需要 clientId 和 clientSecret", auth_method)),
+                credential_id: None,
+            };
+        }
+
+        // dry_run 模式：只返回预览
+        if dry_run {
+            return ImportItemResult {
+                index,
+                fingerprint,
+                action: ImportAction::Added,
+                reason: None,
+                credential_id: None,
+            };
+        }
+
+        // 实际添加凭据
+        let new_cred = KiroCredentials {
+            id: None,
+            access_token: None,
+            refresh_token: Some(refresh_token),
+            profile_arn: None,
+            expires_at: None,
+            auth_method: Some(auth_method),
+            client_id: item.client_id,
+            client_secret: item.client_secret,
+            priority: item.priority,
+            region: None,
+            machine_id: None,
+        };
+
+        match self.token_manager.add_credential(new_cred).await {
+            Ok(credential_id) => ImportItemResult {
+                index,
+                fingerprint,
+                action: ImportAction::Added,
+                reason: None,
+                credential_id: Some(credential_id),
+            },
+            Err(e) => {
+                let msg = e.to_string();
+                // 判断是否为重复（可选：根据错误信息判断）
+                if msg.contains("已存在") {
+                    ImportItemResult {
+                        index,
+                        fingerprint,
+                        action: ImportAction::Skipped,
+                        reason: Some("凭据已存在".to_string()),
+                        credential_id: None,
+                    }
+                } else {
+                    ImportItemResult {
+                        index,
+                        fingerprint,
+                        action: ImportAction::Invalid,
+                        reason: Some(msg),
+                        credential_id: None,
+                    }
+                }
+            }
+        }
+    }
+
+    /// 按 provider 映射 authMethod
+    fn map_provider_to_auth_method(item: &TokenJsonItem) -> Option<String> {
+        let provider = item.provider.as_ref()?.to_lowercase();
+        match provider.as_str() {
+            "builderid" | "builder-id" => Some("builder-id".to_string()),
+            "idc" => Some("idc".to_string()),
+            "social" => Some("social".to_string()),
+            _ => None,
+        }
+    }
+
+    /// 生成 token 指纹（不暴露完整 token）
+    fn generate_fingerprint(item: &TokenJsonItem) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        if let Some(rt) = &item.refresh_token {
+            rt.hash(&mut hasher);
+        }
+        if let Some(provider) = &item.provider {
+            provider.hash(&mut hasher);
+        }
+        let hash = hasher.finish();
+        format!("fp_{:016x}", hash)
     }
 }
