@@ -1094,8 +1094,8 @@ mod tests {
             "content 不应为空"
         );
         assert_eq!(
-            result.assistant_response_message.content, "OK",
-            "仅 tool_use 时应使用 'OK' 占位符"
+            result.assistant_response_message.content, "There is a tool use.",
+            "仅 tool_use 时应使用 'There is a tool use.' 占位符"
         );
 
         // 验证 tool_uses 被正确保留
