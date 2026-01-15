@@ -589,6 +589,33 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
+    /// 获取指定凭据的 API 调用上下文（用于验证）
+    ///
+    /// 与 `acquire_context` 不同，此方法：
+    /// - 不切换 current_id
+    /// - 不影响其他请求的凭据选择
+    /// - 允许获取已禁用凭据的上下文（用于验证）
+    ///
+    /// # Arguments
+    /// * `id` - 凭据 ID
+    ///
+    /// # Returns
+    /// - `Ok(CallContext)` - 成功获取上下文
+    /// - `Err` - 凭据不存在或 Token 刷新失败
+    pub async fn acquire_context_for(&self, id: u64) -> anyhow::Result<CallContext> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?
+        };
+
+        // 尝试获取/刷新 Token（不影响 current_id）
+        self.try_ensure_token(id, &credentials).await
+    }
+
     /// 获取 API 调用上下文
     ///
     /// 返回绑定了 id、credentials 和 token 的调用上下文
@@ -934,10 +961,7 @@ impl MultiTokenManager {
         // 设为阈值，便于在管理面板中直观看到该凭据已不可用
         entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
 
-        tracing::error!(
-            "凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用",
-            id
-        );
+        tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
 
         // 切换到优先级最高的可用凭据
         if let Some(next) = entries

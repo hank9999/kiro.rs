@@ -67,3 +67,41 @@ export interface AddCredentialResponse {
   message: string
   credentialId: number
 }
+
+// ============ 凭据验证 ============
+
+// 验证请求
+export interface ValidateCredentialsRequest {
+  credentialIds: number[]
+  model?: 'sonnet' | 'opus' | 'haiku'
+  timeoutMs?: number
+  maxConcurrency?: number
+}
+
+// 验证响应
+export interface ValidateCredentialsResponse {
+  results: CredentialValidationResult[]
+  summary: ValidationSummary
+}
+
+// 单个凭据验证结果
+export interface CredentialValidationResult {
+  id: number
+  status: ValidationStatus
+  message?: string
+  latencyMs?: number
+}
+
+// 验证状态
+export type ValidationStatus = 'ok' | 'denied' | 'invalid' | 'transient' | 'not_found'
+
+// 验证汇总
+export interface ValidationSummary {
+  total: number
+  ok: number
+  denied: number
+  invalid: number
+  transient: number
+  notFound: number
+}
+

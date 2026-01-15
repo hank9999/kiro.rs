@@ -9,6 +9,7 @@ use super::{
     handlers::{
         add_credential, delete_credential, get_all_credentials, get_credential_balance,
         reset_failure_count, set_credential_disabled, set_credential_priority,
+        validate_credentials,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -23,6 +24,7 @@ use super::{
 /// - `POST /credentials/:id/priority` - 设置凭据优先级
 /// - `POST /credentials/:id/reset` - 重置失败计数
 /// - `GET /credentials/:id/balance` - 获取凭据余额
+/// - `POST /credentials/validate` - 批量验证凭据
 ///
 /// # 认证
 /// 需要 Admin API Key 认证，支持：
@@ -34,6 +36,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/credentials",
             get(get_all_credentials).post(add_credential),
         )
+        .route("/credentials/validate", post(validate_credentials))
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
