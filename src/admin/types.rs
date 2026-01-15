@@ -201,7 +201,7 @@ pub struct CredentialValidationResult {
 
 /// 验证状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ValidationStatus {
     /// 验证成功（2xx 响应）
     Ok,
