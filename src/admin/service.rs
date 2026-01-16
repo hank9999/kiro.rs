@@ -1,14 +1,23 @@
 //! Admin API 业务逻辑服务
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use futures::stream::{self, StreamExt};
 
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::requests::conversation::{
+    ConversationState, CurrentMessage, UserInputMessage,
+};
+use crate::kiro::model::requests::kiro::KiroRequest;
+use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse,
+    CredentialValidationResult, CredentialsStatusResponse, ValidateCredentialsRequest,
+    ValidateCredentialsResponse, ValidationStatus, ValidationSummary,
 };
 
 /// Admin 服务
@@ -16,11 +25,15 @@ use super::types::{
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
+    provider: Arc<KiroProvider>,
 }
 
 impl AdminService {
-    pub fn new(token_manager: Arc<MultiTokenManager>) -> Self {
-        Self { token_manager }
+    pub fn new(token_manager: Arc<MultiTokenManager>, provider: Arc<KiroProvider>) -> Self {
+        Self {
+            token_manager,
+            provider,
+        }
     }
 
     /// 获取所有凭据状态
@@ -230,5 +243,214 @@ impl AdminService {
         } else {
             AdminServiceError::InternalError(msg)
         }
+    }
+
+    /// 批量验证凭据
+    ///
+    /// 对指定的凭据列表发送最小化 API 请求，验证凭据是否可用。
+    /// 不影响凭据的失败计数和禁用状态。
+    pub async fn validate_credentials(
+        &self,
+        req: ValidateCredentialsRequest,
+    ) -> Result<ValidateCredentialsResponse, AdminServiceError> {
+        let model_id = Self::map_validate_model(&req.model);
+        let timeout = Duration::from_millis(req.timeout_ms);
+        let max_concurrency = req.max_concurrency.max(1).min(10);
+
+        // 构建最小化请求体
+        let request_body = Self::build_minimal_request(&model_id);
+
+        // 并发验证
+        let results: Vec<CredentialValidationResult> = stream::iter(req.credential_ids)
+            .map(|id| {
+                let request_body = request_body.clone();
+                let timeout = timeout;
+                async move {
+                    self.validate_single_credential(id, &request_body, timeout)
+                        .await
+                }
+            })
+            .buffer_unordered(max_concurrency)
+            .collect()
+            .await;
+
+        // 统计汇总
+        let mut ok = 0;
+        let mut denied = 0;
+        let mut invalid = 0;
+        let mut transient = 0;
+        let mut not_found = 0;
+
+        for result in &results {
+            match result.status {
+                ValidationStatus::Ok => ok += 1,
+                ValidationStatus::Denied => denied += 1,
+                ValidationStatus::Invalid => invalid += 1,
+                ValidationStatus::Transient => transient += 1,
+                ValidationStatus::NotFound => not_found += 1,
+            }
+        }
+
+        Ok(ValidateCredentialsResponse {
+            results,
+            summary: ValidationSummary {
+                total: ok + denied + invalid + transient + not_found,
+                ok,
+                denied,
+                invalid,
+                transient,
+                not_found,
+            },
+        })
+    }
+
+    async fn validate_single_credential(
+        &self,
+        id: u64,
+        request_body: &str,
+        timeout: Duration,
+    ) -> CredentialValidationResult {
+        let start = Instant::now();
+
+        let ctx = match self.token_manager.acquire_context_for(id).await {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                let msg = e.to_string();
+                let status = if msg.contains("不存在") {
+                    ValidationStatus::NotFound
+                } else {
+                    ValidationStatus::Invalid
+                };
+                return CredentialValidationResult {
+                    id,
+                    status,
+                    message: Some(msg),
+                    latency_ms: Some(start.elapsed().as_millis() as u64),
+                };
+            }
+        };
+
+        match self
+            .provider
+            .validate_credential(&ctx, request_body, timeout)
+            .await
+        {
+            Ok(status_code) => {
+                let (status, message) = Self::classify_status_code(status_code);
+                CredentialValidationResult {
+                    id,
+                    status,
+                    message,
+                    latency_ms: Some(start.elapsed().as_millis() as u64),
+                }
+            }
+            Err(e) => CredentialValidationResult {
+                id,
+                status: ValidationStatus::Transient,
+                message: Some(e.to_string()),
+                latency_ms: Some(start.elapsed().as_millis() as u64),
+            },
+        }
+    }
+
+    fn classify_status_code(status_code: u16) -> (ValidationStatus, Option<String>) {
+        match status_code {
+            200..=299 => (ValidationStatus::Ok, None),
+            400 => (ValidationStatus::Invalid, Some("请求格式错误".to_string())),
+            401 | 403 => (ValidationStatus::Denied, Some("凭据被拒绝".to_string())),
+            402 => (ValidationStatus::Denied, Some("额度已用尽".to_string())),
+            408 | 429 => (
+                ValidationStatus::Transient,
+                Some(format!("服务暂时不可用 ({})", status_code)),
+            ),
+            500..=599 => (
+                ValidationStatus::Transient,
+                Some(format!("服务器错误 ({})", status_code)),
+            ),
+            _ => (
+                ValidationStatus::Invalid,
+                Some(format!("未知状态码 ({})", status_code)),
+            ),
+        }
+    }
+
+    fn map_validate_model(model: &str) -> String {
+        match model.to_lowercase().as_str() {
+            "opus" => "claude-opus-4.5".to_string(),
+            "haiku" => "claude-haiku-4.5".to_string(),
+            _ => "claude-sonnet-4.5".to_string(),
+        }
+    }
+
+    fn build_minimal_request(model_id: &str) -> String {
+        let state = ConversationState::new(uuid::Uuid::new_v4().to_string())
+            .with_agent_task_type("vibe")
+            .with_chat_trigger_type("MANUAL")
+            .with_current_message(CurrentMessage::new(UserInputMessage::new("ping", model_id)));
+
+        let request = KiroRequest {
+            conversation_state: state,
+            profile_arn: None,
+        };
+
+        serde_json::to_string(&request).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_map_validate_model() {
+        assert_eq!(
+            AdminService::map_validate_model("sonnet"),
+            "claude-sonnet-4.5"
+        );
+        assert_eq!(AdminService::map_validate_model("opus"), "claude-opus-4.5");
+        assert_eq!(
+            AdminService::map_validate_model("haiku"),
+            "claude-haiku-4.5"
+        );
+        assert_eq!(
+            AdminService::map_validate_model("unknown"),
+            "claude-sonnet-4.5"
+        );
+    }
+
+    #[test]
+    fn test_classify_status_code() {
+        let (status, _) = AdminService::classify_status_code(200);
+        assert_eq!(status, ValidationStatus::Ok);
+
+        let (status, _) = AdminService::classify_status_code(401);
+        assert_eq!(status, ValidationStatus::Denied);
+
+        let (status, _) = AdminService::classify_status_code(400);
+        assert_eq!(status, ValidationStatus::Invalid);
+
+        let (status, _) = AdminService::classify_status_code(429);
+        assert_eq!(status, ValidationStatus::Transient);
+
+        let (status, _) = AdminService::classify_status_code(500);
+        assert_eq!(status, ValidationStatus::Transient);
+    }
+
+    #[test]
+    fn test_build_minimal_request() {
+        let json = AdminService::build_minimal_request("claude-opus-4.5");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        let conversation = &value["conversationState"];
+        assert_eq!(conversation["agentTaskType"], "vibe");
+        assert_eq!(conversation["chatTriggerType"], "MANUAL");
+        assert_eq!(
+            conversation["currentMessage"]["userInputMessage"]["content"],
+            "ping"
+        );
+        assert_eq!(
+            conversation["currentMessage"]["userInputMessage"]["modelId"],
+            "claude-opus-4.5"
+        );
     }
 }

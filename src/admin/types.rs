@@ -142,6 +142,97 @@ impl SuccessResponse {
     }
 }
 
+// ============ 凭据验证 ============
+
+/// 凭据验证请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateCredentialsRequest {
+    /// 要验证的凭据 ID 列表
+    pub credential_ids: Vec<u64>,
+    /// 验证使用的模型（sonnet/opus/haiku）
+    #[serde(default = "default_validate_model")]
+    pub model: String,
+    /// 超时时间（毫秒），默认 30000
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// 最大并发数，默认 3
+    #[serde(default = "default_max_concurrency")]
+    pub max_concurrency: usize,
+}
+
+fn default_validate_model() -> String {
+    "sonnet".to_string()
+}
+
+fn default_timeout_ms() -> u64 {
+    30000
+}
+
+fn default_max_concurrency() -> usize {
+    3
+}
+
+/// 凭据验证响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateCredentialsResponse {
+    /// 验证结果列表
+    pub results: Vec<CredentialValidationResult>,
+    /// 汇总信息
+    pub summary: ValidationSummary,
+}
+
+/// 单个凭据的验证结果
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialValidationResult {
+    /// 凭据 ID
+    pub id: u64,
+    /// 验证状态
+    pub status: ValidationStatus,
+    /// 详细信息（错误时提供）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// 响应耗时（毫秒）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+}
+
+/// 验证状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationStatus {
+    /// 验证成功（2xx 响应）
+    Ok,
+    /// 凭据被拒绝（401/403）
+    Denied,
+    /// 凭据无效（400 或 token 刷新失败）
+    Invalid,
+    /// 瞬态错误（408/429/5xx/网络错误）
+    Transient,
+    /// 凭据不存在
+    NotFound,
+}
+
+/// 验证汇总
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidationSummary {
+    /// 总数
+    pub total: usize,
+    /// 成功数
+    pub ok: usize,
+    /// 被拒绝数
+    pub denied: usize,
+    /// 无效数
+    pub invalid: usize,
+    /// 瞬态错误数
+    pub transient: usize,
+    /// 未找到数
+    pub not_found: usize,
+}
+
 /// 错误响应
 #[derive(Debug, Serialize)]
 pub struct AdminErrorResponse {
@@ -183,5 +274,20 @@ impl AdminErrorResponse {
 
     pub fn internal_error(message: impl Into<String>) -> Self {
         Self::new("internal_error", message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_credentials_request_defaults() {
+        let json = r#"{ "credentialIds": [1, 2, 3] }"#;
+        let req: ValidateCredentialsRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.model, "sonnet");
+        assert_eq!(req.timeout_ms, 30000);
+        assert_eq!(req.max_concurrency, 3);
+        assert_eq!(req.credential_ids, vec![1, 2, 3]);
     }
 }

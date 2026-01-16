@@ -7,8 +7,9 @@ import {
   getCredentialBalance,
   addCredential,
   deleteCredential,
+  validateCredentials,
 } from '@/api/credentials'
-import type { AddCredentialRequest } from '@/types/api'
+import type { AddCredentialRequest, ValidateCredentialsRequest } from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -85,3 +86,11 @@ export function useDeleteCredential() {
     },
   })
 }
+
+// 批量验证凭据
+export function useValidateCredentials() {
+  return useMutation({
+    mutationFn: (req: ValidateCredentialsRequest) => validateCredentials(req),
+  })
+}
+
