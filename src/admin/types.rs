@@ -12,8 +12,6 @@ pub struct CredentialsStatusResponse {
     pub total: usize,
     /// 可用凭据数量（未禁用）
     pub available: usize,
-    /// 当前活跃凭据 ID
-    pub current_id: u64,
     /// 各凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
 }
@@ -30,14 +28,18 @@ pub struct CredentialStatusItem {
     pub disabled: bool,
     /// 连续失败次数
     pub failure_count: u32,
-    /// 是否为当前活跃凭据
-    pub is_current: bool,
     /// Token 过期时间（RFC3339 格式）
     pub expires_at: Option<String>,
     /// 认证方式
     pub auth_method: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
+    /// 成功调用次数
+    pub success_count: u64,
+    /// 总请求数
+    pub total_requests: u64,
+    /// 最后使用时间 (RFC3339)
+    pub last_used_at: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -100,6 +102,57 @@ pub struct AddCredentialResponse {
     pub message: String,
     /// 新添加的凭据 ID
     pub credential_id: u64,
+}
+
+/// 批量添加凭据请求
+///
+/// 支持多个 refresh token，每行一个
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchAddCredentialsRequest {
+    /// 多个 refresh token，每行一个（用换行符分隔）
+    pub tokens: String,
+
+    /// 认证方式（可选，默认 social，应用于所有凭据）
+    #[serde(default = "default_auth_method")]
+    pub auth_method: String,
+
+    /// OIDC Client ID（IdC 认证需要，应用于所有凭据）
+    pub client_id: Option<String>,
+
+    /// OIDC Client Secret（IdC 认证需要，应用于所有凭据）
+    pub client_secret: Option<String>,
+
+    /// 凭据级 Region 配置（应用于所有凭据）
+    pub region: Option<String>,
+}
+
+/// 批量添加单个凭据的结果
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchAddResultItem {
+    /// 行号（从 1 开始）
+    pub line: usize,
+    /// 是否成功
+    pub success: bool,
+    /// 成功时为凭据 ID，失败时为 None
+    pub credential_id: Option<u64>,
+    /// 错误消息（失败时）
+    pub error: Option<String>,
+}
+
+/// 批量添加凭据响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchAddCredentialsResponse {
+    /// 总数（提交的 token 数量）
+    pub total: usize,
+    /// 成功数量
+    pub success_count: usize,
+    /// 失败数量
+    pub failed_count: usize,
+    /// 各凭据添加结果
+    pub results: Vec<BatchAddResultItem>,
 }
 
 // ============ 余额查询 ============

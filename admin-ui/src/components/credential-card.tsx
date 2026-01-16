@@ -107,16 +107,31 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
     return `${Math.floor(hours / 24)} 天`
   }
 
+  const formatLastUsed = (lastUsedAt: string | null) => {
+    if (!lastUsedAt) return '从未使用'
+    const date = new Date(lastUsedAt)
+    const now = new Date()
+    const diff = now.getTime() - date.getTime()
+    if (diff < 60000) return '刚刚'
+    const minutes = Math.floor(diff / 60000)
+    if (minutes < 60) return `${minutes} 分钟前`
+    const hours = Math.floor(minutes / 60)
+    if (hours < 24) return `${hours} 小时前`
+    const days = Math.floor(hours / 24)
+    return `${days} 天前`
+  }
+
+  const successRate = credential.totalRequests > 0
+    ? ((credential.successCount / credential.totalRequests) * 100).toFixed(1)
+    : '0.0'
+
   return (
     <>
-      <Card className={credential.isCurrent ? 'ring-2 ring-primary' : ''}>
+      <Card>
         <CardHeader className="pb-2">
           <div className="flex items-center justify-between">
             <CardTitle className="text-lg flex items-center gap-2">
               凭据 #{credential.id}
-              {credential.isCurrent && (
-                <Badge variant="success">当前</Badge>
-              )}
               {credential.disabled && (
                 <Badge variant="destructive">已禁用</Badge>
               )}
@@ -189,6 +204,24 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
             <div>
               <span className="text-muted-foreground">Token 有效期：</span>
               <span className="font-medium">{formatExpiry(credential.expiresAt)}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">成功次数：</span>
+              <span className="text-green-600 font-medium">{credential.successCount}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">总请求数：</span>
+              <span className="font-medium">{credential.totalRequests}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">成功率：</span>
+              <span className={Number(successRate) >= 90 ? 'text-green-600 font-medium' : Number(successRate) >= 50 ? 'text-yellow-600 font-medium' : 'text-red-500 font-medium'}>
+                {successRate}%
+              </span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">最后使用：</span>
+              <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
             </div>
             {credential.hasProfileArn && (
               <div className="col-span-2">

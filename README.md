@@ -49,7 +49,7 @@ cargo build --release
 ```json
 {
    "host": "127.0.0.1",   // 必配, 监听地址
-   "port": 8990,  // 必配, 监听端口
+   "port": 17152,  // 必配, 监听端口
    "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",  // 必配, 请求的鉴权 token
    "region": "us-east-1",  // 必配, 区域, 一般保持默认即可
    "kiroVersion": "0.8.0",  // 可选, 用于自定义请求特征, 不需要请删除: kiro ide 版本
@@ -69,7 +69,7 @@ cargo build --release
 ```json
 {
    "host": "127.0.0.1",
-   "port": 8990,
+   "port": 17152,
    "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
    "region": "us-east-1"
 }
@@ -155,7 +155,7 @@ cargo build --release
 ### 5. 使用 API
 
 ```bash
-curl http://127.0.0.1:8990/v1/messages \
+curl http://127.0.0.1:17152/v1/messages \
   -H "Content-Type: application/json" \
   -H "x-api-key: sk-your-custom-api-key" \
   -d '{

@@ -7,7 +7,8 @@ use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, BatchAddCredentialsRequest,
+    BatchAddCredentialsResponse, BatchAddResultItem, CredentialStatusItem,
     CredentialsStatusResponse,
 };
 
@@ -35,10 +36,12 @@ impl AdminService {
                 priority: entry.priority,
                 disabled: entry.disabled,
                 failure_count: entry.failure_count,
-                is_current: entry.id == snapshot.current_id,
                 expires_at: entry.expires_at,
                 auth_method: entry.auth_method,
                 has_profile_arn: entry.has_profile_arn,
+                success_count: entry.success_count,
+                total_requests: entry.total_requests,
+                last_used_at: entry.last_used_at,
             })
             .collect();
 
@@ -48,26 +51,15 @@ impl AdminService {
         CredentialsStatusResponse {
             total: snapshot.total,
             available: snapshot.available,
-            current_id: snapshot.current_id,
             credentials,
         }
     }
 
     /// 设置凭据禁用状态
     pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminServiceError> {
-        // 先获取当前凭据 ID，用于判断是否需要切换
-        let snapshot = self.token_manager.snapshot();
-        let current_id = snapshot.current_id;
-
         self.token_manager
             .set_disabled(id, disabled)
-            .map_err(|e| self.classify_error(e, id))?;
-
-        // 只有禁用的是当前凭据时才尝试切换到下一个
-        if disabled && id == current_id {
-            let _ = self.token_manager.switch_to_next();
-        }
-        Ok(())
+            .map_err(|e| self.classify_error(e, id))
     }
 
     /// 设置凭据优先级
@@ -144,6 +136,74 @@ impl AdminService {
             message: format!("凭据添加成功，ID: {}", credential_id),
             credential_id,
         })
+    }
+
+    /// 批量添加凭据
+    ///
+    /// 解析多行 refresh token，逐个添加，返回每个的结果
+    pub async fn batch_add_credentials(
+        &self,
+        req: BatchAddCredentialsRequest,
+    ) -> BatchAddCredentialsResponse {
+        // 解析 tokens：按换行符分割，去除空行和首尾空白
+        let tokens: Vec<(usize, String)> = req
+            .tokens
+            .lines()
+            .enumerate()
+            .map(|(i, line)| (i + 1, line.trim().to_string()))
+            .filter(|(_, token)| !token.is_empty())
+            .collect();
+
+        let total = tokens.len();
+        let mut results = Vec::with_capacity(total);
+        let mut success_count = 0;
+
+        for (line, token) in tokens {
+            // 构建凭据对象
+            let new_cred = KiroCredentials {
+                id: None,
+                access_token: None,
+                refresh_token: Some(token),
+                profile_arn: None,
+                expires_at: None,
+                auth_method: Some(req.auth_method.clone()),
+                client_id: req.client_id.clone(),
+                client_secret: req.client_secret.clone(),
+                priority: 0, // 批量添加默认优先级为 0
+                region: req.region.clone(),
+                machine_id: None,
+            };
+
+            // 尝试添加凭据
+            match self.token_manager.add_credential(new_cred).await {
+                Ok(credential_id) => {
+                    success_count += 1;
+                    results.push(BatchAddResultItem {
+                        line,
+                        success: true,
+                        credential_id: Some(credential_id),
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    results.push(BatchAddResultItem {
+                        line,
+                        success: false,
+                        credential_id: None,
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+
+        let failed_count = total - success_count;
+
+        BatchAddCredentialsResponse {
+            total,
+            success_count,
+            failed_count,
+            results,
+        }
     }
 
     /// 删除凭据
