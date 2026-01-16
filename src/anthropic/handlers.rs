@@ -224,6 +224,7 @@ async fn handle_stream_request(
 
     let stats = provider.stats_store();
     let model = model.to_string();
+    let request_body = request_body.to_string();
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model.clone(), input_tokens, thinking_enabled);
@@ -231,8 +232,17 @@ async fn handle_stream_request(
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
-    // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events, stats, credential_id, model);
+    // 创建 SSE 流（支持流中断自动重试）
+    let stream = create_sse_stream(
+        response,
+        ctx,
+        initial_events,
+        stats,
+        credential_id,
+        model,
+        provider,
+        request_body,
+    );
 
     // 返回 SSE 响应
     match Response::builder()
@@ -260,12 +270,35 @@ async fn handle_stream_request(
 /// Ping 事件间隔（25秒）
 const PING_INTERVAL_SECS: u64 = 25;
 
+/// 流中断重试的最小输出 tokens 阈值
+/// 只有在流读取**出错**且输出少于此值时才尝试重试
+/// 正常EOF结束不触发重试（即使输出很短）
+const STREAM_RETRY_MIN_OUTPUT_TOKENS: i32 = 100;
+
+/// 流中断最大重试次数
+const STREAM_MAX_RETRIES: usize = 2;
+
 /// 创建 ping 事件的 SSE 字符串
 fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
 }
 
-/// 创建 SSE 事件流
+/// 流处理状态
+struct StreamState {
+    body_stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>,
+    ctx: StreamContext,
+    decoder: EventStreamDecoder,
+    finished: bool,
+    ping_interval: tokio::time::Interval,
+    stats: Option<Arc<StatsStore>>,
+    credential_id: u64,
+    model: String,
+    provider: Arc<crate::kiro::provider::KiroProvider>,
+    request_body: String,
+    retry_count: usize,
+}
+
+/// 创建 SSE 事件流（支持流中断自动重试）
 fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
@@ -273,6 +306,8 @@ fn create_sse_stream(
     stats: Option<Arc<StatsStore>>,
     credential_id: u64,
     model: String,
+    provider: Arc<crate::kiro::provider::KiroProvider>,
+    request_body: String,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -284,163 +319,228 @@ fn create_sse_stream(
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
     let body_stream = response.bytes_stream();
 
-    let processing_stream = stream::unfold(
-        (
-            body_stream,
-            ctx,
-            EventStreamDecoder::new(),
-            false,
-            interval(Duration::from_secs(PING_INTERVAL_SECS)),
-            stats,
-            credential_id,
-            model,
-        ),
-        |(
-            mut body_stream,
-            mut ctx,
-            mut decoder,
-            finished,
-            mut ping_interval,
-            stats,
-            credential_id,
-            model,
-        )| async move {
-            if finished {
-                return None;
-            }
+    let state = StreamState {
+        body_stream: Box::pin(body_stream),
+        ctx,
+        decoder: EventStreamDecoder::new(),
+        finished: false,
+        ping_interval: interval(Duration::from_secs(PING_INTERVAL_SECS)),
+        stats,
+        credential_id,
+        model,
+        provider,
+        request_body,
+        retry_count: 0,
+    };
 
-            // 使用 select! 同时等待数据和 ping 定时器
-            tokio::select! {
-                // 处理数据流
-                chunk_result = body_stream.next() => {
-                    match chunk_result {
-                        Some(Ok(chunk)) => {
-                            // 解码事件
-                            if let Err(e) = decoder.feed(&chunk) {
-                                tracing::warn!("缓冲区溢出: {}", e);
-                            }
+    let processing_stream = stream::unfold(state, |mut state| async move {
+        if state.finished {
+            return None;
+        }
 
-                            let mut events = Vec::new();
-                            for result in decoder.decode_iter() {
-                                match result {
-                                    Ok(frame) => {
-                                        let message_type = frame
-                                            .message_type()
-                                            .unwrap_or("unknown")
-                                            .to_string();
-                                        let event_type = frame
-                                            .event_type()
-                                            .unwrap_or("unknown")
-                                            .to_string();
-                                        let payload_len = frame.payload.len();
+        // 使用 select! 同时等待数据和 ping 定时器
+        tokio::select! {
+            // 处理数据流
+            chunk_result = state.body_stream.next() => {
+                match chunk_result {
+                    Some(Ok(chunk)) => {
+                        // 解码事件
+                        if let Err(e) = state.decoder.feed(&chunk) {
+                            tracing::warn!("缓冲区溢出: {}", e);
+                        }
 
-                                        match Event::from_frame(frame) {
-                                            Ok(event) => {
-                                                let sse_events = ctx.process_kiro_event(&event);
-                                                events.extend(sse_events);
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    message_id = %ctx.message_id,
-                                                    message_type = %message_type,
-                                                    event_type = %event_type,
-                                                    payload_len = payload_len,
-                                                    "解析上游事件失败: {}",
-                                                    e
-                                                );
-                                            }
+                        let mut events = Vec::new();
+                        for result in state.decoder.decode_iter() {
+                            match result {
+                                Ok(frame) => {
+                                    let message_type = frame
+                                        .message_type()
+                                        .unwrap_or("unknown")
+                                        .to_string();
+                                    let event_type = frame
+                                        .event_type()
+                                        .unwrap_or("unknown")
+                                        .to_string();
+                                    let payload_len = frame.payload.len();
+
+                                    match Event::from_frame(frame) {
+                                        Ok(event) => {
+                                            let sse_events = state.ctx.process_kiro_event(&event);
+                                            events.extend(sse_events);
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                message_id = %state.ctx.message_id,
+                                                message_type = %message_type,
+                                                event_type = %event_type,
+                                                payload_len = payload_len,
+                                                "解析上游事件失败: {}",
+                                                e
+                                            );
                                         }
                                     }
-                                    Err(e) => {
-                                        tracing::warn!("解码事件失败: {}", e);
-                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("解码事件失败: {}", e);
                                 }
                             }
-
-                            // 转换为 SSE 字节流
-                            let bytes: Vec<Result<Bytes, Infallible>> = events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, stats, credential_id, model)))
                         }
-                        Some(Err(e)) => {
-                            tracing::error!(
-                                message_id = %ctx.message_id,
-                                decoded_frames = decoder.frames_decoded(),
-                                decoder_buffer_len = decoder.buffer_len(),
-                                decoder_error_count = decoder.error_count(),
-                                decoder_bytes_skipped = decoder.bytes_skipped(),
-                                "读取上游响应流失败: {}",
+
+                        // 转换为 SSE 字节流
+                        let bytes: Vec<Result<Bytes, Infallible>> = events
+                            .into_iter()
+                            .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                            .collect();
+
+                        Some((stream::iter(bytes), state))
+                    }
+                    Some(Err(e)) => {
+                        // 流读取错误，检查是否可以重试
+                        let can_retry = state.retry_count < STREAM_MAX_RETRIES
+                            && state.ctx.output_tokens < STREAM_RETRY_MIN_OUTPUT_TOKENS;
+
+                        if can_retry {
+                            tracing::warn!(
+                                message_id = %state.ctx.message_id,
+                                output_tokens = state.ctx.output_tokens,
+                                retry_count = state.retry_count,
+                                decoded_frames = state.decoder.frames_decoded(),
+                                "读取上游响应流失败，尝试重试: {}",
                                 e
                             );
-                            // 发送最终事件并结束
-                            if let Some(s) = &stats {
-                                s.record_error(credential_id, Some(&model), format!("读取上游响应流失败: {}", e));
+
+                            // 尝试重新建立连接
+                            match state.provider
+                                .call_api_stream_with_credential_id(&state.request_body, Some(&state.model))
+                                .await
+                            {
+                                Ok((new_credential_id, new_response)) => {
+                                    tracing::info!(
+                                        message_id = %state.ctx.message_id,
+                                        retry_count = state.retry_count + 1,
+                                        new_credential_id = new_credential_id,
+                                        "流重试成功，已重新建立连接"
+                                    );
+
+                                    // 更新状态
+                                    state.body_stream = Box::pin(new_response.bytes_stream());
+                                    state.decoder = EventStreamDecoder::new();
+                                    state.credential_id = new_credential_id;
+                                    state.retry_count += 1;
+
+                                    // 发送 ping 保持连接活跃
+                                    let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
+                                    return Some((stream::iter(bytes), state));
+                                }
+                                Err(retry_err) => {
+                                    tracing::error!(
+                                        message_id = %state.ctx.message_id,
+                                        retry_count = state.retry_count,
+                                        "流重试失败: {}",
+                                        retry_err
+                                    );
+                                    // 重试失败，继续走正常的错误处理流程
+                                }
                             }
-
-                            let final_events = ctx.generate_final_events();
-
-                            // 记录用量（即使流中断，也尽量把已输出部分计入）
-                            if let Some(s) = &stats {
-                                let final_input_tokens = ctx.context_input_tokens.unwrap_or(ctx.input_tokens);
-                                s.add_usage(
-                                    credential_id,
-                                    Some(&model),
-                                    final_input_tokens as i64,
-                                    ctx.output_tokens as i64,
-                                );
-                            }
-
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, stats, credential_id, model)))
                         }
-                        None => {
-                            // 流结束，发送最终事件
-                            tracing::info!(
-                                message_id = %ctx.message_id,
-                                decoded_frames = decoder.frames_decoded(),
-                                decoder_buffer_len = decoder.buffer_len(),
-                                decoder_error_count = decoder.error_count(),
-                                decoder_bytes_skipped = decoder.bytes_skipped(),
-                                "上游响应流结束（EOF）"
+
+                        // 无法重试或重试失败，记录错误并结束
+                        tracing::error!(
+                            message_id = %state.ctx.message_id,
+                            output_tokens = state.ctx.output_tokens,
+                            decoded_frames = state.decoder.frames_decoded(),
+                            decoder_buffer_len = state.decoder.buffer_len(),
+                            decoder_error_count = state.decoder.error_count(),
+                            decoder_bytes_skipped = state.decoder.bytes_skipped(),
+                            retry_count = state.retry_count,
+                            "读取上游响应流失败（已放弃重试）: {}",
+                            e
+                        );
+
+                        if let Some(s) = &state.stats {
+                            s.record_error(state.credential_id, Some(&state.model), format!("读取上游响应流失败: {}", e));
+                        }
+
+                        let final_events = state.ctx.generate_final_events();
+
+                        // 记录用量（即使流中断，也尽量把已输出部分计入）
+                        if let Some(s) = &state.stats {
+                            let final_input_tokens = state.ctx.context_input_tokens.unwrap_or(state.ctx.input_tokens);
+                            s.add_usage(
+                                state.credential_id,
+                                Some(&state.model),
+                                final_input_tokens as i64,
+                                state.ctx.output_tokens as i64,
                             );
-
-                            let final_events = ctx.generate_final_events();
-
-                            // 正常结束：记录成功 + 用量
-                            if let Some(s) = &stats {
-                                s.record_success(credential_id, Some(&model));
-                                let final_input_tokens = ctx.context_input_tokens.unwrap_or(ctx.input_tokens);
-                                s.add_usage(
-                                    credential_id,
-                                    Some(&model),
-                                    final_input_tokens as i64,
-                                    ctx.output_tokens as i64,
-                                );
-                            }
-
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, stats, credential_id, model)))
                         }
+
+                        state.finished = true;
+                        let bytes: Vec<Result<Bytes, Infallible>> = final_events
+                            .into_iter()
+                            .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                            .collect();
+                        Some((stream::iter(bytes), state))
+                    }
+                    None => {
+                        // 流正常结束（EOF）
+                        // 注意：正常EOF不触发重试，即使输出很短
+                        // 只有流读取出错（Some(Err)）时才考虑重试
+                        let is_abnormally_short = state.ctx.output_tokens < STREAM_RETRY_MIN_OUTPUT_TOKENS;
+
+                        if is_abnormally_short {
+                            tracing::warn!(
+                                message_id = %state.ctx.message_id,
+                                output_tokens = state.ctx.output_tokens,
+                                input_tokens = state.ctx.input_tokens,
+                                decoded_frames = state.decoder.frames_decoded(),
+                                retry_count = state.retry_count,
+                                "检测到异常短响应，上游API可能提前终止。建议检查：1)上游服务状态 2)Token额度 3)请求频率限制"
+                            );
+                        }
+
+                        tracing::info!(
+                            message_id = %state.ctx.message_id,
+                            output_tokens = state.ctx.output_tokens,
+                            decoded_frames = state.decoder.frames_decoded(),
+                            decoder_buffer_len = state.decoder.buffer_len(),
+                            decoder_error_count = state.decoder.error_count(),
+                            decoder_bytes_skipped = state.decoder.bytes_skipped(),
+                            retry_count = state.retry_count,
+                            abnormally_short = is_abnormally_short,
+                            "上游响应流结束（EOF）"
+                        );
+
+                        let final_events = state.ctx.generate_final_events();
+
+                        // 正常结束：记录成功 + 用量
+                        if let Some(s) = &state.stats {
+                            s.record_success(state.credential_id, Some(&state.model));
+                            let final_input_tokens = state.ctx.context_input_tokens.unwrap_or(state.ctx.input_tokens);
+                            s.add_usage(
+                                state.credential_id,
+                                Some(&state.model),
+                                final_input_tokens as i64,
+                                state.ctx.output_tokens as i64,
+                            );
+                        }
+
+                        state.finished = true;
+                        let bytes: Vec<Result<Bytes, Infallible>> = final_events
+                            .into_iter()
+                            .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                            .collect();
+                        Some((stream::iter(bytes), state))
                     }
                 }
-                // 发送 ping 保活
-                _ = ping_interval.tick() => {
-                    tracing::trace!("发送 ping 保活事件");
-                    let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, stats, credential_id, model)))
-                }
             }
-        },
-    )
+            // 发送 ping 保活
+            _ = state.ping_interval.tick() => {
+                tracing::trace!("发送 ping 保活事件");
+                let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
+                Some((stream::iter(bytes), state))
+            }
+        }
+    })
     .flatten();
 
     initial_stream.chain(processing_stream)
