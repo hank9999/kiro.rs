@@ -419,6 +419,10 @@ pub struct CredentialEntrySnapshot {
     pub has_profile_arn: bool,
     /// Token 过期时间
     pub expires_at: Option<String>,
+    /// 账户邮箱（尽力从 token 中解析，仅用于展示）
+    pub account_email: Option<String>,
+    /// 用户 ID（从 API 获取，持久化保存）
+    pub user_id: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -1017,6 +1021,8 @@ impl MultiTokenManager {
                     auth_method: e.credentials.auth_method.clone(),
                     has_profile_arn: e.credentials.profile_arn.is_some(),
                     expires_at: e.credentials.expires_at.clone(),
+                    account_email: e.credentials.account_email.clone(),
+                    user_id: e.credentials.user_id.clone(),
                 })
                 .collect(),
             current_id,
@@ -1146,6 +1152,107 @@ impl MultiTokenManager {
         };
 
         get_usage_limits(&credentials, &self.config, &token, self.proxy.as_ref()).await
+    }
+
+    /// 获取指定凭据的账号信息（Admin API）
+    ///
+    /// 调用 Kiro Web Portal API 获取账号聚合信息（用量、邮箱、订阅等）
+    pub async fn get_account_info_for(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<crate::kiro::web_portal::AccountAggregateInfo> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        // 检查是否需要刷新 token
+        let needs_refresh = is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
+
+        let (token, updated_creds) = if needs_refresh {
+            let _guard = self.refresh_lock.lock().await;
+            let current_creds = {
+                let entries = self.entries.lock();
+                entries
+                    .iter()
+                    .find(|e| e.id == id)
+                    .map(|e| e.credentials.clone())
+                    .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+            };
+
+            if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
+                let new_creds =
+                    refresh_token(&current_creds, &self.config, self.proxy.as_ref()).await?;
+                {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                        entry.credentials = new_creds.clone();
+                    }
+                }
+                if let Err(e) = self.persist_credentials() {
+                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
+                }
+                let token = new_creds
+                    .access_token
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?;
+                (token, new_creds)
+            } else {
+                let token = current_creds
+                    .access_token
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?;
+                (token, current_creds)
+            }
+        } else {
+            let token = credentials
+                .access_token
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?;
+            (token, credentials)
+        };
+
+        // 获取 IDP（身份提供商）
+        let idp = updated_creds
+            .provider
+            .as_deref()
+            .unwrap_or("Google");
+
+        // 调用 Web Portal API
+        let info = crate::kiro::web_portal::get_account_aggregate_info(
+            &token,
+            idp,
+            self.proxy.as_ref(),
+        )
+        .await?;
+
+        // 更新凭据中的 email 和 user_id（如果 API 返回了这些信息）
+        if info.email.is_some() || info.user_id.is_some() {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                if info.email.is_some() {
+                    entry.credentials.account_email = info.email.clone();
+                }
+                if info.user_id.is_some() {
+                    entry.credentials.user_id = info.user_id.clone();
+                }
+            }
+            drop(entries);
+            if let Err(e) = self.persist_credentials() {
+                tracing::warn!("更新账号信息后持久化失败: {}", e);
+            }
+        }
+
+        Ok(info)
+    }
+
+    /// 删除凭据（别名，用于兼容 Admin Service）
+    pub fn remove_credential(&self, id: u64) -> anyhow::Result<()> {
+        self.delete_credential(id)
     }
 
     /// 添加新凭据（Admin API）

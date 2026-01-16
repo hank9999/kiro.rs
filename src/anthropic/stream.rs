@@ -465,6 +465,10 @@ pub struct StreamContext {
     pub output_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
+    /// 工具名称缓存 (tool_use_id -> tool_name)，用于处理分片事件缺失 name 的情况
+    pub tool_names: HashMap<String, String>,
+    /// 工具是否收到过 input (tool_use_id -> has_input)
+    pub tool_has_input: HashMap<String, bool>,
     /// thinking 是否启用
     pub thinking_enabled: bool,
     /// thinking 内容缓冲区
@@ -494,6 +498,8 @@ impl StreamContext {
             context_input_tokens: None,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
+            tool_names: HashMap::new(),
+            tool_has_input: HashMap::new(),
             thinking_enabled,
             thinking_buffer: String::new(),
             in_thinking_block: false,
@@ -889,6 +895,25 @@ impl StreamContext {
             idx
         };
 
+        // 更新/获取工具名称缓存：Kiro 的 toolUseEvent 可能在后续分片缺失 name
+        if !tool_use.name.is_empty() {
+            self.tool_names
+                .insert(tool_use.tool_use_id.clone(), tool_use.name.clone());
+        }
+
+        let tool_name = if !tool_use.name.is_empty() {
+            tool_use.name.clone()
+        } else if let Some(name) = self.tool_names.get(&tool_use.tool_use_id) {
+            name.clone()
+        } else {
+            tracing::warn!(
+                message_id = %self.message_id,
+                tool_use_id = %tool_use.tool_use_id,
+                "toolUseEvent 缺少 name，且未找到缓存"
+            );
+            String::new()
+        };
+
         // 发送 content_block_start
         let start_events = self.state_manager.handle_content_block_start(
             block_index,
@@ -899,7 +924,7 @@ impl StreamContext {
                 "content_block": {
                     "type": "tool_use",
                     "id": tool_use.tool_use_id,
-                    "name": tool_use.name,
+                    "name": tool_name,
                     "input": {}
                 }
             }),
@@ -908,6 +933,7 @@ impl StreamContext {
 
         // 发送参数增量 (ToolUseEvent.input 是 String 类型)
         if !tool_use.input.is_empty() {
+            self.tool_has_input.insert(tool_use.tool_use_id.clone(), true);
             self.output_tokens += (tool_use.input.len() as i32 + 3) / 4; // 估算 token
 
             if let Some(delta_event) = self.state_manager.handle_content_block_delta(
@@ -927,6 +953,17 @@ impl StreamContext {
 
         // 如果是完整的工具调用（stop=true），发送 content_block_stop
         if tool_use.stop {
+            // 检查是否收到过任何 input
+            let has_input = self.tool_has_input.get(&tool_use.tool_use_id).copied().unwrap_or(false);
+            if !has_input {
+                tracing::error!(
+                    message_id = %self.message_id,
+                    tool_use_id = %tool_use.tool_use_id,
+                    tool_name = %tool_name,
+                    "工具调用完成但未收到任何 input，客户端将收到空 input"
+                );
+            }
+
             if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
                 events.push(stop_event);
             }
@@ -1094,9 +1131,10 @@ mod tests {
                     && e.data["content_block"]["type"] == "text")
         );
 
-        let initial_text_index = ctx
-            .text_block_index
-            .expect("initial text block index should exist");
+        let initial_text_index = match ctx.text_block_index {
+            Some(v) => v,
+            None => panic!("initial text block index should exist"),
+        };
 
         // tool_use 开始会自动关闭现有 text block
         let tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
@@ -1122,12 +1160,13 @@ mod tests {
                 None
             }
         });
-        assert!(
-            new_text_start_index.is_some(),
-            "should start a new text block"
-        );
+        assert!(new_text_start_index.is_some(), "should start a new text block");
+        let new_text_start_index = match new_text_start_index {
+            Some(v) => v,
+            None => panic!("should start a new text block"),
+        };
         assert_ne!(
-            new_text_start_index.unwrap(),
+            new_text_start_index,
             initial_text_index as i64,
             "new text block index should differ from the stopped one"
         );
@@ -1201,9 +1240,18 @@ mod tests {
         );
         assert!(pos_tool_start.is_some(), "should start tool_use block");
 
-        let pos_text_delta = pos_text_delta.unwrap();
-        let pos_text_stop = pos_text_stop.unwrap();
-        let pos_tool_start = pos_tool_start.unwrap();
+        let pos_text_delta = match pos_text_delta {
+            Some(v) => v,
+            None => panic!("should flush buffered text as text_delta"),
+        };
+        let pos_text_stop = match pos_text_stop {
+            Some(v) => v,
+            None => panic!("should stop text block before tool_use block starts"),
+        };
+        let pos_tool_start = match pos_tool_start {
+            Some(v) => v,
+            None => panic!("should start tool_use block"),
+        };
 
         assert!(
             pos_text_delta < pos_text_stop && pos_text_stop < pos_tool_start,
