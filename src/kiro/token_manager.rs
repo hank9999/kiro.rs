@@ -934,10 +934,7 @@ impl MultiTokenManager {
         // 设为阈值，便于在管理面板中直观看到该凭据已不可用
         entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
 
-        tracing::error!(
-            "凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用",
-            id
-        );
+        tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
 
         // 切换到优先级最高的可用凭据
         if let Some(next) = entries

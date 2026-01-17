@@ -142,6 +142,110 @@ impl SuccessResponse {
     }
 }
 
+// ============ 批量导入 token.json ============
+
+/// 官方 token.json 格式（用于解析导入）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenJsonItem {
+    /// 认证提供者（BuilderId / IdC / Social）
+    pub provider: Option<String>,
+    /// 刷新令牌
+    pub refresh_token: Option<String>,
+    /// OIDC Client ID
+    pub client_id: Option<String>,
+    /// OIDC Client Secret
+    pub client_secret: Option<String>,
+    /// 认证方式（备用字段）
+    pub auth_method: Option<String>,
+    /// 优先级（可选）
+    #[serde(default)]
+    pub priority: u32,
+}
+
+/// 批量导入请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportTokenJsonRequest {
+    /// 是否为预览模式（不实际写入）
+    #[serde(default = "default_dry_run")]
+    pub dry_run: bool,
+    /// 要导入的 token.json 项（单个或数组）
+    pub items: ImportItems,
+}
+
+fn default_dry_run() -> bool {
+    true
+}
+
+/// 导入项（支持单个或数组）
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ImportItems {
+    Single(TokenJsonItem),
+    Multiple(Vec<TokenJsonItem>),
+}
+
+impl ImportItems {
+    pub fn into_vec(self) -> Vec<TokenJsonItem> {
+        match self {
+            ImportItems::Single(item) => vec![item],
+            ImportItems::Multiple(items) => items,
+        }
+    }
+}
+
+/// 批量导入响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportTokenJsonResponse {
+    /// 汇总信息
+    pub summary: ImportSummary,
+    /// 每项的处理结果
+    pub items: Vec<ImportItemResult>,
+}
+
+/// 导入汇总
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSummary {
+    /// 解析的总数
+    pub parsed: usize,
+    /// 成功添加数
+    pub added: usize,
+    /// 跳过数（如重复）
+    pub skipped: usize,
+    /// 无效数
+    pub invalid: usize,
+}
+
+/// 单项导入结果
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportItemResult {
+    /// 项索引（从 0 开始）
+    pub index: usize,
+    /// token 指纹（用于识别，不暴露完整 token）
+    pub fingerprint: String,
+    /// 处理动作
+    pub action: ImportAction,
+    /// 原因说明（invalid/skipped 时提供）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// 新凭据 ID（added 时提供）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<u64>,
+}
+
+/// 导入动作
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ImportAction {
+    Added,
+    Skipped,
+    Invalid,
+}
+
 /// 错误响应
 #[derive(Debug, Serialize)]
 pub struct AdminErrorResponse {
