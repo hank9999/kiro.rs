@@ -165,7 +165,7 @@ async fn refresh_social_token(
         .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
     let kiro_version = &config.kiro_version;
 
-    let client = build_client(proxy, 60)?;
+    let client = build_client(proxy, 60, config.tls_backend)?;
     let body = RefreshRequest {
         refresh_token: refresh_token.to_string(),
     };
@@ -244,7 +244,7 @@ async fn refresh_idc_token(
     let region = credentials.region.as_ref().unwrap_or(&config.region);
     let refresh_url = format!("https://oidc.{}.amazonaws.com/token", region);
 
-    let client = build_client(proxy, 60)?;
+    let client = build_client(proxy, 60, config.tls_backend)?;
     let body = IdcRefreshRequest {
         client_id: client_id.to_string(),
         client_secret: client_secret.to_string(),
@@ -337,7 +337,7 @@ pub(crate) async fn get_usage_limits(
         USAGE_LIMITS_AMZ_USER_AGENT_PREFIX, kiro_version, machine_id
     );
 
-    let client = build_client(proxy, 60)?;
+    let client = build_client(proxy, 60, config.tls_backend)?;
 
     let response = client
         .get(&url)
@@ -934,10 +934,7 @@ impl MultiTokenManager {
         // 设为阈值，便于在管理面板中直观看到该凭据已不可用
         entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
 
-        tracing::error!(
-            "凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用",
-            id
-        );
+        tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
 
         // 切换到优先级最高的可用凭据
         if let Some(next) = entries

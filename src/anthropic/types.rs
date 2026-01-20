@@ -144,7 +144,11 @@ where
             while let Some(msg) = seq.next_element()? {
                 messages.push(msg);
             }
-            Ok(if messages.is_empty() { None } else { Some(messages) })
+            Ok(if messages.is_empty() {
+                None
+            } else {
+                Some(messages)
+            })
         }
 
         fn visit_none<E>(self) -> Result<Self::Value, E>

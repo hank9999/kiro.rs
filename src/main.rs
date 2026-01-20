@@ -98,6 +98,7 @@ async fn main() {
         api_key: config.count_tokens_api_key.clone(),
         auth_type: config.count_tokens_auth_type.clone(),
         proxy: proxy_config,
+        tls_backend: config.tls_backend,
     });
 
     // 构建 Anthropic API 路由（从第一个凭据获取 profile_arn）

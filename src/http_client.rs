@@ -5,6 +5,8 @@
 use reqwest::{Client, Proxy};
 use std::time::Duration;
 
+use crate::model::config::TlsBackend;
+
 /// 代理配置
 #[derive(Debug, Clone, Default)]
 pub struct ProxyConfig {
@@ -42,8 +44,16 @@ impl ProxyConfig {
 ///
 /// # Returns
 /// 配置好的 reqwest::Client
-pub fn build_client(proxy: Option<&ProxyConfig>, timeout_secs: u64) -> anyhow::Result<Client> {
+pub fn build_client(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
     let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+
+    if tls_backend == TlsBackend::Rustls {
+        builder = builder.use_rustls_tls();
+    }
 
     if let Some(proxy_config) = proxy {
         let mut proxy = Proxy::all(&proxy_config.url)?;
@@ -82,14 +92,14 @@ mod tests {
 
     #[test]
     fn test_build_client_without_proxy() {
-        let client = build_client(None, 30);
+        let client = build_client(None, 30, TlsBackend::Rustls);
         assert!(client.is_ok());
     }
 
     #[test]
     fn test_build_client_with_proxy() {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
-        let client = build_client(Some(&config), 30);
+        let client = build_client(Some(&config), 30, TlsBackend::Rustls);
         assert!(client.is_ok());
     }
 }
