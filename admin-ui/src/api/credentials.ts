@@ -6,6 +6,7 @@ import type {
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
+  SetEnabledModelsRequest,
   AddCredentialRequest,
   AddCredentialResponse,
   CredentialStatsResponse,
@@ -61,6 +62,18 @@ export async function setCredentialPriority(
   const { data } = await api.post<SuccessResponse>(
     `/credentials/${id}/priority`,
     { priority } as SetPriorityRequest
+  )
+  return data
+}
+
+// 设置凭据启用模型列表
+export async function setCredentialEnabledModels(
+  id: number,
+  enabledModels: string[]
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/models`,
+    { enabledModels } as SetEnabledModelsRequest
   )
   return data
 }

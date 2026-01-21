@@ -9,8 +9,8 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, CredentialAccountInfoResponse, SetDisabledRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, CredentialAccountInfoResponse, SetDisabledRequest,
+        SetEnabledModelsRequest, SetPriorityRequest, SuccessResponse,
     },
 };
 
@@ -50,6 +50,19 @@ pub async fn set_credential_priority(
             id, payload.priority
         )))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/models
+/// 设置凭据启用的模型列表
+pub async fn set_credential_enabled_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetEnabledModelsRequest>,
+) -> impl IntoResponse {
+    match state.service.set_enabled_models(id, payload.enabled_models) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 模型开关已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

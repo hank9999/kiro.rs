@@ -18,6 +18,7 @@ export interface CredentialStatusItem {
   hasProfileArn: boolean
   accountEmail: string | null
   userId: string | null
+  enabledModels?: string[] | null
 
   // ===== 统计（可持久化） =====
   callsTotal: number
@@ -96,6 +97,10 @@ export interface SetPriorityRequest {
   priority: number
 }
 
+export interface SetEnabledModelsRequest {
+  enabledModels: string[]
+}
+
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken: string
@@ -104,6 +109,7 @@ export interface AddCredentialRequest {
   clientSecret?: string
   priority?: number
   region?: string
+  enabledModels?: string[]
 }
 
 // 添加凭据响应

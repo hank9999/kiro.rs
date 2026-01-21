@@ -4,6 +4,7 @@ import {
   deleteCredential,
   setCredentialDisabled,
   setCredentialPriority,
+  setCredentialEnabledModels,
   resetCredentialFailure,
   getCredentialBalance,
   getCredentialAccountInfo,
@@ -95,6 +96,18 @@ export function useSetPriority() {
   return useMutation({
     mutationFn: ({ id, priority }: { id: number; priority: number }) =>
       setCredentialPriority(id, priority),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 设置模型开关
+export function useSetEnabledModels() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, enabledModels }: { id: number; enabledModels: string[] }) =>
+      setCredentialEnabledModels(id, enabledModels),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

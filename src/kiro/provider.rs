@@ -413,7 +413,7 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context().await {
+            let ctx = match self.token_manager.acquire_context_for_model(model).await {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(

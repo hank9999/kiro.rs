@@ -69,6 +69,7 @@ impl AdminService {
                     has_profile_arn: entry.has_profile_arn,
                     account_email: entry.account_email,
                     user_id: entry.user_id,
+                    enabled_models: entry.enabled_models,
 
                     calls_total: stats.as_ref().map(|s| s.calls_total).unwrap_or(0),
                     calls_ok: stats.as_ref().map(|s| s.calls_ok).unwrap_or(0),
@@ -115,6 +116,13 @@ impl AdminService {
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_priority(id, priority)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置凭据启用的模型列表
+    pub fn set_enabled_models(&self, id: u64, enabled_models: Vec<String>) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_enabled_models(id, enabled_models)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -299,6 +307,7 @@ impl AdminService {
             provider: req.provider,
             region: req.region,
             machine_id: req.machine_id,
+            enabled_models: req.enabled_models,
         };
 
         // 调用 token_manager 添加凭据

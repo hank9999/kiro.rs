@@ -427,6 +427,8 @@ pub struct CredentialEntrySnapshot {
     pub account_email: Option<String>,
     /// 用户 ID（从 API 获取，持久化保存）
     pub user_id: Option<String>,
+    /// 该凭据启用的模型列表（None 表示默认全开）
+    pub enabled_models: Option<Vec<String>>,
 }
 
 /// 凭据管理器状态快照
@@ -464,6 +466,95 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+
+/// Admin/UI 默认"全开"的模型集合（canonical id）
+const DEFAULT_ENABLED_MODELS: [&str; 4] = [
+    "claude-sonnet-4.5",
+    "claude-sonnet-4",
+    "claude-haiku-4.5",
+    "claude-opus-4.5",
+];
+
+/// 将不同来源的模型字符串归一化到"凭据模型开关"的 canonical id。
+///
+/// - Anthropic 风格：`claude-sonnet-4-5-20250929` → `claude-sonnet-4.5`
+/// - Canonical：`claude-opus-4.5` → `claude-opus-4.5`
+/// - 仅对本项目默认的 4 种模型做归一化；未知模型返回 None（保持原行为，不做过滤）
+fn normalize_model_for_credential_policy(model: &str) -> Option<&'static str> {
+    let m = model.trim().to_ascii_lowercase();
+    if m.is_empty() {
+        return None;
+    }
+
+    if m.contains("sonnet") {
+        if m.contains("4.5") || m.contains("4-5") || m.contains("4_5") {
+            Some("claude-sonnet-4.5")
+        } else if m.contains("sonnet-4") || m.contains("sonnet 4") || m.contains("sonnet4") {
+            Some("claude-sonnet-4")
+        } else {
+            // 未显式版本时，沿用当前"sonnet 默认 4.5"的行为
+            Some("claude-sonnet-4.5")
+        }
+    } else if m.contains("opus") {
+        Some("claude-opus-4.5")
+    } else if m.contains("haiku") {
+        Some("claude-haiku-4.5")
+    } else {
+        None
+    }
+}
+
+/// 检查凭据是否启用了指定模型
+fn is_model_enabled_for_credential(credentials: &KiroCredentials, normalized_model: &str) -> bool {
+    match &credentials.enabled_models {
+        None => true, // 未配置时默认全开
+        Some(list) => list
+            .iter()
+            .any(|m| m.trim().eq_ignore_ascii_case(normalized_model)),
+    }
+}
+
+/// 归一化并验证用户输入的模型列表（用于持久化）
+fn normalize_enabled_models_for_persist(models: Vec<String>) -> anyhow::Result<Option<Vec<String>>> {
+    use std::collections::HashSet;
+
+    // 用 &'static str 存 canonical，避免重复分配
+    let mut seen: HashSet<&'static str> = HashSet::new();
+
+    for raw in models {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let normalized = normalize_model_for_credential_policy(raw).ok_or_else(|| {
+            anyhow::anyhow!(
+                "不支持的模型值: {}（允许值: {:?}）",
+                raw,
+                DEFAULT_ENABLED_MODELS
+            )
+        })?;
+        seen.insert(normalized);
+    }
+
+    // 允许显式配置为空数组：表示该凭据不启用任何模型
+    if seen.is_empty() {
+        return Ok(Some(vec![]));
+    }
+
+    // 按默认顺序输出
+    let out: Vec<String> = DEFAULT_ENABLED_MODELS
+        .iter()
+        .filter(|m| seen.contains(**m))
+        .map(|m| (*m).to_string())
+        .collect();
+
+    // 如果全开，返回 None（表示未配置，向后兼容）
+    if out.len() == DEFAULT_ENABLED_MODELS.len() {
+        Ok(None)
+    } else {
+        Ok(Some(out))
+    }
+}
 
 /// API 调用上下文
 ///
@@ -598,6 +689,17 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
+    /// 获取"支持指定模型"的可用凭据数量
+    ///
+    /// 注意：`normalized_model` 必须是 `normalize_model_for_credential_policy` 的返回值（canonical id）。
+    fn available_count_for_model(&self, normalized_model: &str) -> usize {
+        self.entries
+            .lock()
+            .iter()
+            .filter(|e| !e.disabled && is_model_enabled_for_credential(&e.credentials, normalized_model))
+            .count()
+    }
+
     /// 获取 API 调用上下文
     ///
     /// 返回绑定了 id、credentials 和 token 的调用上下文
@@ -606,31 +708,82 @@ impl MultiTokenManager {
     /// 如果 Token 过期或即将过期，会自动刷新
     /// Token 刷新失败时会尝试下一个可用凭据（不计入失败次数）
     pub async fn acquire_context(&self) -> anyhow::Result<CallContext> {
+        self.acquire_context_for_model(None).await
+    }
+
+    /// 获取 API 调用上下文（按模型过滤可用凭据）
+    ///
+    /// - 若模型可归一化到默认模型集合，则只在"启用该模型"的凭据中选择
+    /// - 若模型无法归一化（未知模型），保持原行为（不做过滤）
+    pub async fn acquire_context_for_model(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+        let normalized_model = model.and_then(normalize_model_for_credential_policy);
+
         let total = self.total_count();
+        if total == 0 {
+            anyhow::bail!("没有配置任何凭据");
+        }
+
+        // 如果模型可归一化但没有任何凭据支持该模型，直接失败，避免无意义重试/死循环
+        if let Some(m) = normalized_model {
+            let eligible = self.available_count_for_model(m);
+            if eligible == 0 {
+                anyhow::bail!(
+                    "没有任何可用凭据支持模型 {}（canonical: {}）",
+                    model.unwrap_or(m),
+                    m
+                );
+            }
+        }
+
         let mut tried_count = 0;
 
         loop {
-            if tried_count >= total {
+            // 未知模型：保持原行为（用 total 做上限）
+            // 已知模型：只在 eligible 集合内尝试
+            let max_tries = match normalized_model {
+                Some(m) => self.available_count_for_model(m),
+                None => total,
+            };
+
+            if max_tries == 0 {
+                if let Some(m) = normalized_model {
+                    anyhow::bail!(
+                        "没有任何可用凭据支持模型 {}（canonical: {}）",
+                        model.unwrap_or(m),
+                        m
+                    );
+                }
+                anyhow::bail!("所有凭据均已禁用（0/{}）", total);
+            }
+
+            if tried_count >= max_tries {
                 anyhow::bail!(
-                    "所有凭据均无法获取有效 Token（可用: {}/{}）",
-                    self.available_count(),
+                    "所有{}凭据均无法获取有效 Token（可用: {}/{}）",
+                    if normalized_model.is_some() { "支持该模型的" } else { "" },
+                    max_tries,
                     total
                 );
             }
 
             let (id, credentials) = {
                 let mut entries = self.entries.lock();
-                let current_id = *self.current_id.lock();
 
-                // 找到当前凭据
-                if let Some(entry) = entries.iter().find(|e| e.id == current_id && !e.disabled) {
-                    (entry.id, entry.credentials.clone())
-                } else {
-                    // 当前凭据不可用，选择优先级最高的可用凭据
-                    let mut best = entries
-                        .iter()
-                        .filter(|e| !e.disabled)
-                        .min_by_key(|e| e.credentials.priority);
+                let supports = |e: &CredentialEntry| -> bool {
+                    if e.disabled {
+                        return false;
+                    }
+                    match normalized_model {
+                        Some(m) => is_model_enabled_for_credential(&e.credentials, m),
+                        None => true,
+                    }
+                };
+
+                // 根据模型动态选择凭据（不再依赖 current_id）
+                // 优先选择优先级最高（priority 最小）且支持该模型的凭据
+                let mut best = entries
+                    .iter()
+                    .filter(|e| supports(e))
+                    .min_by_key(|e| e.credentials.priority);
 
                     // 没有可用凭据：如果是“自动禁用导致全灭”，做一次类似重启的自愈
                     if best.is_none()
@@ -650,27 +803,42 @@ impl MultiTokenManager {
                         }
                         best = entries
                             .iter()
-                            .filter(|e| !e.disabled)
+                            .filter(|e| supports(e))
                             .min_by_key(|e| e.credentials.priority);
                     }
 
                     if let Some(entry) = best {
-                        // 先提取数据
-                        let new_id = entry.id;
-                        let new_creds = entry.credentials.clone();
-                        drop(entries);
-                        // 更新 current_id
-                        let mut current_id = self.current_id.lock();
-                        *current_id = new_id;
-                        (new_id, new_creds)
+                        // 提取凭据信息
+                        let selected_id = entry.id;
+                        let selected_creds = entry.credentials.clone();
+                        (selected_id, selected_creds)
                     } else {
                         // 注意：必须在 bail! 之前计算 available_count，
                         // 因为 available_count() 会尝试获取 entries 锁，
                         // 而此时我们已经持有该锁，会导致死锁
                         let available = entries.iter().filter(|e| !e.disabled).count();
+                        if available == 0 {
+                            anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                        }
+
+                        if let Some(m) = normalized_model {
+                            let eligible = entries
+                                .iter()
+                                .filter(|e| !e.disabled && is_model_enabled_for_credential(&e.credentials, m))
+                                .count();
+                            if eligible == 0 {
+                                anyhow::bail!(
+                                    "没有任何可用凭据支持模型 {}（canonical: {}，可用: {}/{}）",
+                                    model.unwrap_or(m),
+                                    m,
+                                    available,
+                                    total
+                                );
+                            }
+                        }
+
                         anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                     }
-                }
             };
 
             // 尝试获取/刷新 Token
@@ -682,7 +850,11 @@ impl MultiTokenManager {
                     tracing::warn!("凭据 #{} Token 刷新失败，尝试下一个凭据: {}", id, e);
 
                     // Token 刷新失败，切换到下一个优先级的凭据（不计入失败次数）
-                    self.switch_to_next_by_priority();
+                    if let Some(m) = normalized_model {
+                        self.switch_to_next_by_priority_for_model(m);
+                    } else {
+                        self.switch_to_next_by_priority();
+                    }
                     tried_count += 1;
                 }
             }
@@ -707,6 +879,16 @@ impl MultiTokenManager {
                 entry.credentials.priority
             );
         }
+    }
+
+    /// 记录按模型选择凭据失败的日志（内部方法）
+    ///
+    /// 在多凭据并行模式下，不需要切换 current_id，只需记录日志
+    fn switch_to_next_by_priority_for_model(&self, normalized_model: &str) {
+        tracing::debug!(
+            "Token 刷新失败，将在下次请求时重新选择支持模型 {} 的凭据",
+            normalized_model
+        );
     }
 
     /// 选择优先级最高的未禁用凭据作为当前凭据（内部方法）
@@ -1038,6 +1220,7 @@ impl MultiTokenManager {
                     expires_at: e.credentials.expires_at.clone(),
                     account_email: e.credentials.account_email.clone(),
                     user_id: e.credentials.user_id.clone(),
+                    enabled_models: e.credentials.enabled_models.clone(),
                 })
                 .collect(),
             current_id,
@@ -1064,6 +1247,25 @@ impl MultiTokenManager {
             }
         }
         // 持久化更改
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置凭据启用模型列表（Admin API）
+    ///
+    /// - 入参会被归一化为 canonical id
+    /// - 全开会存为 None（表示未配置，向后兼容）
+    /// - 空数组会存为 Some(vec![])（表示不启用任何模型）
+    pub fn set_enabled_models(&self, id: u64, enabled_models: Vec<String>) -> anyhow::Result<()> {
+        let normalized = normalize_enabled_models_for_persist(enabled_models)?;
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.enabled_models = normalized;
+        }
         self.persist_credentials()?;
         Ok(())
     }

@@ -86,6 +86,8 @@ pub struct CredentialStatusItem {
     pub account_email: Option<String>,
     /// 用户 ID（从 API 获取，持久化保存）
     pub user_id: Option<String>,
+    /// 该凭据启用的模型列表（None 表示默认全开）
+    pub enabled_models: Option<Vec<String>>,
 
     // ===== 统计（可持久化） =====
 
@@ -127,6 +129,14 @@ pub struct SetPriorityRequest {
     pub priority: u32,
 }
 
+/// 设置凭据启用模型列表请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetEnabledModelsRequest {
+    /// 启用的模型（canonical id 列表）。空数组表示不启用任何模型。
+    pub enabled_models: Vec<String>,
+}
+
 /// 添加凭据请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -158,6 +168,10 @@ pub struct AddCredentialRequest {
     /// 凭据级 Machine ID（可选，64 位字符串）
     /// 未配置时回退到 config.json 的 machineId
     pub machine_id: Option<String>,
+
+    /// 该凭据启用的模型列表（可选；不填/为 null 表示默认全开）
+    #[serde(default)]
+    pub enabled_models: Option<Vec<String>>,
 }
 
 fn default_auth_method() -> String {

@@ -69,6 +69,14 @@ pub struct KiroCredentials {
     /// 未配置时回退到 config.json 的 machineId；都未配置时由 refreshToken 派生
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
+
+    /// 该凭据允许使用的模型列表（可选）。
+    ///
+    /// - `None`：未配置（向后兼容），等价于"允许全部模型"（包括 IdC 默认）。
+    /// - `Some(vec)`：仅允许列表中的模型（建议填写 canonical 模型 ID，如 `claude-sonnet-4.5`）。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled_models: Option<Vec<String>>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -258,6 +266,7 @@ mod tests {
             provider: None,
             region: None,
             machine_id: None,
+            enabled_models: None,
         };
 
         let json = match creds.to_pretty_json() {
@@ -386,6 +395,7 @@ mod tests {
             priority: 0,
             region: Some("eu-west-1".to_string()),
             machine_id: None,
+            enabled_models: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -408,6 +418,7 @@ mod tests {
             priority: 0,
             region: None,
             machine_id: None,
+            enabled_models: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -512,6 +523,7 @@ mod tests {
             priority: 3,
             region: Some("us-west-2".to_string()),
             machine_id: Some("c".repeat(64)),
+            enabled_models: None,
         };
 
         let json = original.to_pretty_json().unwrap();

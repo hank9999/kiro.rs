@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { RefreshCw, ChevronUp, ChevronDown, Wallet, BarChart3, Trash2, Trash } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -19,12 +19,14 @@ import {
   useDeleteCredential,
   useSetDisabled,
   useSetPriority,
+  useSetEnabledModels,
   useResetFailure,
   useResetCredentialStats,
   useCredentialBalance,
 } from '@/hooks/use-credentials'
 import { StatsDialog } from '@/components/stats-dialog'
 import { formatExpiry, formatTokensPair } from '@/lib/format'
+import { ALL_MODEL_IDS, MODEL_OPTIONS, normalizeEnabledModels, type SupportedModelId } from '@/lib/models'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
@@ -42,15 +44,33 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [statsDialogOpen, setStatsDialogOpen] = useState(false)
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [enabledModelsDraft, setEnabledModelsDraft] = useState<SupportedModelId[]>(
+    normalizeEnabledModels(credential.enabledModels)
+  )
 
   const deleteCredential = useDeleteCredential()
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
+  const setEnabledModels = useSetEnabledModels()
   const resetFailure = useResetFailure()
   const resetStats = useResetCredentialStats()
   const balanceQuery = useCredentialBalance(credential.id, {
     refetchInterval: 10 * 60 * 1000, // 每 10 分钟刷新一次
   })
+
+  useEffect(() => {
+    setEnabledModelsDraft(normalizeEnabledModels(credential.enabledModels))
+  }, [credential.id, credential.enabledModels])
+
+  const saveEnabledModels = () => {
+    setEnabledModels.mutate(
+      { id: credential.id, enabledModels: enabledModelsDraft },
+      {
+        onSuccess: (res) => toast.success(res.message),
+        onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+      }
+    )
+  }
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -215,6 +235,57 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
             <div>
               <span className="text-muted-foreground">Token 有效期：</span>
               <span className="font-medium">{formatExpiry(credential.expiresAt)}</span>
+            </div>
+            <div className="col-span-2">
+              <span className="text-muted-foreground">模型开关：</span>
+              <div className="mt-2 flex flex-wrap items-center gap-4">
+                {MODEL_OPTIONS.map((m) => {
+                  const checked = enabledModelsDraft.includes(m.id)
+                  return (
+                    <div key={m.id} className="flex items-center gap-2">
+                      <Switch
+                        checked={checked}
+                        onCheckedChange={(v) => {
+                          setEnabledModelsDraft((prev) => {
+                            if (v) return Array.from(new Set([...prev, m.id]))
+                            return prev.filter((x) => x !== m.id)
+                          })
+                        }}
+                        disabled={setEnabledModels.isPending}
+                      />
+                      <span className="text-sm">{m.label}</span>
+                    </div>
+                  )
+                })}
+
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setEnabledModelsDraft([...ALL_MODEL_IDS])}
+                  disabled={setEnabledModels.isPending}
+                >
+                  全选
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setEnabledModelsDraft([])}
+                  disabled={setEnabledModels.isPending}
+                >
+                  全不选
+                </Button>
+                <Button
+                  size="sm"
+                  variant="default"
+                  onClick={saveEnabledModels}
+                  disabled={setEnabledModels.isPending}
+                >
+                  保存
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground mt-1">
+                未配置时默认全开；保存会写回 credentials.json（多凭据数组格式才会回写）。
+              </p>
             </div>
             <div className="col-span-2">
               <span className="text-muted-foreground">调用次数：</span>
