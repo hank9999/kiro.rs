@@ -7,7 +7,8 @@
 本项目与 AWS/KIRO/Anthropic/Claude 等官方无关, 本项目不代表官方立场。
 
 ## 注意！
-因 tls 库从 native-tls 切换至 rustls, 你可能需要专门安装证书后才能配置 HTTP PROXY
+因 TLS 默认从 native-tls 切换至 rustls，你可能需要专门安装证书后才能配置 HTTP 代理。可通过 `config.json` 的 `tlsBackend` 切回 `native-tls`。
+如果遇到请求报错, 尤其是无法刷新 token, 或者是直接返回 error request, 请尝试切换 tls 后端为 `native-tls`, 一般即可解决。
 
 ## 功能特性
 
@@ -53,9 +54,9 @@
 
 ## 快速开始
 
-> **前置步骤**：编译前需要先构建前端 Admin UI：
+> **前置步骤**：编译前需要先构建前端 Admin UI（用于嵌入到二进制中）：
 > ```bash
-> cd admin-ui && npm install && npm run build
+> cd admin-ui && pnpm install && pnpm build
 > ```
 
 ### 1. 编译项目
@@ -74,6 +75,7 @@ cargo build --release
    "port": 8990,  // 必配, 监听端口
    "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",  // 必配, 请求的鉴权 token
    "region": "us-east-1",  // 必配, 区域, 一般保持默认即可
+   "tlsBackend": "rustls", // 可选, TLS 后端: rustls / native-tls
    "kiroVersion": "0.8.0",  // 可选, 用于自定义请求特征, 不需要请删除: kiro ide 版本
    "machineId": "如果你需要自定义机器码请将64位机器码填到这里", // 可选, 用于自定义请求特征, 不需要请删除: 机器码
    "systemVersion": "darwin#24.6.0",  // 可选, 用于自定义请求特征, 不需要请删除: 系统版本
@@ -84,7 +86,7 @@ cargo build --release
    "proxyUrl": "http://127.0.0.1:7890", // 可选, HTTP/SOCK5代理, 不需要请删除
    "proxyUsername": "user",  // 可选, HTTP/SOCK5代理用户名, 不需要请删除
    "proxyPassword": "pass",  // 可选, HTTP/SOCK5代理密码, 不需要请删除
-   "adminApiKey": "sk-admin-your-secret-key"  // 可选, Admin API 密钥, 用于启用凭据管理 API, 不需要请删除
+   "adminApiKey": "sk-admin-your-secret-key"  // 可选, Admin API 密钥, 用于启用凭据管理 API, 填写后才会启用web管理， 不需要请删除
 }
 ```
 最小启动配置为: 
@@ -93,7 +95,8 @@ cargo build --release
    "host": "127.0.0.1",
    "port": 8990,
    "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
-   "region": "us-east-1"
+   "region": "us-east-1",
+   "tlsBackend": "rustls"
 }
 ```
 ### 3. 凭证文件
@@ -108,7 +111,7 @@ cargo build --release
    "refreshToken": "这里是刷新token 一般有效期7-30天不等",  // 必配, 根据实际填写
    "profileArn": "这是profileArn, 如果没有请你删除该字段， 配置应该像这个 arn:aws:codewhisperer:us-east-1:111112222233:profile/QWER1QAZSDFGH",  // 可选, 不需要请删除
    "expiresAt": "这里是请求token过期时间, 一般格式是这样2025-12-31T02:32:45.144Z, 在过期前 kirors 不会请求刷新请求token",  // 必配, 不确定你需要写一个已经过期的UTC时间
-   "authMethod": "这里是认证方式 social/Social 或者是 idc/IdC",  // 必配, 根据你 Token 登录来源决定
+   "authMethod": "这里是认证方式 social / idc",  // 必配, IdC/Builder-ID/IAM 三类用户统一填写 idc
    "clientId": "如果你是 IdC 登录 需要配置这个",  // 可选, 不需要请删除
    "clientSecret": "如果你是 IdC 登录 需要配置这个"  // 可选, 不需要请删除
 }
@@ -142,6 +145,7 @@ cargo build --release
 > - 自动故障转移到下一个可用凭据
 > - 多凭据格式下 Token 刷新后自动回写到源文件
 > - 可选的 `region` 字段：用于 OIDC token 刷新时指定 endpoint 区域，未配置时回退到 config.json 的 region
+> - 可选的 `machineId` 字段：凭据级机器码；未配置时回退到 config.json 的 machineId；都未配置时由 refreshToken 派生
 
 最小启动配置(social):
 ```json
@@ -197,19 +201,20 @@ curl http://127.0.0.1:8990/v1/messages \
 |------|------|--------|-------------------------|
 | `host` | string | `127.0.0.1` | 服务监听地址                  |
 | `port` | number | `8080` | 服务监听端口                  |
-| `apiKey` | string | - | 自定义 API Key（用于客户端认证）    |
+| `apiKey` | string | - | 自定义 API Key（用于客户端认证，必配） |
 | `region` | string | `us-east-1` | AWS 区域                  |
 | `kiroVersion` | string | `0.8.0` | Kiro 版本号                |
 | `machineId` | string | - | 自定义机器码（64位十六进制）不定义则自动生成 |
 | `systemVersion` | string | 随机 | 系统版本标识                  |
 | `nodeVersion` | string | `22.21.1` | Node.js 版本标识            |
+| `tlsBackend` | string | `rustls` | TLS 后端：`rustls` 或 `native-tls` |
 | `countTokensApiUrl` | string | - | 外部 count_tokens API 地址（可选） |
 | `countTokensApiKey` | string | - | 外部 count_tokens API 密钥（可选） |
 | `countTokensAuthType` | string | `x-api-key` | 外部 API 认证类型：`x-api-key` 或 `bearer` |
 | `proxyUrl` | string | - | HTTP/SOCKS5 代理地址（可选） |
 | `proxyUsername` | string | - | 代理用户名（可选） |
 | `proxyPassword` | string | - | 代理密码（可选） |
-| `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API（可选） |
+| `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API, 填写后才会启用web管理（可选） |
 
 ### credentials.json
 
@@ -217,16 +222,21 @@ curl http://127.0.0.1:8990/v1/messages \
 
 | 字段 | 类型 | 描述                      |
 |------|------|-------------------------|
+| `id` | number | 凭据唯一 ID（可选，仅用于 Admin API 管理；手写文件可不填） |
 | `accessToken` | string | OAuth 访问令牌（可选，可自动刷新）    |
 | `refreshToken` | string | OAuth 刷新令牌              |
 | `profileArn` | string | AWS Profile ARN（可选，登录时返回） |
 | `expiresAt` | string | Token 过期时间 (RFC3339)    |
-| `authMethod` | string | 认证方式（social 或 idc）      |
+| `authMethod` | string | 认证方式（`social` / `idc`） |
 | `clientId` | string | IdC 登录的客户端 ID（可选）      |
 | `clientSecret` | string | IdC 登录的客户端密钥（可选）      |
 | `priority` | number | 凭据优先级，数字越小越优先，默认为 0（多凭据格式时有效）|
 | `region` | string | 凭据级 region（可选），用于 OIDC token 刷新时指定 endpoint 的区域。未配置时回退到 config.json 的 region。注意：API 调用始终使用 config.json 的 region |
 | `machineId` | string | 凭据级机器码（可选，64位十六进制）。未配置时回退到 config.json 的 machineId；都未配置时由 refreshToken 派生 |
+
+说明：
+- IdC / Builder-ID / IAM 在本项目里属于同一种登录方式，配置时统一使用 `authMethod: "idc"`
+- 为兼容旧配置，`builder-id` / `iam` 仍可被识别，但会按 `idc` 处理
 
 ## 模型映射
 
@@ -278,9 +288,9 @@ kiro-rs/
 ├── Cargo.toml                  # 项目配置
 ├── admin-ui/                   # 管理面板前端（Vue 3 + Vite）
 ├── config.example.json         # 配置示例
-├── credentials.example.social.json   # Social 凭证示例
-├── credentials.example.idc.json      # IdC 凭证示例
-└── credentials.example.multiple.json # 多凭据示例
+├── admin-ui/                   # Admin UI 前端工程（构建产物会嵌入二进制）
+├── tools/                      # 辅助工具
+└── Dockerfile                  # Docker 构建文件
 ```
 
 ## 技术栈
@@ -403,7 +413,23 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 1. **凭证安全**: 请妥善保管 `credentials.json` 文件，不要提交到版本控制
 2. **Token 刷新**: 服务会自动刷新过期的 Token，无需手动干预
-3. **不支持的工具**: `web_search` 和 `websearch` 工具会被自动过滤
+3. **WebSearch 工具**: 当 `tools` 列表仅包含一个 `web_search` 工具时，会走内置 WebSearch 转换逻辑
+
+## Admin（可选）
+
+当 `config.json` 配置了非空 `adminApiKey` 时，会启用：
+
+- **Admin API（认证同 API Key）**
+  - `GET /api/admin/credentials` - 获取所有凭据状态
+  - `POST /api/admin/credentials` - 添加新凭据
+  - `DELETE /api/admin/credentials/:id` - 删除凭据
+  - `POST /api/admin/credentials/:id/disabled` - 设置凭据禁用状态
+  - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
+  - `POST /api/admin/credentials/:id/reset` - 重置失败计数
+  - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
+
+- **Admin UI**
+  - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）
 
 ## License
 

@@ -17,11 +17,12 @@ interface AddCredentialDialogProps {
   onOpenChange: (open: boolean) => void
 }
 
-type AuthMethod = 'social' | 'idc' | 'builder-id'
+type AuthMethod = 'social' | 'idc'
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
+  const [region, setRegion] = useState('')
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
   const [priority, setPriority] = useState('0')
@@ -31,6 +32,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const resetForm = () => {
     setRefreshToken('')
     setAuthMethod('social')
+    setRegion('')
     setClientId('')
     setClientSecret('')
     setPriority('0')
@@ -45,10 +47,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       return
     }
 
-    // IdC/Builder-ID 需要额外字段
-    if ((authMethod === 'idc' || authMethod === 'builder-id') &&
-        (!clientId.trim() || !clientSecret.trim())) {
-      toast.error('IdC/Builder-ID 认证需要填写 Client ID 和 Client Secret')
+    // IdC/Builder-ID/IAM 需要额外字段
+    if (authMethod === 'idc' && (!clientId.trim() || !clientSecret.trim())) {
+      toast.error('IdC/Builder-ID/IAM 认证需要填写 Client ID 和 Client Secret')
       return
     }
 
@@ -56,6 +57,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       {
         refreshToken: refreshToken.trim(),
         authMethod,
+        region: region.trim() || undefined,
         clientId: clientId.trim() || undefined,
         clientSecret: clientSecret.trim() || undefined,
         priority: parseInt(priority) || 0,
@@ -110,13 +112,25 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <option value="social">Social</option>
-                <option value="idc">IdC</option>
-                <option value="builder-id">Builder-ID</option>
+                <option value="idc">IdC/Builder-ID/IAM</option>
               </select>
             </div>
 
-            {/* IdC/Builder-ID 额外字段 */}
-            {(authMethod === 'idc' || authMethod === 'builder-id') && (
+            <div className="space-y-2">
+              <label htmlFor="region" className="text-sm font-medium">
+                刷新 Token 地域
+              </label>
+              <Input
+                id="region"
+                placeholder="例如 us-east-1（留空则使用全局 region）"
+                value={region}
+                onChange={(e) => setRegion(e.target.value)}
+                disabled={isPending}
+              />
+            </div>
+
+            {/* IdC/Builder-ID/IAM 额外字段 */}
+            {authMethod === 'idc' && (
               <>
                 <div className="space-y-2">
                   <label htmlFor="clientId" className="text-sm font-medium">

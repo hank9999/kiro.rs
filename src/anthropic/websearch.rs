@@ -138,11 +138,7 @@ pub fn extract_search_query(req: &MessagesRequest) -> Option<String> {
         text
     };
 
-    if query.is_empty() {
-        None
-    } else {
-        Some(query)
-    }
+    if query.is_empty() { None } else { Some(query) }
 }
 
 /// 生成22位大小写字母和数字的随机字符串
@@ -175,7 +171,10 @@ pub fn create_mcp_request(query: &str) -> (String, McpRequest) {
     let timestamp = chrono::Utc::now().timestamp_millis();
     let random_8 = generate_random_id_8();
 
-    let request_id = format!("web_search_tooluse_{}_{}_{}",random_22, timestamp, random_8);
+    let request_id = format!(
+        "web_search_tooluse_{}_{}_{}",
+        random_22, timestamp, random_8
+    );
 
     // tool_use_id 使用相同格式
     let tool_use_id = format!(
@@ -218,7 +217,8 @@ pub fn create_websearch_sse_stream(
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let events = generate_websearch_events(&model, &query, &tool_use_id, search_results, input_tokens);
+    let events =
+        generate_websearch_events(&model, &query, &tool_use_id, search_results, input_tokens);
 
     stream::iter(
         events
@@ -236,7 +236,10 @@ fn generate_websearch_events(
     input_tokens: i32,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
-    let message_id = format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")[..24].to_string());
+    let message_id = format!(
+        "msg_{}",
+        Uuid::new_v4().to_string().replace('-', "")[..24].to_string()
+    );
 
     // 1. message_start
     events.push(SseEvent::new(
@@ -473,13 +476,8 @@ pub async fn handle_websearch_request(
 
     // 4. 生成 SSE 响应
     let model = payload.model.clone();
-    let stream = create_websearch_sse_stream(
-        model,
-        query,
-        tool_use_id,
-        search_results,
-        input_tokens,
-    );
+    let stream =
+        create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -672,9 +670,11 @@ mod tests {
 
         // 第三部分: 8位小写字母和数字
         assert_eq!(parts[2].len(), 8);
-        assert!(parts[2]
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert!(
+            parts[2]
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        );
     }
 
     #[test]

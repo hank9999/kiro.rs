@@ -31,6 +31,12 @@ interface CredentialCardProps {
   onViewBalance: (id: number) => void
 }
 
+function formatAuthMethodLabel(authMethod: string | null): string {
+  if (!authMethod) return '未知'
+  if (authMethod.toLowerCase() === 'idc') return 'IdC/Builder-ID/IAM'
+  return authMethod
+}
+
 export function CredentialCard({ credential, onViewBalance }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
@@ -204,7 +210,7 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
             </div>
             <div>
               <span className="text-muted-foreground">认证方式：</span>
-              <span className="font-medium">{credential.authMethod || '未知'}</span>
+              <span className="font-medium">{formatAuthMethodLabel(credential.authMethod)}</span>
             </div>
             <div>
               <span className="text-muted-foreground">Token 有效期：</span>

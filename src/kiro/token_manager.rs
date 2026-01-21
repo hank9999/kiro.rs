@@ -141,9 +141,13 @@ pub(crate) async fn refresh_token(
         }
     });
 
-    match auth_method.to_lowercase().as_str() {
-        "idc" | "builder-id" => refresh_idc_token(credentials, config, proxy).await,
-        _ => refresh_social_token(credentials, config, proxy).await,
+    if auth_method.eq_ignore_ascii_case("idc")
+        || auth_method.eq_ignore_ascii_case("builder-id")
+        || auth_method.eq_ignore_ascii_case("iam")
+    {
+        refresh_idc_token(credentials, config, proxy).await
+    } else {
+        refresh_social_token(credentials, config, proxy).await
     }
 }
 
@@ -165,7 +169,7 @@ async fn refresh_social_token(
         .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
     let kiro_version = &config.kiro_version;
 
-    let client = build_client(proxy, 60)?;
+    let client = build_client(proxy, 60, config.tls_backend)?;
     let body = RefreshRequest {
         refresh_token: refresh_token.to_string(),
     };
@@ -244,7 +248,7 @@ async fn refresh_idc_token(
     let region = credentials.region.as_ref().unwrap_or(&config.region);
     let refresh_url = format!("https://oidc.{}.amazonaws.com/token", region);
 
-    let client = build_client(proxy, 60)?;
+    let client = build_client(proxy, 60, config.tls_backend)?;
     let body = IdcRefreshRequest {
         client_id: client_id.to_string(),
         client_secret: client_secret.to_string(),
@@ -337,7 +341,7 @@ pub(crate) async fn get_usage_limits(
         USAGE_LIMITS_AMZ_USER_AGENT_PREFIX, kiro_version, machine_id
     );
 
-    let client = build_client(proxy, 60)?;
+    let client = build_client(proxy, 60, config.tls_backend)?;
 
     let response = client
         .get(&url)
@@ -501,6 +505,7 @@ impl MultiTokenManager {
         let entries: Vec<CredentialEntry> = credentials
             .into_iter()
             .map(|mut cred| {
+                cred.canonicalize_auth_method();
                 let id = cred.id.unwrap_or_else(|| {
                     let id = next_id;
                     next_id += 1;
@@ -829,7 +834,14 @@ impl MultiTokenManager {
         // 收集所有凭据
         let credentials: Vec<KiroCredentials> = {
             let entries = self.entries.lock();
-            entries.iter().map(|e| e.credentials.clone()).collect()
+            entries
+                .iter()
+                .map(|e| {
+                    let mut cred = e.credentials.clone();
+                    cred.canonicalize_auth_method();
+                    cred
+                })
+                .collect()
         };
 
         // 序列化为 pretty JSON
@@ -938,10 +950,7 @@ impl MultiTokenManager {
         // 设为阈值，便于在管理面板中直观看到该凭据已不可用
         entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
 
-        tracing::error!(
-            "凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用",
-            id
-        );
+        tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
 
         // 切换到优先级最高的可用凭据
         if let Some(next) = entries
@@ -1018,7 +1027,13 @@ impl MultiTokenManager {
                     priority: e.credentials.priority,
                     disabled: e.disabled,
                     failure_count: e.failure_count,
-                    auth_method: e.credentials.auth_method.clone(),
+                    auth_method: e.credentials.auth_method.as_deref().map(|m| {
+                        if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
+                            "idc".to_string()
+                        } else {
+                            m.to_string()
+                        }
+                    }),
                     has_profile_arn: e.credentials.profile_arn.is_some(),
                     expires_at: e.credentials.expires_at.clone(),
                     account_email: e.credentials.account_email.clone(),
@@ -1284,9 +1299,17 @@ impl MultiTokenManager {
         // 4. 设置 ID 并保留用户输入的元数据
         validated_cred.id = Some(new_id);
         validated_cred.priority = new_cred.priority;
-        validated_cred.auth_method = new_cred.auth_method;
+        validated_cred.auth_method = new_cred.auth_method.map(|m| {
+            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
+                "idc".to_string()
+            } else {
+                m
+            }
+        });
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;
+        validated_cred.region = new_cred.region;
+        validated_cred.machine_id = new_cred.machine_id;
 
         {
             let mut entries = self.entries.lock();

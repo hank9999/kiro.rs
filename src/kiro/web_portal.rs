@@ -15,6 +15,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, COOKIE, HeaderMap, He
 use serde::{Deserialize, Deserializer};
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::model::config::TlsBackend;
 
 const KIRO_API_BASE: &str = "https://app.kiro.dev/service/KiroWebPortalService/operation";
 const SMITHY_PROTOCOL: &str = "rpc-v2-cbor";
@@ -326,7 +327,7 @@ where
     ciborium::into_writer(req, &mut body).context("CBOR 编码失败")?;
     tracing::debug!("[KiroAPI] 请求体 CBOR 编码完成，长度: {} bytes", body.len());
 
-    let client = build_client(proxy, 60)?;
+    let client = build_client(proxy, 60, TlsBackend::default())?;
     let headers = build_headers(access_token, idp)?;
 
     // 打印请求头（脱敏）

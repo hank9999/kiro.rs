@@ -115,8 +115,6 @@ fn deserialize_system<'de, D>(deserializer: D) -> Result<Option<Vec<SystemMessag
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de::Error;
-
     // 创建一个 visitor 来处理 string 或 array
     struct SystemVisitor;
 
@@ -144,7 +142,11 @@ where
             while let Some(msg) = seq.next_element()? {
                 messages.push(msg);
             }
-            Ok(if messages.is_empty() { None } else { Some(messages) })
+            Ok(if messages.is_empty() {
+                None
+            } else {
+                Some(messages)
+            })
         }
 
         fn visit_none<E>(self) -> Result<Self::Value, E>
