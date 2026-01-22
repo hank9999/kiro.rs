@@ -12,6 +12,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use uuid::Uuid;
 
+use crate::common::truncate_str_safe;
 use crate::http_client::{build_client, build_stream_client, ProxyConfig};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -95,7 +96,11 @@ fn format_credential_info(ctx: &CallContext, config_region: &str) -> String {
     } else {
         let token_len = ctx.token.len();
         let token_preview = if token_len > 100 {
-            format!("{}...{}", &ctx.token[..50], &ctx.token[token_len-20..])
+            format!(
+                "{}...{}",
+                truncate_str_safe(&ctx.token, 50),
+                truncate_str_safe(&ctx.token[ctx.token.len().saturating_sub(20)..], 20)
+            )
         } else {
             ctx.token.clone()
         };
@@ -199,10 +204,17 @@ fn format_headers(headers: &HeaderMap) -> String {
     let mut lines = Vec::new();
     for (name, value) in headers.iter() {
         let value_str = value.to_str().unwrap_or("<binary>");
-        // 对敏感头进行部分脱敏
+        // 对敏感头进行部分脱敏（使用安全截断）
         let display_value = if name.as_str().eq_ignore_ascii_case("authorization") {
             if value_str.len() > 50 {
-                format!("{}...{} ({} chars)", &value_str[..30], &value_str[value_str.len()-10..], value_str.len())
+                let start = truncate_str_safe(value_str, 30);
+                let end_start = value_str.len().saturating_sub(10);
+                let end = if end_start < value_str.len() {
+                    truncate_str_safe(&value_str[end_start..], 10)
+                } else {
+                    ""
+                };
+                format!("{}...{} ({} chars)", start, end, value_str.len())
             } else {
                 value_str.to_string()
             }
@@ -226,7 +238,7 @@ fn format_request_body(body: &str) -> String {
                 if let Some(val) = obj.get(key) {
                     let val_str = serde_json::to_string(val).unwrap_or_else(|_| "<序列化失败>".to_string());
                     let truncated = if val_str.len() > 500 {
-                        format!("{}... ({} chars)", &val_str[..500], val_str.len())
+                        format!("{}... ({} chars)", truncate_str_safe(&val_str, 500), val_str.len())
                     } else {
                         val_str
                     };
@@ -242,7 +254,7 @@ fn format_request_body(body: &str) -> String {
         };
         
         let full_body = if body.len() > 3000 {
-            format!("{}... (truncated, total {} bytes)", &body[..3000], body.len())
+            format!("{}... (truncated, total {} bytes)", truncate_str_safe(body, 3000), body.len())
         } else {
             body.to_string()
         };
@@ -256,7 +268,7 @@ fn format_request_body(body: &str) -> String {
     } else {
         // 非 JSON 格式
         if body.len() > 3000 {
-            format!("(非 JSON, {} bytes): {}... (truncated)", body.len(), &body[..3000])
+            format!("(非 JSON, {} bytes): {}... (truncated)", body.len(), truncate_str_safe(body, 3000))
         } else {
             format!("(非 JSON, {} bytes): {}", body.len(), body)
         }
@@ -341,7 +353,7 @@ fn log_response_diagnostic(
     };
     
     let body_display = if response_body.len() > 2000 {
-        format!("{}... (truncated, {} bytes)", &response_body[..2000], response_body.len())
+        format!("{}... (truncated, {} bytes)", truncate_str_safe(response_body, 2000), response_body.len())
     } else {
         response_body.to_string()
     };

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
+use crate::common::truncate_with_ellipsis;
 use crate::kiro::model::requests::conversation::{
     ConversationState, CurrentMessage, HistoryAssistantMessage,
     HistoryUserMessage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
@@ -450,18 +451,22 @@ impl HistoryManager {
         for msg in history {
             let (role, content) = match msg {
                 Message::User(user_msg) => {
-                    let mut content = user_msg.user_input_message.content.clone();
-                    // 截断过长的单条消息
-                    if content.len() > 500 {
-                        content = format!("{}...", &content[..500]);
-                    }
+                    let content = user_msg.user_input_message.content.clone();
+                    // 截断过长的单条消息（使用安全截断）
+                    let content = if content.len() > 500 {
+                        truncate_with_ellipsis(&content, 500)
+                    } else {
+                        content
+                    };
                     ("user", content)
                 }
                 Message::Assistant(assistant_msg) => {
-                    let mut content = assistant_msg.assistant_response_message.content.clone();
-                    if content.len() > 500 {
-                        content = format!("{}...", &content[..500]);
-                    }
+                    let content = assistant_msg.assistant_response_message.content.clone();
+                    let content = if content.len() > 500 {
+                        truncate_with_ellipsis(&content, 500)
+                    } else {
+                        content
+                    };
                     ("assistant", content)
                 }
             };
@@ -474,9 +479,9 @@ impl HistoryManager {
     /// 生成摘要提示词
     fn build_summary_prompt(history: &[Message], max_length: usize) -> String {
         let formatted = Self::format_history_for_summary(history);
-        // 限制输入长度
+        // 限制输入长度（使用安全截断）
         let formatted = if formatted.len() > 10000 {
-            format!("{}...(truncated)", &formatted[..10000])
+            format!("{}...(truncated)", crate::common::truncate_str_safe(&formatted, 10000))
         } else {
             formatted
         };
@@ -614,9 +619,9 @@ impl HistoryManager {
         let prompt = Self::build_summary_prompt(&old_history, self.config.summary_max_length);
         match generator.generate(&prompt).await {
             Ok(mut summary) => {
-                // 限制摘要长度
+                // 限制摘要长度（使用安全截断）
                 if summary.len() > self.config.summary_max_length {
-                    summary = format!("{}...", &summary[..self.config.summary_max_length]);
+                    summary = truncate_with_ellipsis(&summary, self.config.summary_max_length);
                 }
 
                 // 缓存摘要
@@ -750,7 +755,7 @@ impl HistoryManager {
             match summary_gen.generate(&prompt).await {
                 Ok(mut summary) => {
                     if summary.len() > self.config.summary_max_length {
-                        summary = format!("{}...", &summary[..self.config.summary_max_length]);
+                        summary = truncate_with_ellipsis(&summary, self.config.summary_max_length);
                     }
 
                     // 缓存摘要
