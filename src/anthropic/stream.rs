@@ -1064,16 +1064,15 @@ impl StreamContext {
         let final_output_tokens = self.output_tokens;
         
         // 记录最终的 token 统计
-        if let Some(percentage) = self.context_usage_percentage {
-            tracing::info!(
-                message_id = %self.message_id,
-                context_usage_percentage = percentage,
-                estimated_input_tokens = self.input_tokens,
-                actual_input_tokens = final_input_tokens,
-                output_tokens = final_output_tokens,
-                "流结束，上下文使用统计"
-            );
-        }
+        tracing::info!(
+            message_id = %self.message_id,
+            context_usage_percentage = ?self.context_usage_percentage,
+            estimated_input_tokens = self.input_tokens,
+            context_input_tokens = ?self.context_input_tokens,
+            final_input_tokens = final_input_tokens,
+            final_output_tokens = final_output_tokens,
+            "流结束，返回给 Claude Code 的 usage"
+        );
 
         // 生成最终事件
         events.extend(

@@ -36,10 +36,14 @@ pub fn map_model(model: &str) -> Option<String> {
 }
 
 /// 转换结果
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ConversionResult {
     /// 转换后的 Kiro 请求
     pub conversation_state: ConversationState,
+    /// 原始历史消息（用于截断重试）
+    pub original_history: Vec<Message>,
+    /// 模型 ID
+    pub model_id: String,
 }
 
 /// 转换错误
@@ -205,9 +209,27 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .with_agent_task_type("vibe")
         .with_chat_trigger_type(chat_trigger_type)
         .with_current_message(current_message)
-        .with_history(history);
+        .with_history(history.clone());
 
-    Ok(ConversionResult { conversation_state })
+    Ok(ConversionResult {
+        conversation_state,
+        original_history: history,
+        model_id,
+    })
+}
+
+/// 使用截断后的历史重新构建 ConversationState
+///
+/// 用于内容长度超限后的截断重试
+pub fn rebuild_with_truncated_history(
+    original_result: &ConversionResult,
+    truncated_history: Vec<Message>,
+) -> ConversationState {
+    let mut new_state = original_result.conversation_state.clone();
+    new_state.history = truncated_history;
+    // 生成新的 agent_continuation_id
+    new_state.agent_continuation_id = Some(Uuid::new_v4().to_string());
+    new_state
 }
 
 /// 确定聊天触发类型

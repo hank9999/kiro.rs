@@ -26,6 +26,8 @@ use model::config::Config;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use anthropic::{HistoryStoreConfig, init_global_store, start_cleanup_task};
+
 type AppResult<T> = anyhow::Result<T>;
 
 fn init_tracing() -> Option<WorkerGuard> {
@@ -185,6 +187,20 @@ async fn run() -> AppResult<()> {
     let stats_store = StatsStore::load_or_new(stats_path.clone())
         .with_context(|| format!("加载统计失败: {:?}", stats_path))?;
     tracing::info!("统计文件: {}", stats_path.display());
+
+    // 初始化历史存储（与统计文件同目录）
+    let history_dir = stats_path.parent()
+        .map(|p| p.join("history"))
+        .unwrap_or_else(|| PathBuf::from("history"));
+    init_global_store(HistoryStoreConfig {
+        storage_dir: history_dir.clone(),
+        expire_secs: 24 * 60 * 60, // 24 小时过期
+        enabled: true,
+    });
+    tracing::info!("历史存储目录: {}", history_dir.display());
+
+    // 启动定期清理任务（每小时清理一次过期历史）
+    start_cleanup_task(Duration::from_secs(60 * 60));
 
     let first_profile_arn = credentials_list
         .first()

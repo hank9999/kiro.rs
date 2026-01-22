@@ -22,7 +22,9 @@ use uuid::Uuid;
 
 use crate::stats::StatsStore;
 
-use super::converter::{ConversionError, convert_request};
+use super::converter::{ConversionError, ConversionResult, convert_request, rebuild_with_truncated_history};
+use super::history_manager::{HistoryManager, KiroSummaryGenerator};
+use super::history_store::global_store;
 use super::middleware::AppState;
 use super::stream::{SseEvent, StreamContext};
 use super::types::{
@@ -152,9 +154,14 @@ pub async fn post_messages(
         }
     };
 
+    // 保存历史记录到文件
+    if let Err(e) = global_store().save(&session_id, conversion_result.original_history.clone()) {
+        tracing::warn!(session_id = %session_id, "保存历史记录失败: {}", e);
+    }
+
     // 构建 Kiro 请求
     let kiro_request = KiroRequest {
-        conversation_state: conversion_result.conversation_state,
+        conversation_state: conversion_result.conversation_state.clone(),
         profile_arn: state.profile_arn.clone(),
     };
 
@@ -200,11 +207,21 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             &session_id,
+            conversion_result,
         )
         .await
     } else {
         // 非流式响应
-        handle_non_stream_request(state, provider, &request_body, &payload.model, input_tokens, &session_id).await
+        handle_non_stream_request(
+            state,
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            &session_id,
+            conversion_result,
+        )
+        .await
     }
 }
 
@@ -217,165 +234,238 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     session_id: &str,
+    conversion_result: ConversionResult,
 ) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let (credential_id, response) = match provider
-        .call_api_stream_with_credential_id(request_body, Some(model))
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            let error_msg = e.to_string();
+    // 截断重试配置（带摘要支持）
+    let mut history_manager = HistoryManager::with_defaults()
+        .with_cache_key(session_id.to_string());
+    let max_retries = 2;
+    let mut retry_count = 0;
+    let mut current_history = conversion_result.original_history.clone();
+    let mut current_request_body = request_body.to_string();
 
-            // 检查是否为内容长度超限错误
-            if error_msg.starts_with("ContentLengthExceeded:") {
-                tracing::info!("检测到内容长度超限（流式），返回提示信息");
+    // 创建摘要生成器
+    let summary_generator = KiroSummaryGenerator::new(
+        provider.clone(),
+        state.profile_arn.clone(),
+    );
 
-                // 返回一个 SSE 流，包含提示信息
-                let model_clone = model.to_string();
-                let stream = stream::iter(vec![
-                    // message_start
-                    Ok::<Bytes, Infallible>(Bytes::from(format!(
-                        "event: message_start\ndata: {}\n\n",
-                        serde_json::to_string(&json!({
-                            "type": "message_start",
-                            "message": {
-                                "id": format!("msg_{}", Uuid::new_v4().simple()),
-                                "type": "message",
-                                "role": "assistant",
-                                "content": [],
-                                "model": &model_clone,
-                                "stop_reason": null,
-                                "stop_sequence": null,
-                                "usage": {
-                                    "input_tokens": input_tokens,
-                                    "output_tokens": 0
-                                }
-                            }
-                        })).unwrap()
-                    ))),
-                    // content_block_start
-                    Ok(Bytes::from(format!(
-                        "event: content_block_start\ndata: {}\n\n",
-                        serde_json::to_string(&json!({
-                            "type": "content_block_start",
-                            "index": 0,
-                            "content_block": {
-                                "type": "text",
-                                "text": ""
-                            }
-                        })).unwrap()
-                    ))),
-                    // content_block_delta
-                    Ok(Bytes::from(format!(
-                        "event: content_block_delta\ndata: {}\n\n",
-                        serde_json::to_string(&json!({
-                            "type": "content_block_delta",
-                            "index": 0,
-                            "delta": {
-                                "type": "text_delta",
-                                "text": "⚠️ 上下文长度超过限制。\n\n建议操作：\n1. 使用 /compact 命令压缩对话历史\n2. 使用 /context 查看当前上下文使用情况\n3. 考虑将长对话拆分为多个会话"
-                            }
-                        })).unwrap()
-                    ))),
-                    // content_block_stop
-                    Ok(Bytes::from(format!(
-                        "event: content_block_stop\ndata: {}\n\n",
-                        serde_json::to_string(&json!({
-                            "type": "content_block_stop",
-                            "index": 0
-                        })).unwrap()
-                    ))),
-                    // message_delta - 正常结束，返回真实的 input_tokens
-                    Ok(Bytes::from(format!(
-                        "event: message_delta\ndata: {}\n\n",
-                        serde_json::to_string(&json!({
-                            "type": "message_delta",
-                            "delta": {
-                                "stop_reason": "end_turn",
-                                "stop_sequence": null
-                            },
-                            "usage": {
-                                "input_tokens": input_tokens,
-                                "output_tokens": 100
-                            }
-                        })).unwrap()
-                    ))),
-                    // message_stop
-                    Ok(Bytes::from(format!(
-                        "event: message_stop\ndata: {}\n\n",
-                        serde_json::to_string(&json!({
-                            "type": "message_stop"
-                        })).unwrap()
-                    ))),
-                ]);
+    loop {
+        // 调用 Kiro API（支持多凭据故障转移）
+        let api_result = provider
+            .call_api_stream_with_credential_id(&current_request_body, Some(model))
+            .await;
 
-                return Response::builder()
+        match api_result {
+            Ok((credential_id, response)) => {
+                let stats = provider.stats_store();
+                let model = model.to_string();
+                let request_body_clone = current_request_body.clone();
+
+                // 创建流处理上下文
+                let mut ctx = StreamContext::new_with_thinking(model.clone(), input_tokens, thinking_enabled);
+
+                // 生成初始事件
+                let initial_events = ctx.generate_initial_events();
+
+                // 创建 SSE 流（支持流中断自动重试）
+                let stream = create_sse_stream(
+                    response,
+                    ctx,
+                    initial_events,
+                    stats,
+                    credential_id,
+                    model,
+                    provider,
+                    request_body_clone,
+                    state,
+                    session_id.to_string(),
+                );
+
+                // 返回 SSE 响应
+                return match Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "text/event-stream")
                     .header(header::CACHE_CONTROL, "no-cache")
                     .header(header::CONNECTION, "keep-alive")
                     .body(Body::from_stream(stream))
-                    .unwrap()
+                {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        tracing::error!("构建 SSE 响应失败: {}", e);
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse::new(
+                                "internal_error",
+                                format!("构建 SSE 响应失败: {}", e),
+                            )),
+                        )
+                            .into_response()
+                    }
+                };
+            }
+            Err(e) => {
+                let error_msg = e.to_string();
+
+                // 检查是否为内容长度超限错误
+                if error_msg.starts_with("ContentLengthExceeded:") {
+                    // 尝试截断重试（带摘要）
+                    if retry_count < max_retries {
+                        let (truncated_history, should_retry) = history_manager
+                            .handle_length_error_with_summary(
+                                current_history.clone(),
+                                &conversion_result.model_id,
+                                retry_count,
+                                Some(&summary_generator),
+                            )
+                            .await;
+
+                        if should_retry {
+                            tracing::info!(
+                                "内容长度超限（流式），尝试{}重试 (第 {} 次): {}",
+                                if history_manager.truncate_info().used_summary { "摘要" } else { "截断" },
+                                retry_count + 1,
+                                history_manager.truncate_info().message
+                            );
+
+                            // 修复截断后的历史消息
+                            let fixed_history =
+                                HistoryManager::fix_history_after_truncate(truncated_history);
+
+                            // 重新构建请求
+                            let new_state =
+                                rebuild_with_truncated_history(&conversion_result, fixed_history.clone());
+                            let new_request = KiroRequest {
+                                conversation_state: new_state,
+                                profile_arn: state.profile_arn.clone(),
+                            };
+
+                            match serde_json::to_string(&new_request) {
+                                Ok(body) => {
+                                    current_request_body = body;
+                                    current_history = fixed_history;
+                                    retry_count += 1;
+                                    continue;
+                                }
+                                Err(e) => {
+                                    tracing::error!("重新序列化请求失败: {}", e);
+                                }
+                            }
+                        }
+                    }
+
+                    // 截断重试失败或达到最大重试次数，返回提示信息
+                    tracing::info!("内容长度超限（流式），截断重试失败，返回提示信息");
+
+                    // 返回一个 SSE 流，包含提示信息
+                    let model_clone = model.to_string();
+                    let stream = stream::iter(vec![
+                        // message_start
+                        Ok::<Bytes, Infallible>(Bytes::from(format!(
+                            "event: message_start\ndata: {}\n\n",
+                            serde_json::to_string(&json!({
+                                "type": "message_start",
+                                "message": {
+                                    "id": format!("msg_{}", Uuid::new_v4().simple()),
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [],
+                                    "model": &model_clone,
+                                    "stop_reason": null,
+                                    "stop_sequence": null,
+                                    "usage": {
+                                        "input_tokens": input_tokens,
+                                        "output_tokens": 0
+                                    }
+                                }
+                            })).unwrap_or_default()
+                        ))),
+                        // content_block_start
+                        Ok(Bytes::from(format!(
+                            "event: content_block_start\ndata: {}\n\n",
+                            serde_json::to_string(&json!({
+                                "type": "content_block_start",
+                                "index": 0,
+                                "content_block": {
+                                    "type": "text",
+                                    "text": ""
+                                }
+                            })).unwrap_or_default()
+                        ))),
+                        // content_block_delta
+                        Ok(Bytes::from(format!(
+                            "event: content_block_delta\ndata: {}\n\n",
+                            serde_json::to_string(&json!({
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": {
+                                    "type": "text_delta",
+                                    "text": "⚠️ 上下文长度超过限制。\n\n建议操作：\n1. 使用 /compact 命令压缩对话历史\n2. 使用 /context 查看当前上下文使用情况\n3. 考虑将长对话拆分为多个会话"
+                                }
+                            })).unwrap_or_default()
+                        ))),
+                        // content_block_stop
+                        Ok(Bytes::from(format!(
+                            "event: content_block_stop\ndata: {}\n\n",
+                            serde_json::to_string(&json!({
+                                "type": "content_block_stop",
+                                "index": 0
+                            })).unwrap_or_default()
+                        ))),
+                        // message_delta
+                        Ok(Bytes::from(format!(
+                            "event: message_delta\ndata: {}\n\n",
+                            serde_json::to_string(&json!({
+                                "type": "message_delta",
+                                "delta": {
+                                    "stop_reason": "end_turn",
+                                    "stop_sequence": null
+                                },
+                                "usage": {
+                                    "input_tokens": input_tokens,
+                                    "output_tokens": 100
+                                }
+                            })).unwrap_or_default()
+                        ))),
+                        // message_stop
+                        Ok(Bytes::from(format!(
+                            "event: message_stop\ndata: {}\n\n",
+                            serde_json::to_string(&json!({
+                                "type": "message_stop"
+                            })).unwrap_or_default()
+                        ))),
+                    ]);
+
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .header(header::CACHE_CONTROL, "no-cache")
+                        .header(header::CONNECTION, "keep-alive")
+                        .body(Body::from_stream(stream))
+                        .unwrap_or_else(|e| {
+                            tracing::error!("构建 SSE 响应失败: {}", e);
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(ErrorResponse::new(
+                                    "internal_error",
+                                    format!("构建 SSE 响应失败: {}", e),
+                                )),
+                            )
+                                .into_response()
+                        });
+                }
+
+                // 其他错误返回 502
+                tracing::error!("Kiro API 调用失败: {}", error_msg);
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorResponse::new(
+                        "api_error",
+                        format!("上游 API 调用失败: {}", error_msg),
+                    )),
+                )
                     .into_response();
             }
-
-            // 其他错误返回 502
-            tracing::error!("Kiro API 调用失败: {}", error_msg);
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
-                    "api_error",
-                    format!("上游 API 调用失败: {}", error_msg),
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    let stats = provider.stats_store();
-    let model = model.to_string();
-    let request_body = request_body.to_string();
-
-    // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model.clone(), input_tokens, thinking_enabled);
-
-    // 生成初始事件
-    let initial_events = ctx.generate_initial_events();
-
-    // 创建 SSE 流（支持流中断自动重试）
-    let stream = create_sse_stream(
-        response,
-        ctx,
-        initial_events,
-        stats,
-        credential_id,
-        model,
-        provider,
-        request_body,
-        state,
-        session_id.to_string(),
-    );
-
-    // 返回 SSE 响应
-    match Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            tracing::error!("构建 SSE 响应失败: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "internal_error",
-                    format!("构建 SSE 响应失败: {}", e),
-                )),
-            )
-                .into_response()
         }
     }
 }
@@ -699,75 +789,160 @@ async fn handle_non_stream_request(
     model: &str,
     input_tokens: i32,
     session_id: &str,
+    conversion_result: ConversionResult,
 ) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let (credential_id, response) = match provider
-        .call_api_with_credential_id(request_body, Some(model))
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            let error_msg = e.to_string();
+    // 截断重试配置（带摘要支持）
+    let mut history_manager = HistoryManager::with_defaults()
+        .with_cache_key(session_id.to_string());
+    let max_retries = 2;
+    let mut retry_count = 0;
+    let mut current_history = conversion_result.original_history.clone();
+    let mut current_request_body = request_body.to_string();
 
-            // 检查是否为内容长度超限错误
-            if error_msg.starts_with("ContentLengthExceeded:") {
-                tracing::info!("检测到内容长度超限，返回提示信息");
+    // 创建摘要生成器
+    let summary_generator = KiroSummaryGenerator::new(
+        provider.clone(),
+        state.profile_arn.clone(),
+    );
 
-                // 返回一个成功的响应，包含提示信息和真实的 input_tokens
-                let response_body = json!({
-                    "id": format!("msg_{}", Uuid::new_v4().simple()),
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{
-                        "type": "text",
-                        "text": "⚠️ 上下文长度超过限制。\n\n建议操作：\n1. 使用 /compact 命令压缩对话历史\n2. 使用 /context 查看当前上下文使用情况\n3. 考虑将长对话拆分为多个会话"
-                    }],
-                    "model": model,
-                    "stop_reason": "end_turn",
-                    "stop_sequence": null,
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "output_tokens": 100
+    loop {
+        // 调用 Kiro API（支持多凭据故障转移）
+        let api_result = provider
+            .call_api_with_credential_id(&current_request_body, Some(model))
+            .await;
+
+        match api_result {
+            Ok((credential_id, response)) => {
+                let stats = provider.stats_store();
+
+                // 读取响应体
+                let body_bytes = match response.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        tracing::error!("读取响应体失败: {}", e);
+                        if let Some(s) = &stats {
+                            s.record_error(credential_id, Some(model), format!("读取响应体失败: {}", e));
+                        }
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            Json(ErrorResponse::new(
+                                "api_error",
+                                format!("读取响应失败: {}", e),
+                            )),
+                        )
+                            .into_response();
                     }
-                });
+                };
 
-                return (StatusCode::OK, Json(response_body)).into_response();
+                // 解析事件流并返回响应
+                return process_non_stream_response(
+                    body_bytes,
+                    model,
+                    input_tokens,
+                    credential_id,
+                    stats,
+                    session_id,
+                    &state,
+                )
+                .await;
             }
+            Err(e) => {
+                let error_msg = e.to_string();
 
-            // 其他错误返回 502
-            tracing::error!("Kiro API 调用失败: {}", error_msg);
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
-                    "api_error",
-                    format!("上游 API 调用失败: {}", error_msg),
-                )),
-            )
-                .into_response();
-        }
-    };
+                // 检查是否为内容长度超限错误
+                if error_msg.starts_with("ContentLengthExceeded:") {
+                    // 尝试截断重试（带摘要）
+                    if retry_count < max_retries {
+                        let (truncated_history, should_retry) = history_manager
+                            .handle_length_error_with_summary(
+                                current_history.clone(),
+                                &conversion_result.model_id,
+                                retry_count,
+                                Some(&summary_generator),
+                            )
+                            .await;
 
-    let stats = provider.stats_store();
+                        if should_retry {
+                            tracing::info!(
+                                "内容长度超限，尝试{}重试 (第 {} 次): {}",
+                                if history_manager.truncate_info().used_summary { "摘要" } else { "截断" },
+                                retry_count + 1,
+                                history_manager.truncate_info().message
+                            );
 
-    // 读取响应体
-    let body_bytes = match response.bytes().await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::error!("读取响应体失败: {}", e);
-            if let Some(s) = &stats {
-                s.record_error(credential_id, Some(model), format!("读取响应体失败: {}", e));
+                            // 修复截断后的历史消息
+                            let fixed_history =
+                                HistoryManager::fix_history_after_truncate(truncated_history);
+
+                            // 重新构建请求
+                            let new_state =
+                                rebuild_with_truncated_history(&conversion_result, fixed_history.clone());
+                            let new_request = KiroRequest {
+                                conversation_state: new_state,
+                                profile_arn: state.profile_arn.clone(),
+                            };
+
+                            match serde_json::to_string(&new_request) {
+                                Ok(body) => {
+                                    current_request_body = body;
+                                    current_history = fixed_history;
+                                    retry_count += 1;
+                                    continue;
+                                }
+                                Err(e) => {
+                                    tracing::error!("重新序列化请求失败: {}", e);
+                                }
+                            }
+                        }
+                    }
+
+                    // 截断重试失败或达到最大重试次数，返回提示信息
+                    tracing::info!("内容长度超限，截断重试失败，返回提示信息");
+                    let response_body = json!({
+                        "id": format!("msg_{}", Uuid::new_v4().simple()),
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "text",
+                            "text": "⚠️ 上下文长度超过限制。\n\n建议操作：\n1. 使用 /compact 命令压缩对话历史\n2. 使用 /context 查看当前上下文使用情况\n3. 考虑将长对话拆分为多个会话"
+                        }],
+                        "model": model,
+                        "stop_reason": "end_turn",
+                        "stop_sequence": null,
+                        "usage": {
+                            "input_tokens": input_tokens,
+                            "output_tokens": 100
+                        }
+                    });
+
+                    return (StatusCode::OK, Json(response_body)).into_response();
+                }
+
+                // 其他错误返回 502
+                tracing::error!("Kiro API 调用失败: {}", error_msg);
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorResponse::new(
+                        "api_error",
+                        format!("上游 API 调用失败: {}", error_msg),
+                    )),
+                )
+                    .into_response();
             }
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
-                    "api_error",
-                    format!("读取响应失败: {}", e),
-                )),
-            )
-                .into_response();
         }
-    };
+    }
+}
 
+/// 处理非流式响应的解析和返回
+async fn process_non_stream_response(
+    body_bytes: Bytes,
+    model: &str,
+    input_tokens: i32,
+    credential_id: u64,
+    stats: Option<Arc<StatsStore>>,
+    session_id: &str,
+    app_state: &AppState,
+) -> Response {
     // 解析事件流
     let mut decoder = EventStreamDecoder::new();
     if let Err(e) = decoder.feed(&body_bytes) {
@@ -913,7 +1088,7 @@ async fn handle_non_stream_request(
     let raw_input_tokens = context_input_tokens.unwrap_or(input_tokens);
     
     // 使用会话级别状态确保 token 一致性
-    let (consistent_input, consistent_output) = state.update_session_tokens(
+    let (consistent_input, consistent_output) = app_state.update_session_tokens(
         session_id,
         raw_input_tokens,
         output_tokens,

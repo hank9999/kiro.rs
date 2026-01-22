@@ -18,10 +18,13 @@
 
 mod converter;
 mod handlers;
+pub mod history_manager;
+pub mod history_store;
 mod middleware;
 mod router;
 mod stream;
 pub mod types;
 mod websearch;
 
+pub use history_store::{global_store, init_global_store, start_cleanup_task, HistoryStore, HistoryStoreConfig};
 pub use router::create_router_with_provider;
