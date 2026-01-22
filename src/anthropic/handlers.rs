@@ -79,11 +79,22 @@ pub async fn post_messages(
     State(state): State<AppState>,
     JsonExtractor(payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    // 从 metadata.user_id 中提取会话 ID
+    // 格式: user_xxx_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705
+    let session_id = payload
+        .metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_ref())
+        .and_then(|uid| uid.split("__session_").nth(1))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "default".to_string());
+    
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
         message_count = %payload.messages.len(),
+        session_id = %session_id,
         "Received POST /v1/messages request"
     );
     // 检查 KiroProvider 是否可用
@@ -114,7 +125,7 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        return websearch::handle_websearch_request(state, provider, &payload, input_tokens, &session_id).await;
     }
 
     // 转换请求
@@ -182,26 +193,30 @@ pub async fn post_messages(
     if payload.stream {
         // 流式响应
         handle_stream_request(
+            state,
             provider,
             &request_body,
             &payload.model,
             input_tokens,
             thinking_enabled,
+            &session_id,
         )
         .await
     } else {
         // 非流式响应
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens).await
+        handle_non_stream_request(state, provider, &request_body, &payload.model, input_tokens, &session_id).await
     }
 }
 
 /// 处理流式请求
 async fn handle_stream_request(
+    state: AppState,
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
+    session_id: &str,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let (credential_id, response) = match provider
@@ -337,6 +352,8 @@ async fn handle_stream_request(
         model,
         provider,
         request_body,
+        state,
+        session_id.to_string(),
     );
 
     // 返回 SSE 响应
@@ -391,6 +408,10 @@ struct StreamState {
     provider: Arc<crate::kiro::provider::KiroProvider>,
     request_body: String,
     retry_count: usize,
+    /// 应用状态，用于跨请求维护 token 一致性
+    app_state: AppState,
+    /// 会话 ID，用于隔离不同 Claude Code 会话
+    session_id: String,
 }
 
 /// 创建 SSE 事件流（支持流中断自动重试）
@@ -403,6 +424,8 @@ fn create_sse_stream(
     model: String,
     provider: Arc<crate::kiro::provider::KiroProvider>,
     request_body: String,
+    app_state: AppState,
+    session_id: String,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -426,6 +449,8 @@ fn create_sse_stream(
         provider,
         request_body,
         retry_count: 0,
+        app_state,
+        session_id,
     };
 
     let processing_stream = stream::unfold(state, |mut state| async move {
@@ -556,16 +581,25 @@ fn create_sse_stream(
                             s.record_error(state.credential_id, Some(&state.model), format!("读取上游响应流失败: {}", e));
                         }
 
+                        // 使用会话级别状态确保 token 一致性（只增不减）
+                        let raw_input_tokens = state.ctx.context_input_tokens.unwrap_or(state.ctx.input_tokens);
+                        let (consistent_input, consistent_output) = state.app_state.update_session_tokens(
+                            &state.session_id,
+                            raw_input_tokens,
+                            state.ctx.output_tokens,
+                        );
+                        state.ctx.context_input_tokens = Some(consistent_input);
+                        state.ctx.output_tokens = consistent_output;
+
                         let final_events = state.ctx.generate_final_events();
 
                         // 记录用量（即使流中断，也尽量把已输出部分计入）
                         if let Some(s) = &state.stats {
-                            let final_input_tokens = state.ctx.context_input_tokens.unwrap_or(state.ctx.input_tokens);
                             s.add_usage(
                                 state.credential_id,
                                 Some(&state.model),
-                                final_input_tokens as i64,
-                                state.ctx.output_tokens as i64,
+                                consistent_input as i64,
+                                consistent_output as i64,
                             );
                         }
 
@@ -605,17 +639,26 @@ fn create_sse_stream(
                             "上游响应流结束（EOF）"
                         );
 
+                        // 使用会话级别状态确保 token 一致性（只增不减）
+                        let raw_input_tokens = state.ctx.context_input_tokens.unwrap_or(state.ctx.input_tokens);
+                        let (consistent_input, consistent_output) = state.app_state.update_session_tokens(
+                            &state.session_id,
+                            raw_input_tokens,
+                            state.ctx.output_tokens,
+                        );
+                        state.ctx.context_input_tokens = Some(consistent_input);
+                        state.ctx.output_tokens = consistent_output;
+
                         let final_events = state.ctx.generate_final_events();
 
                         // 正常结束：记录成功 + 用量
                         if let Some(s) = &state.stats {
                             s.record_success(state.credential_id, Some(&state.model));
-                            let final_input_tokens = state.ctx.context_input_tokens.unwrap_or(state.ctx.input_tokens);
                             s.add_usage(
                                 state.credential_id,
                                 Some(&state.model),
-                                final_input_tokens as i64,
-                                state.ctx.output_tokens as i64,
+                                consistent_input as i64,
+                                consistent_output as i64,
                             );
                         }
 
@@ -644,12 +687,17 @@ fn create_sse_stream(
 /// 上下文窗口大小（200k tokens）
 const CONTEXT_WINDOW_SIZE: i32 = 200_000;
 
+/// 触发自动压缩的上下文使用率阈值（百分比）
+const AUTO_COMPACT_THRESHOLD: f64 = 85.0;
+
 /// 处理非流式请求
 async fn handle_non_stream_request(
+    state: AppState,
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    session_id: &str,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let (credential_id, response) = match provider
@@ -799,7 +847,20 @@ async fn handle_non_stream_request(
                                 * (CONTEXT_WINDOW_SIZE as f64)
                                 / 100.0)
                                 as i32;
+                            
+                            // 直接使用远程返回的上下文使用率计算的 input_tokens
+                            // 不再强制只增不减，因为 /compact 后上下文会变小
                             context_input_tokens = Some(actual_input_tokens);
+                            
+                            // 记录上下文使用情况
+                            if context_usage.context_usage_percentage >= AUTO_COMPACT_THRESHOLD {
+                                tracing::info!(
+                                    "上下文使用率 {:.1}% 超过阈值 {:.1}%",
+                                    context_usage.context_usage_percentage,
+                                    AUTO_COMPACT_THRESHOLD
+                                );
+                            }
+                            
                             tracing::debug!(
                                 "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
                                 context_usage.context_usage_percentage,
@@ -807,9 +868,7 @@ async fn handle_non_stream_request(
                             );
                         }
                         Event::Exception { exception_type, .. } => {
-                            if exception_type == "ContentLengthExceededException" {
-                                stop_reason = "max_tokens".to_string();
-                            }
+                            tracing::warn!("收到异常事件: {}", exception_type);
                         }
                         _ => {}
                     },
@@ -853,7 +912,14 @@ async fn handle_non_stream_request(
     let output_tokens = token::estimate_output_tokens(&content);
 
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-    let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    let raw_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    
+    // 使用会话级别状态确保 token 一致性
+    let (consistent_input, consistent_output) = state.update_session_tokens(
+        session_id,
+        raw_input_tokens,
+        output_tokens,
+    );
 
     // 记录成功 + 用量（按最终使用的凭据归集）
     if let Some(s) = &stats {
@@ -861,8 +927,8 @@ async fn handle_non_stream_request(
         s.add_usage(
             credential_id,
             Some(model),
-            final_input_tokens as i64,
-            output_tokens as i64,
+            consistent_input as i64,
+            consistent_output as i64,
         );
     }
 
@@ -876,8 +942,8 @@ async fn handle_non_stream_request(
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
+            "input_tokens": consistent_input,
+            "output_tokens": consistent_output
         }
     });
 

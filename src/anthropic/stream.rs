@@ -277,11 +277,6 @@ impl SseStateManager {
         self.has_tool_use = has;
     }
 
-    /// 设置 stop_reason
-    pub fn set_stop_reason(&mut self, reason: impl Into<String>) {
-        self.stop_reason = Some(reason.into());
-    }
-
     /// 获取最终的 stop_reason
     pub fn get_stop_reason(&self) -> String {
         if let Some(ref reason) = self.stop_reason {
@@ -449,6 +444,10 @@ impl SseStateManager {
 /// 上下文窗口大小（200k tokens）
 const CONTEXT_WINDOW_SIZE: i32 = 200_000;
 
+/// 触发自动压缩的上下文使用率阈值（百分比）
+/// 当 contextUsagePercentage 超过此值时记录日志
+const AUTO_COMPACT_THRESHOLD: f64 = 85.0;
+
 /// 流处理上下文
 pub struct StreamContext {
     /// SSE 状态管理器
@@ -461,6 +460,8 @@ pub struct StreamContext {
     pub input_tokens: i32,
     /// 从 contextUsageEvent 计算的实际输入 tokens
     pub context_input_tokens: Option<i32>,
+    /// 上下文使用百分比（从 contextUsageEvent 获取）
+    pub context_usage_percentage: Option<f64>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
@@ -496,6 +497,7 @@ impl StreamContext {
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_tokens,
             context_input_tokens: None,
+            context_usage_percentage: None,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
             tool_names: HashMap::new(),
@@ -574,12 +576,28 @@ impl StreamContext {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(context_usage) => {
+                // 保存上下文使用百分比
+                self.context_usage_percentage = Some(context_usage.context_usage_percentage);
+                
                 // 从上下文使用百分比计算实际的 input_tokens
                 // 公式: percentage * 200000 / 100 = percentage * 2000
                 let actual_input_tokens = (context_usage.context_usage_percentage
                     * (CONTEXT_WINDOW_SIZE as f64)
                     / 100.0) as i32;
+                
+                // 直接使用远程返回的上下文使用率计算的 input_tokens
+                // 不再强制只增不减，因为 /compact 后上下文会变小
                 self.context_input_tokens = Some(actual_input_tokens);
+                
+                // 记录上下文使用情况
+                if context_usage.context_usage_percentage >= AUTO_COMPACT_THRESHOLD {
+                    tracing::info!(
+                        "上下文使用率 {:.1}% 超过阈值 {:.1}%",
+                        context_usage.context_usage_percentage,
+                        AUTO_COMPACT_THRESHOLD
+                    );
+                }
+                
                 tracing::debug!(
                     "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
                     context_usage.context_usage_percentage,
@@ -598,10 +616,6 @@ impl StreamContext {
                 exception_type,
                 message,
             } => {
-                // 处理 ContentLengthExceededException
-                if exception_type == "ContentLengthExceededException" {
-                    self.state_manager.set_stop_reason("max_tokens");
-                }
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
                 Vec::new()
             }
@@ -1040,11 +1054,24 @@ impl StreamContext {
 
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        let final_output_tokens = self.output_tokens;
+        
+        // 记录最终的 token 统计
+        if let Some(percentage) = self.context_usage_percentage {
+            tracing::info!(
+                message_id = %self.message_id,
+                context_usage_percentage = percentage,
+                estimated_input_tokens = self.input_tokens,
+                actual_input_tokens = final_input_tokens,
+                output_tokens = final_output_tokens,
+                "流结束，上下文使用统计"
+            );
+        }
 
         // 生成最终事件
         events.extend(
             self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens),
+                .generate_final_events(final_input_tokens, final_output_tokens),
         );
         events
     }
