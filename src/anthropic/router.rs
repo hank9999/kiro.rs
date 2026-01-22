@@ -34,17 +34,22 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// - `kiro_provider`: 可选的 KiroProvider，用于调用上游 API
 
 /// 创建带有 KiroProvider 的 Anthropic API 路由
+/// 返回 (Router, AppState) 以便其他模块访问 AppState
 pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
     profile_arn: Option<String>,
-) -> Router {
+    summary_model: Option<String>,
+) -> (Router, AppState) {
     let mut state = AppState::new(api_key);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
     if let Some(arn) = profile_arn {
         state = state.with_profile_arn(arn);
+    }
+    if let Some(model) = summary_model {
+        state = state.with_summary_model(model);
     }
 
     // 需要认证的 /v1 路由
@@ -57,9 +62,11 @@ pub fn create_router_with_provider(
             auth_middleware,
         ));
 
-    Router::new()
+    let router = Router::new()
         .nest("/v1", v1_routes)
         .layer(cors_layer())
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
-        .with_state(state)
+        .with_state(state.clone());
+
+    (router, state)
 }

@@ -125,3 +125,28 @@ export async function resetAllStats(): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>('/stats/reset')
   return data
 }
+
+// ===== 摘要模型设置 =====
+
+export interface SummaryModelResponse {
+  currentModel: string
+  availableModels: string[]
+}
+
+export interface SetSummaryModelRequest {
+  model: string
+}
+
+// 获取摘要模型设置
+export async function getSummaryModel(): Promise<SummaryModelResponse> {
+  const { data } = await api.get<SummaryModelResponse>('/settings/summary-model')
+  return data
+}
+
+// 设置摘要模型
+export async function setSummaryModel(model: string): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/settings/summary-model', {
+    model,
+  } as SetSummaryModelRequest)
+  return data
+}

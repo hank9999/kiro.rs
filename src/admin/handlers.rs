@@ -10,7 +10,8 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, CredentialAccountInfoResponse, SetDisabledRequest,
-        SetEnabledModelsRequest, SetPriorityRequest, SuccessResponse,
+        SetEnabledModelsRequest, SetPriorityRequest, SetSummaryModelRequest,
+        SummaryModelResponse, SuccessResponse, AVAILABLE_SUMMARY_MODELS,
     },
 };
 
@@ -161,5 +162,60 @@ pub async fn add_credential(
     match state.service.add_credential(payload).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/settings/summary-model
+/// 获取当前摘要模型设置
+pub async fn get_summary_model(State(state): State<AdminState>) -> impl IntoResponse {
+    let current_model = state
+        .app_state
+        .as_ref()
+        .map(|s| s.get_summary_model())
+        .unwrap_or_else(|| "claude-sonnet-4.5".to_string());
+
+    Json(SummaryModelResponse {
+        current_model,
+        available_models: AVAILABLE_SUMMARY_MODELS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    })
+}
+
+/// POST /api/admin/settings/summary-model
+/// 设置摘要模型
+pub async fn set_summary_model(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetSummaryModelRequest>,
+) -> impl IntoResponse {
+    // 验证模型是否在允许列表中
+    if !AVAILABLE_SUMMARY_MODELS.contains(&payload.model.as_str()) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(format!(
+                "不支持的模型: {}，可用模型: {:?}",
+                payload.model, AVAILABLE_SUMMARY_MODELS
+            ))),
+        )
+            .into_response();
+    }
+
+    // 设置模型
+    if let Some(app_state) = &state.app_state {
+        app_state.set_summary_model(&payload.model);
+        Json(SuccessResponse::new(format!(
+            "摘要模型已设置为: {}",
+            payload.model
+        )))
+        .into_response()
+    } else {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(super::types::AdminErrorResponse::internal_error(
+                "AppState 未配置",
+            )),
+        )
+            .into_response()
     }
 }

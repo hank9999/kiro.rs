@@ -892,10 +892,12 @@ impl HistoryManager {
 
 /// Kiro API 摘要生成器
 ///
-/// 使用 Kiro API 调用 claude-sonnet-4.5 生成摘要
+/// 使用 Kiro API 调用指定模型生成摘要
 pub struct KiroSummaryGenerator {
     provider: Arc<crate::kiro::provider::KiroProvider>,
     profile_arn: String,
+    /// 摘要使用的模型（默认 claude-sonnet-4.5）
+    model: String,
 }
 
 impl KiroSummaryGenerator {
@@ -907,7 +909,14 @@ impl KiroSummaryGenerator {
         Self {
             provider,
             profile_arn: profile_arn.unwrap_or_default(),
+            model: "claude-sonnet-4.5".to_string(),
         }
+    }
+
+    /// 设置摘要使用的模型
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
     }
 }
 
@@ -915,7 +924,7 @@ impl KiroSummaryGenerator {
 impl SummaryGenerator for KiroSummaryGenerator {
     async fn generate(&self, prompt: &str) -> anyhow::Result<String> {
         // 构建简单的摘要请求
-        let user_input = UserInputMessage::new(prompt.to_string(), "claude-sonnet-4.5")
+        let user_input = UserInputMessage::new(prompt.to_string(), &self.model)
             .with_context(UserInputMessageContext::new())
             .with_origin("AI_EDITOR");
 
@@ -937,7 +946,7 @@ impl SummaryGenerator for KiroSummaryGenerator {
         // 调用 Kiro API（非流式）
         let response = self
             .provider
-            .call_api_with_credential_id(&request_body, Some("claude-sonnet-4.5"))
+            .call_api_with_credential_id(&request_body, Some(&self.model))
             .await
             .map_err(|e| anyhow::anyhow!("Kiro API 调用失败: {}", e))?;
 

@@ -158,6 +158,8 @@ pub struct AppState {
     pub profile_arn: Option<String>,
     /// 会话 token 管理器（按会话 ID 隔离）
     pub session_tokens: Arc<SessionTokenManager>,
+    /// 智能摘要使用的模型
+    pub summary_model: Arc<std::sync::RwLock<String>>,
 }
 
 impl AppState {
@@ -168,6 +170,7 @@ impl AppState {
             kiro_provider: None,
             profile_arn: None,
             session_tokens: Arc::new(SessionTokenManager::default()),
+            summary_model: Arc::new(std::sync::RwLock::new("claude-sonnet-4.5".to_string())),
         }
     }
 
@@ -181,6 +184,27 @@ impl AppState {
     pub fn with_profile_arn(mut self, arn: impl Into<String>) -> Self {
         self.profile_arn = Some(arn.into());
         self
+    }
+
+    /// 设置摘要模型
+    pub fn with_summary_model(mut self, model: impl Into<String>) -> Self {
+        self.summary_model = Arc::new(std::sync::RwLock::new(model.into()));
+        self
+    }
+
+    /// 获取当前摘要模型
+    pub fn get_summary_model(&self) -> String {
+        self.summary_model
+            .read()
+            .map(|m| m.clone())
+            .unwrap_or_else(|_| "claude-sonnet-4.5".to_string())
+    }
+
+    /// 设置摘要模型（运行时）
+    pub fn set_summary_model(&self, model: impl Into<String>) {
+        if let Ok(mut m) = self.summary_model.write() {
+            *m = model.into();
+        }
     }
     
     /// 更新会话的 token 统计，返回一致的值（只增不减）

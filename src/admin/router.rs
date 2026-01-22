@@ -8,9 +8,9 @@ use axum::{
 use super::{
     handlers::{
         add_credential, delete_credential, get_all_credentials, get_credential_account_info,
-        get_credential_balance, get_credential_stats, reset_all_stats, reset_credential_stats,
-        reset_failure_count, set_credential_disabled, set_credential_enabled_models,
-        set_credential_priority,
+        get_credential_balance, get_credential_stats, get_summary_model, reset_all_stats,
+        reset_credential_stats, reset_failure_count, set_credential_disabled,
+        set_credential_enabled_models, set_credential_priority, set_summary_model,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -25,6 +25,8 @@ use super::{
 /// - `POST /credentials/:id/priority` - 设置凭据优先级
 /// - `POST /credentials/:id/reset` - 重置失败计数
 /// - `GET /credentials/:id/balance` - 获取凭据余额
+/// - `GET /settings/summary-model` - 获取摘要模型设置
+/// - `POST /settings/summary-model` - 设置摘要模型
 ///
 /// # 认证
 /// 需要 Admin API Key 认证，支持：
@@ -46,6 +48,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/stats", get(get_credential_stats))
         .route("/credentials/{id}/stats/reset", post(reset_credential_stats))
         .route("/stats/reset", post(reset_all_stats))
+        .route(
+            "/settings/summary-model",
+            get(get_summary_model).post(set_summary_model),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

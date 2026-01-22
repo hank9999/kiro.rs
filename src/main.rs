@@ -254,10 +254,11 @@ async fn run() -> AppResult<()> {
     });
 
     // 构建 Anthropic API 路由
-    let anthropic_app = anthropic::create_router_with_provider(
+    let (anthropic_app, app_state) = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),
         first_profile_arn,
+        Some(config.summary_model.clone()),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -274,7 +275,8 @@ async fn run() -> AppResult<()> {
             anthropic_app
         } else {
             let admin_service = admin::AdminService::new(token_manager.clone(), Some(stats_store.clone()));
-            let admin_state = admin::AdminState::new(admin_key, admin_service);
+            let admin_state = admin::AdminState::new(admin_key, admin_service)
+                .with_app_state(app_state);
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由

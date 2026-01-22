@@ -279,3 +279,30 @@ impl AdminErrorResponse {
         Self::new("internal_error", message)
     }
 }
+
+// ============ 摘要模型设置 ============
+
+/// 可用的摘要模型列表
+pub const AVAILABLE_SUMMARY_MODELS: &[&str] = &[
+    "claude-sonnet-4.5",
+    "claude-sonnet-4",
+    "claude-haiku-4.5",
+];
+
+/// 获取摘要模型响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryModelResponse {
+    /// 当前摘要模型
+    pub current_model: String,
+    /// 可用的模型列表
+    pub available_models: Vec<String>,
+}
+
+/// 设置摘要模型请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSummaryModelRequest {
+    /// 要设置的模型 ID
+    pub model: String,
+}

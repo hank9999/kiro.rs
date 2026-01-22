@@ -244,11 +244,12 @@ async fn handle_stream_request(
     let mut current_history = conversion_result.original_history.clone();
     let mut current_request_body = request_body.to_string();
 
-    // 创建摘要生成器
+    // 创建摘要生成器（使用配置的模型）
+    let summary_model = state.get_summary_model();
     let summary_generator = KiroSummaryGenerator::new(
         provider.clone(),
         state.profile_arn.clone(),
-    );
+    ).with_model(&summary_model);
 
     loop {
         // 调用 Kiro API（支持多凭据故障转移）
@@ -799,11 +800,12 @@ async fn handle_non_stream_request(
     let mut current_history = conversion_result.original_history.clone();
     let mut current_request_body = request_body.to_string();
 
-    // 创建摘要生成器
+    // 创建摘要生成器（使用配置的模型）
+    let summary_model = state.get_summary_model();
     let summary_generator = KiroSummaryGenerator::new(
         provider.clone(),
         state.profile_arn.clone(),
-    );
+    ).with_model(&summary_model);
 
     loop {
         // 调用 Kiro API（支持多凭据故障转移）

@@ -12,6 +12,8 @@ import {
   getCredentialStats,
   resetCredentialStats,
   resetAllStats,
+  getSummaryModel,
+  setSummaryModel,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -166,6 +168,28 @@ export function useResetAllStats() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
       queryClient.invalidateQueries({ queryKey: ['credential-stats'] })
+    },
+  })
+}
+
+// ===== 摘要模型设置 =====
+
+// 查询摘要模型设置
+export function useSummaryModel() {
+  return useQuery({
+    queryKey: ['summary-model'],
+    queryFn: getSummaryModel,
+    staleTime: 5 * 60 * 1000, // 5 分钟内不重新请求
+  })
+}
+
+// 设置摘要模型
+export function useSetSummaryModel() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (model: string) => setSummaryModel(model),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['summary-model'] })
     },
   })
 }

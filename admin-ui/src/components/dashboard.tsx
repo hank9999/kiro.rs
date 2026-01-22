@@ -9,6 +9,7 @@ import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
+import { SummaryModelSetting } from '@/components/summary-model-setting'
 import { useCredentials, useResetAllStats, useCredentialAccountInfo } from '@/hooks/use-credentials'
 import { formatExpiry, formatTokensPair } from '@/lib/format'
 
@@ -316,6 +317,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
               )}
             </CardContent>
           </Card>
+        </div>
+
+        {/* 设置区域 */}
+        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 mb-6">
+          <SummaryModelSetting />
         </div>
 
         {/* 凭据列表 */}
