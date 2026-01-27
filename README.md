@@ -26,11 +26,25 @@
 
 ## 支持的 API 端点
 
+### 标准端点 (/v1)
+
 | 端点 | 方法 | 描述          |
 |------|------|-------------|
 | `/v1/models` | GET | 获取可用模型列表    |
 | `/v1/messages` | POST | 创建消息（对话）    |
 | `/v1/messages/count_tokens` | POST | 估算 Token 数量 |
+
+### Claude Code 兼容端点 (/cc/v1)
+
+| 端点 | 方法 | 描述          |
+|------|------|-------------|
+| `/cc/v1/messages` | POST | 创建消息（流式响应会等待上游完成后再返回，确保 `input_tokens` 准确） |
+| `/cc/v1/messages/count_tokens` | POST | 估算 Token 数量（与 `/v1` 相同） |
+
+> **`/cc/v1/messages` 与 `/v1/messages` 的区别**：
+> - `/v1/messages`：实时流式返回，`message_start` 中的 `input_tokens` 是估算值
+> - `/cc/v1/messages`：缓冲模式，等待上游流完成后，用从 `contextUsageEvent` 计算的准确 `input_tokens` 更正 `message_start`，然后一次性返回所有事件
+> - 等待期间会每 25 秒发送 `ping` 事件保活
 
 ## 快速开始
 

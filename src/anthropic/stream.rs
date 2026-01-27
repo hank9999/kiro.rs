@@ -1013,6 +1013,94 @@ impl StreamContext {
     }
 }
 
+/// 缓冲流处理上下文 - 用于 /cc/v1/messages 流式请求
+///
+/// 与 `StreamContext` 不同，此上下文会缓冲所有事件直到流结束，
+/// 然后用从 `contextUsageEvent` 计算的正确 `input_tokens` 更正 `message_start` 事件。
+///
+/// 工作流程：
+/// 1. 使用 `StreamContext` 正常处理所有 Kiro 事件
+/// 2. 把生成的 SSE 事件缓存起来（而不是立即发送）
+/// 3. 流结束时，找到 `message_start` 事件并更新其 `input_tokens`
+/// 4. 一次性返回所有事件
+pub struct BufferedStreamContext {
+    /// 内部流处理上下文（复用现有的事件处理逻辑）
+    inner: StreamContext,
+    /// 缓冲的所有事件（包括 message_start、content_block_start 等）
+    event_buffer: Vec<SseEvent>,
+    /// 估算的 input_tokens（用于回退）
+    estimated_input_tokens: i32,
+    /// 是否已经生成了初始事件
+    initial_events_generated: bool,
+}
+
+impl BufferedStreamContext {
+    /// 创建缓冲流上下文
+    pub fn new(model: impl Into<String>, estimated_input_tokens: i32, thinking_enabled: bool) -> Self {
+        let inner = StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled);
+        Self {
+            inner,
+            event_buffer: Vec::new(),
+            estimated_input_tokens,
+            initial_events_generated: false,
+        }
+    }
+
+    /// 处理 Kiro 事件并缓冲结果
+    ///
+    /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
+    pub fn process_and_buffer(&mut self, event: &crate::kiro::model::events::Event) {
+        // 首次处理事件时，先生成初始事件（message_start 等）
+        if !self.initial_events_generated {
+            let initial_events = self.inner.generate_initial_events();
+            self.event_buffer.extend(initial_events);
+            self.initial_events_generated = true;
+        }
+
+        // 处理事件并缓冲结果
+        let events = self.inner.process_kiro_event(event);
+        self.event_buffer.extend(events);
+    }
+
+    /// 完成流处理并返回所有事件
+    ///
+    /// 此方法会：
+    /// 1. 生成最终事件（message_delta, message_stop）
+    /// 2. 用正确的 input_tokens 更正 message_start 事件
+    /// 3. 返回所有缓冲的事件
+    pub fn finish_and_get_all_events(&mut self) -> Vec<SseEvent> {
+        // 如果从未处理过事件，也要生成初始事件
+        if !self.initial_events_generated {
+            let initial_events = self.inner.generate_initial_events();
+            self.event_buffer.extend(initial_events);
+            self.initial_events_generated = true;
+        }
+
+        // 生成最终事件
+        let final_events = self.inner.generate_final_events();
+        self.event_buffer.extend(final_events);
+
+        // 获取正确的 input_tokens
+        let final_input_tokens = self
+            .inner
+            .context_input_tokens
+            .unwrap_or(self.estimated_input_tokens);
+
+        // 更正 message_start 事件中的 input_tokens
+        for event in &mut self.event_buffer {
+            if event.event == "message_start" {
+                if let Some(message) = event.data.get_mut("message") {
+                    if let Some(usage) = message.get_mut("usage") {
+                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                    }
+                }
+            }
+        }
+
+        std::mem::take(&mut self.event_buffer)
+    }
+}
+
 /// 简单的 token 估算
 fn estimate_tokens(text: &str) -> i32 {
     let chars: Vec<char> = text.chars().collect();
