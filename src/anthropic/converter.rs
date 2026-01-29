@@ -149,13 +149,18 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let mut tools = convert_tools(&req.tools);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let history = build_history(req, &model_id)?;
+    let mut history = build_history(req, &model_id)?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
-    let validated_tool_results = validate_tool_pairing(&history, &tool_results);
+    // 同时返回孤立的 tool_use_id 集合，用于后续清理
+    let (validated_tool_results, orphaned_tool_use_ids) =
+        validate_tool_pairing(&history, &tool_results);
 
-    // 9. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
+    // 9. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
+    remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
+
+    // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
     // 注意：Kiro 匹配工具名称时忽略大小写，所以这里也需要忽略大小写比较
     let history_tool_names = collect_history_tool_names(&history);
@@ -170,7 +175,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         }
     }
 
-    // 10. 构建 UserInputMessageContext
+    // 11. 构建 UserInputMessageContext
     let mut context = UserInputMessageContext::new();
     if !tools.is_empty() {
         context = context.with_tools(tools);
@@ -179,7 +184,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         context = context.with_tool_results(validated_tool_results);
     }
 
-    // 11. 构建当前消息
+    // 12. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
     let content = text_content;
 
@@ -193,7 +198,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     let current_message = CurrentMessage::new(user_input);
 
-    // 12. 构建 ConversationState
+    // 13. 构建 ConversationState
     let conversation_state = ConversationState::new(conversation_id)
         .with_agent_continuation_id(agent_continuation_id)
         .with_agent_task_type("vibe")
@@ -307,8 +312,11 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
 /// * `tool_results` - 当前消息中的 tool_result 列表
 ///
 /// # Returns
-/// 经过验证和过滤后的 tool_result 列表
-fn validate_tool_pairing(history: &[Message], tool_results: &[ToolResult]) -> Vec<ToolResult> {
+/// 元组：(经过验证和过滤后的 tool_result 列表, 孤立的 tool_use_id 集合)
+fn validate_tool_pairing(
+    history: &[Message],
+    tool_results: &[ToolResult],
+) -> (Vec<ToolResult>, std::collections::HashSet<String>) {
     use std::collections::HashSet;
 
     // 1. 收集所有历史中的 tool_use_id
@@ -370,12 +378,50 @@ fn validate_tool_pairing(history: &[Message], tool_results: &[ToolResult]) -> Ve
     // 5. 检测真正孤立的 tool_use（有 tool_use 但在历史和当前消息中都没有 tool_result）
     for orphaned_id in &unpaired_tool_use_ids {
         tracing::warn!(
-            "检测到孤立的 tool_use：找不到对应的 tool_result，tool_use_id={}",
+            "检测到孤立的 tool_use：找不到对应的 tool_result，将从历史中移除，tool_use_id={}",
             orphaned_id
         );
     }
 
-    filtered_results
+    (filtered_results, unpaired_tool_use_ids)
+}
+
+/// 从历史消息中移除孤立的 tool_use
+///
+/// Kiro API 要求每个 tool_use 必须有对应的 tool_result，否则返回 400 Bad Request。
+/// 此函数遍历历史中的 assistant 消息，移除没有对应 tool_result 的 tool_use。
+///
+/// # Arguments
+/// * `history` - 可变的历史消息列表
+/// * `orphaned_ids` - 需要移除的孤立 tool_use_id 集合
+fn remove_orphaned_tool_uses(
+    history: &mut [Message],
+    orphaned_ids: &std::collections::HashSet<String>,
+) {
+    if orphaned_ids.is_empty() {
+        return;
+    }
+
+    for msg in history.iter_mut() {
+        if let Message::Assistant(assistant_msg) = msg {
+            if let Some(ref mut tool_uses) =
+                assistant_msg.assistant_response_message.tool_uses
+            {
+                let original_len = tool_uses.len();
+                tool_uses.retain(|tu| !orphaned_ids.contains(&tu.tool_use_id));
+
+                // 如果移除后为空，设置为 None
+                if tool_uses.is_empty() {
+                    assistant_msg.assistant_response_message.tool_uses = None;
+                } else if tool_uses.len() != original_len {
+                    tracing::debug!(
+                        "从 assistant 消息中移除了 {} 个孤立的 tool_use",
+                        original_len - tool_uses.len()
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// 转换工具定义
@@ -877,7 +923,7 @@ mod tests {
 
         let tool_results = vec![ToolResult::success("orphan-123", "some result")];
 
-        let filtered = validate_tool_pairing(&history, &tool_results);
+        let (filtered, _) = validate_tool_pairing(&history, &tool_results);
 
         // 孤立的 tool_result 应该被过滤掉
         assert!(filtered.is_empty(), "孤立的 tool_result 应该被过滤");
@@ -907,11 +953,12 @@ mod tests {
         // 没有 tool_result
         let tool_results: Vec<ToolResult> = vec![];
 
-        let filtered = validate_tool_pairing(&history, &tool_results);
+        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
 
         // 结果应该为空（因为没有 tool_result）
-        // 同时应该输出警告日志（孤立的 tool_use）
+        // 同时应该返回孤立的 tool_use_id
         assert!(filtered.is_empty());
+        assert!(orphaned.contains("tool-orphan"));
     }
 
     #[test]
@@ -937,11 +984,12 @@ mod tests {
 
         let tool_results = vec![ToolResult::success("tool-1", "file content")];
 
-        let filtered = validate_tool_pairing(&history, &tool_results);
+        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
 
-        // 配对成功，应该保留
+        // 配对成功，应该保留，无孤立
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].tool_use_id, "tool-1");
+        assert!(orphaned.is_empty());
     }
 
     #[test]
@@ -968,12 +1016,13 @@ mod tests {
             ToolResult::success("tool-3", "orphan result"), // 孤立
         ];
 
-        let filtered = validate_tool_pairing(&history, &tool_results);
+        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
 
         // 只有 tool-1 应该保留
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].tool_use_id, "tool-1");
         // tool-2 是孤立的 tool_use（无 result），tool-3 是孤立的 tool_result
+        assert!(orphaned.contains("tool-2"));
     }
 
     #[test]
@@ -1015,11 +1064,12 @@ mod tests {
         // 当前消息没有 tool_results（用户只是继续对话）
         let tool_results: Vec<ToolResult> = vec![];
 
-        let filtered = validate_tool_pairing(&history, &tool_results);
+        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
 
-        // 结果应该为空，且不应该有孤立 tool_use 的警告
+        // 结果应该为空，且不应该有孤立 tool_use
         // 因为 tool-1 已经在历史中配对了
         assert!(filtered.is_empty());
+        assert!(orphaned.is_empty());
     }
 
     #[test]
@@ -1056,7 +1106,7 @@ mod tests {
         // 当前消息又发送了相同的 tool_result（重复）
         let tool_results = vec![ToolResult::success("tool-1", "file content again")];
 
-        let filtered = validate_tool_pairing(&history, &tool_results);
+        let (filtered, _) = validate_tool_pairing(&history, &tool_results);
 
         // 重复的 tool_result 应该被过滤掉
         assert!(filtered.is_empty(), "重复的 tool_result 应该被过滤");
@@ -1125,5 +1175,78 @@ mod tests {
             .expect("应该有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_02XYZ");
+    }
+
+    #[test]
+    fn test_remove_orphaned_tool_uses() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        // 测试从历史中移除孤立的 tool_use
+        let mut assistant_msg = AssistantMessage::new("I'll use multiple tools.");
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({})),
+            ToolUseEntry::new("tool-2", "write").with_input(serde_json::json!({})),
+            ToolUseEntry::new("tool-3", "delete").with_input(serde_json::json!({})),
+        ]);
+
+        let mut history = vec![
+            Message::User(HistoryUserMessage::new("Do something", "claude-sonnet-4.5")),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: assistant_msg,
+            }),
+        ];
+
+        // 移除 tool-1 和 tool-3
+        let mut orphaned = std::collections::HashSet::new();
+        orphaned.insert("tool-1".to_string());
+        orphaned.insert("tool-3".to_string());
+
+        remove_orphaned_tool_uses(&mut history, &orphaned);
+
+        // 验证只剩下 tool-2
+        if let Message::Assistant(ref assistant_msg) = history[1] {
+            let tool_uses = assistant_msg
+                .assistant_response_message
+                .tool_uses
+                .as_ref()
+                .expect("应该还有 tool_uses");
+            assert_eq!(tool_uses.len(), 1);
+            assert_eq!(tool_uses[0].tool_use_id, "tool-2");
+        } else {
+            panic!("应该是 Assistant 消息");
+        }
+    }
+
+    #[test]
+    fn test_remove_orphaned_tool_uses_all_removed() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        // 测试移除所有 tool_use 后，tool_uses 变为 None
+        let mut assistant_msg = AssistantMessage::new("I'll use a tool.");
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({})),
+        ]);
+
+        let mut history = vec![
+            Message::User(HistoryUserMessage::new("Do something", "claude-sonnet-4.5")),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: assistant_msg,
+            }),
+        ];
+
+        let mut orphaned = std::collections::HashSet::new();
+        orphaned.insert("tool-1".to_string());
+
+        remove_orphaned_tool_uses(&mut history, &orphaned);
+
+        // 验证 tool_uses 变为 None
+        if let Message::Assistant(ref assistant_msg) = history[1] {
+            assert!(
+                assistant_msg.assistant_response_message.tool_uses.is_none(),
+                "移除所有 tool_use 后应为 None"
+            );
+        } else {
+            panic!("应该是 Assistant 消息");
+        }
     }
 }
