@@ -11,6 +11,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    environment:
+      - RUST_LOG=debug
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8990/health"]

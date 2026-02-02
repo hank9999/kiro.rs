@@ -3,6 +3,7 @@
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use crate::anthropic::types::{CacheControl, Message, SystemMessage, Tool};
@@ -54,17 +55,51 @@ pub fn compute_cache_breakpoints(
     system: &Option<Vec<SystemMessage>>,
     messages: &[Message],
 ) -> Vec<CacheBreakpoint> {
+    // 统计 cache_control 字段的存在情况
+    let tools_with_cache_control = tools
+        .as_ref()
+        .map(|t| t.iter().filter(|tool| tool.cache_control.is_some()).count())
+        .unwrap_or(0);
+
+    let system_with_cache_control = system
+        .as_ref()
+        .map(|s| s.iter().filter(|msg| msg.cache_control.is_some()).count())
+        .unwrap_or(0);
+
+    let messages_with_cache_control = messages
+        .iter()
+        .filter(|msg| {
+            msg.content
+                .as_array()
+                .map(|blocks| blocks.iter().any(|b| b.get("cache_control").is_some()))
+                .unwrap_or(false)
+        })
+        .count();
+
+    tracing::debug!(
+        "Cache control in request: tools={}/{}, system={}/{}, messages={}/{}",
+        tools_with_cache_control,
+        tools.as_ref().map(|t| t.len()).unwrap_or(0),
+        system_with_cache_control,
+        system.as_ref().map(|s| s.len()).unwrap_or(0),
+        messages_with_cache_control,
+        messages.len()
+    );
+
     let mut hasher = Sha256::new();
     let mut breakpoints = Vec::new();
     let mut cumulative_tokens: i32 = 0;
 
-    // 1. 处理 tools
+    // 1. 处理 tools（按 name 排序，确保顺序稳定）
     if let Some(tools) = tools {
-        for tool in tools {
-            // 序列化 tool 并更新 hash
-            let tool_json = serde_json::to_string(tool).unwrap_or_default();
-            hasher.update(tool_json.as_bytes());
-            cumulative_tokens += token::count_tokens(&tool_json) as i32;
+        let mut sorted_tools: Vec<_> = tools.iter().collect();
+        sorted_tools.sort_by(|a, b| a.name.cmp(&b.name));
+
+        for tool in sorted_tools {
+            // 使用规范化的 tool 表示更新 hash
+            let normalized = normalize_tool(tool);
+            hasher.update(normalized.as_bytes());
+            cumulative_tokens += token::count_tokens(&normalized) as i32;
 
             // 检查 cache_control
             if let Some(cc) = &tool.cache_control {
@@ -128,6 +163,14 @@ pub fn compute_cache_breakpoints(
         }
     }
 
+    tracing::debug!(
+        "Cache breakpoints computed: count={}, tools={}, system={}, messages={}",
+        breakpoints.len(),
+        tools.as_ref().map(|t| t.len()).unwrap_or(0),
+        system.as_ref().map(|s| s.len()).unwrap_or(0),
+        messages.len()
+    );
+
     breakpoints
 }
 
@@ -139,6 +182,48 @@ fn parse_ttl(cc: &CacheControl) -> u64 {
     }
 }
 
+/// 递归排序 JSON 对象的 key
+fn sort_json_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut sorted: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+            for (k, v) in map {
+                sorted.insert(k.clone(), sort_json_value(v));
+            }
+            serde_json::Value::Object(sorted.into_iter().collect())
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(sort_json_value).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
+/// 递归排序 JSON 对象的 key 并序列化为字符串
+fn sort_json_keys(value: &serde_json::Value) -> Result<String, serde_json::Error> {
+    let sorted = sort_json_value(value);
+    serde_json::to_string(&sorted)
+}
+
+/// 规范化 Tool 为稳定的字符串表示（用于 hash 计算）
+fn normalize_tool(tool: &Tool) -> String {
+    // 按固定顺序拼接关键字段
+    let mut parts = Vec::new();
+    parts.push(format!("name:{}", tool.name));
+    if !tool.description.is_empty() {
+        parts.push(format!("desc:{}", tool.description));
+    }
+    // input_schema 使用排序后的 JSON
+    if !tool.input_schema.is_empty() {
+        // 将 HashMap 转换为 JSON Value 再排序
+        let schema_value = serde_json::to_value(&tool.input_schema).unwrap_or_default();
+        if let Ok(sorted) = sort_json_keys(&schema_value) {
+            parts.push(format!("schema:{}", sorted));
+        }
+    }
+    parts.join("|")
+}
+
 /// 查询或创建缓存
 pub async fn lookup_or_create(
     api_key: &str,
@@ -147,6 +232,7 @@ pub async fn lookup_or_create(
 ) -> CacheResult {
     // 如果 Redis 不可用或没有断点，返回默认结果
     let Some(conn) = REDIS_CONN.get() else {
+        tracing::debug!("Cache lookup skipped: Redis not available");
         return CacheResult {
             uncached_input_tokens: total_input_tokens,
             ..Default::default()
@@ -154,6 +240,7 @@ pub async fn lookup_or_create(
     };
 
     if breakpoints.is_empty() {
+        tracing::debug!("Cache lookup skipped: no breakpoints");
         return CacheResult {
             uncached_input_tokens: total_input_tokens,
             ..Default::default()
@@ -172,6 +259,10 @@ pub async fn lookup_or_create(
 
         if let Some(cached_tokens) = cached {
             // 缓存命中
+            tracing::debug!(
+                "Cache hit: key={}, cached_tokens={}",
+                key, cached_tokens
+            );
             result.cache_read_input_tokens = cached_tokens;
 
             // 刷新 TTL
@@ -191,6 +282,8 @@ pub async fn lookup_or_create(
             }
 
             break;
+        } else {
+            tracing::debug!("Cache miss: key={}", key);
         }
     }
 
@@ -208,6 +301,13 @@ pub async fn lookup_or_create(
     // 计算未缓存的 tokens
     let cached_tokens = result.cache_read_input_tokens + result.cache_creation_input_tokens;
     result.uncached_input_tokens = (total_input_tokens - cached_tokens).max(0);
+
+    tracing::debug!(
+        "Cache result: read={}, creation={}, uncached={}",
+        result.cache_read_input_tokens,
+        result.cache_creation_input_tokens,
+        result.uncached_input_tokens
+    );
 
     result
 }
