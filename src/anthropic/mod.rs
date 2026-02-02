@@ -29,5 +29,6 @@ mod router;
 mod stream;
 pub mod types;
 mod websearch;
+pub mod cache;
 
 pub use router::create_router_with_provider;

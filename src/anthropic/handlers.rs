@@ -2,19 +2,20 @@
 
 use std::convert::Infallible;
 
+use crate::anthropic::cache;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
 use axum::{
-    Json as JsonExtractor,
     body::Body,
     extract::State,
-    http::{StatusCode, header},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
+    Json as JsonExtractor,
 };
 use bytes::Bytes;
-use futures::{Stream, StreamExt, stream};
+use futures::{stream, Stream, StreamExt};
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::interval;
@@ -75,6 +76,7 @@ pub async fn get_models() -> impl IntoResponse {
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
+    headers: HeaderMap,
     JsonExtractor(payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -159,13 +161,31 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(
+    // 提取 API key（用于缓存隔离）
+    let api_key = extract_api_key(&headers);
+
+    // 计算总 input tokens
+    let total_input_tokens = token::count_all_tokens(
         payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
     ) as i32;
+
+    // 计算缓存断点并查询 Redis
+    let cache_result = if cache::is_redis_available() {
+        let breakpoints = cache::compute_cache_breakpoints(
+            &payload.tools,
+            &payload.system,
+            &payload.messages,
+        );
+        cache::lookup_or_create(&api_key, &breakpoints, total_input_tokens).await
+    } else {
+        cache::CacheResult {
+            uncached_input_tokens: total_input_tokens,
+            ..Default::default()
+        }
+    };
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -180,14 +200,31 @@ pub async fn post_messages(
             provider,
             &request_body,
             &payload.model,
-            input_tokens,
+            cache_result,
             thinking_enabled,
         )
         .await
     } else {
         // 非流式响应
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            total_input_tokens,
+            cache_result,
+        )
+        .await
     }
+}
+
+/// 从请求头中提取 API Key
+fn extract_api_key(headers: &HeaderMap) -> String {
+    headers
+        .get("x-api-key")
+        .or_else(|| headers.get("authorization"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim_start_matches("Bearer ").to_string())
+        .unwrap_or_default()
 }
 
 /// 处理流式请求
@@ -195,7 +232,7 @@ async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
-    input_tokens: i32,
+    cache_result: cache::CacheResult,
     thinking_enabled: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
@@ -215,7 +252,7 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled);
+    let mut ctx = StreamContext::new_with_cache(model, cache_result, thinking_enabled);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -341,7 +378,8 @@ async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
-    input_tokens: i32,
+    total_input_tokens: i32,
+    cache_result: cache::CacheResult,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api(request_body).await {
@@ -477,8 +515,8 @@ async fn handle_non_stream_request(
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-    let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用总 token 数减去缓存的
+    let final_input_tokens = context_input_tokens.unwrap_or(cache_result.uncached_input_tokens);
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -491,7 +529,9 @@ async fn handle_non_stream_request(
         "stop_sequence": null,
         "usage": {
             "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": cache_result.cache_creation_input_tokens,
+            "cache_read_input_tokens": cache_result.cache_read_input_tokens
         }
     });
 
@@ -529,6 +569,7 @@ pub async fn count_tokens(
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
+    headers: HeaderMap,
     JsonExtractor(payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -614,13 +655,31 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(
+    // 提取 API key（用于缓存隔离）
+    let api_key = extract_api_key(&headers);
+
+    // 计算总 input tokens
+    let total_input_tokens = token::count_all_tokens(
         payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
     ) as i32;
+
+    // 计算缓存断点并查询 Redis
+    let cache_result = if cache::is_redis_available() {
+        let breakpoints = cache::compute_cache_breakpoints(
+            &payload.tools,
+            &payload.system,
+            &payload.messages,
+        );
+        cache::lookup_or_create(&api_key, &breakpoints, total_input_tokens).await
+    } else {
+        cache::CacheResult {
+            uncached_input_tokens: total_input_tokens,
+            ..Default::default()
+        }
+    };
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -635,13 +694,20 @@ pub async fn post_messages_cc(
             provider,
             &request_body,
             &payload.model,
-            input_tokens,
+            cache_result,
             thinking_enabled,
         )
         .await
     } else {
         // 非流式响应（复用现有逻辑，已经使用正确的 input_tokens）
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            total_input_tokens,
+            cache_result,
+        )
+        .await
     }
 }
 
@@ -653,7 +719,7 @@ async fn handle_stream_request_buffered(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
-    estimated_input_tokens: i32,
+    cache_result: cache::CacheResult,
     thinking_enabled: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
@@ -673,7 +739,7 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled);
+    let ctx = BufferedStreamContext::new_with_cache(model, cache_result, thinking_enabled);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);

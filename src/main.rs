@@ -101,6 +101,14 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
+    // 初始化 Redis（如果配置了）
+    if let Some(redis_url) = &config.redis_url {
+        if let Err(e) = anthropic::cache::init_redis(redis_url).await {
+            tracing::warn!("Failed to initialize Redis cache: {}", e);
+            // 继续运行，缓存功能不可用
+        }
+    }
+
     // 构建 Anthropic API 路由（从第一个凭据获取 profile_arn）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
