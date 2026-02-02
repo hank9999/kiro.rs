@@ -2,9 +2,7 @@ version: '3.8'
 
 services:
   kiro-rs:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: fqdeng/kiro-rs:latest
     container_name: kiro-rs
     ports:
       - "8990:8990"
