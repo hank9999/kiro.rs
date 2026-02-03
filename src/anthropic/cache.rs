@@ -266,7 +266,7 @@ pub async fn lookup_or_create(
             result.cache_read_input_tokens = cached_tokens;
 
             // 刷新 TTL
-            if let Err(e) = conn.expire(&key, bp.ttl as i64).await {
+            if let Err(e) = conn.expire::<_, ()>(&key, bp.ttl as i64).await {
                 tracing::warn!("Failed to refresh cache TTL for key {}: {}", key, e);
             }
 
