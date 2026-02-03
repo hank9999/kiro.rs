@@ -1191,6 +1191,14 @@ impl BufferedStreamContext {
     /// 2. 用正确的 input_tokens 更正 message_start 事件
     /// 3. 返回所有缓冲的事件
     pub fn finish_and_get_all_events(&mut self) -> Vec<SseEvent> {
+        let (events, _, _) = self.finish_and_get_all_events_with_tokens();
+        events
+    }
+
+    /// 完成流处理并返回所有事件及 token 统计
+    ///
+    /// 返回值：(事件列表, input_tokens, output_tokens)
+    pub fn finish_and_get_all_events_with_tokens(&mut self) -> (Vec<SseEvent>, i32, i32) {
         // 如果从未处理过事件，也要生成初始事件
         if !self.initial_events_generated {
             let initial_events = self.inner.generate_initial_events();
@@ -1208,6 +1216,8 @@ impl BufferedStreamContext {
             .context_input_tokens
             .unwrap_or(self.estimated_input_tokens);
 
+        let output_tokens = self.inner.output_tokens;
+
         // 更正 message_start 事件中的 input_tokens
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
@@ -1219,7 +1229,17 @@ impl BufferedStreamContext {
             }
         }
 
-        std::mem::take(&mut self.event_buffer)
+        (std::mem::take(&mut self.event_buffer), final_input_tokens, output_tokens)
+    }
+
+    /// 检查是否收到上游错误
+    pub fn has_upstream_error(&self) -> bool {
+        self.inner.received_upstream_error
+    }
+
+    /// 获取上游错误消息
+    pub fn get_upstream_error_message(&self) -> Option<String> {
+        self.inner.upstream_error_message.clone()
     }
 }
 

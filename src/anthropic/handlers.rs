@@ -1313,11 +1313,13 @@ pub async fn post_messages_cc(
     if payload.stream {
         // 流式响应（缓冲模式）
         handle_stream_request_buffered(
+            state,
             provider,
             &request_body,
             &payload.model,
             input_tokens,
             thinking_enabled,
+            &session_id,
         )
         .await
     } else {
@@ -1340,17 +1342,27 @@ pub async fn post_messages_cc(
 /// 与 `handle_stream_request` 不同，此函数会缓冲所有事件直到流结束，
 /// 然后用从 contextUsageEvent 计算的正确 input_tokens 生成 message_start 事件。
 async fn handle_stream_request_buffered(
+    state: AppState,
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
     estimated_input_tokens: i32,
     thinking_enabled: bool,
+    session_id: &str,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
-        Ok(resp) => resp,
+    let api_result = provider
+        .call_api_stream_with_credential_id(request_body, Some(model))
+        .await;
+
+    let (credential_id, response) = match api_result {
+        Ok((cid, resp)) => (cid, resp),
         Err(e) => {
             tracing::error!("Kiro API 调用失败: {}", e);
+            // 记录错误统计（使用 credential_id = 0 表示未知凭据）
+            if let Some(stats) = provider.stats_store() {
+                stats.record_error(0, Some(model), format!("API 调用失败: {}", e));
+            }
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
@@ -1362,109 +1374,215 @@ async fn handle_stream_request_buffered(
         }
     };
 
+    let stats = provider.stats_store();
+
     // 创建缓冲流处理上下文
     let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled);
 
-    // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx);
+    // 创建缓冲 SSE 流（带统计支持）
+    let stream = create_buffered_sse_stream_with_stats(
+        response,
+        ctx,
+        stats,
+        credential_id,
+        model.to_string(),
+        state,
+        session_id.to_string(),
+    );
 
     // 返回 SSE 响应
-    Response::builder()
+    match Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(stream))
-        .unwrap()
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::error!("构建 SSE 响应失败: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "internal_error",
+                    format!("构建 SSE 响应失败: {}", e),
+                )),
+            )
+                .into_response()
+        }
+    }
 }
 
-/// 创建缓冲 SSE 事件流
+/// 缓冲流处理状态（带统计支持）
+struct BufferedStreamState {
+    body_stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>,
+    ctx: BufferedStreamContext,
+    decoder: EventStreamDecoder,
+    finished: bool,
+    ping_interval: tokio::time::Interval,
+    stats: Option<Arc<StatsStore>>,
+    credential_id: u64,
+    model: String,
+    /// 是否已记录统计（避免重复记录）
+    stats_recorded: bool,
+}
+
+/// 创建缓冲 SSE 事件流（带统计支持）
 ///
 /// 工作流程：
 /// 1. 等待上游流完成，期间只发送 ping 保活信号
 /// 2. 使用 StreamContext 的事件处理逻辑处理所有 Kiro 事件，结果缓存
 /// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
-/// 4. 一次性发送所有事件
-fn create_buffered_sse_stream(
+/// 4. 记录统计信息（成功/失败、用量）
+/// 5. 一次性发送所有事件
+fn create_buffered_sse_stream_with_stats(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
+    stats: Option<Arc<StatsStore>>,
+    credential_id: u64,
+    model: String,
+    _app_state: AppState,
+    _session_id: String,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
-    stream::unfold(
-        (
-            body_stream,
-            ctx,
-            EventStreamDecoder::new(),
-            false,
-            interval(Duration::from_secs(PING_INTERVAL_SECS)),
-        ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
-            if finished {
-                return None;
-            }
+    let state = BufferedStreamState {
+        body_stream: Box::pin(body_stream),
+        ctx,
+        decoder: EventStreamDecoder::new(),
+        finished: false,
+        ping_interval: interval(Duration::from_secs(PING_INTERVAL_SECS)),
+        stats,
+        credential_id,
+        model,
+        stats_recorded: false,
+    };
 
-            loop {
-                tokio::select! {
-                    // 使用 biased 模式，优先检查 ping 定时器
-                    // 避免在上游 chunk 密集时 ping 被"饿死"
-                    biased;
+    stream::unfold(state, |mut state| async move {
+        if state.finished {
+            return None;
+        }
 
-                    // 优先检查 ping 保活（等待期间唯一发送的数据）
-                    _ = ping_interval.tick() => {
-                        tracing::trace!("发送 ping 保活事件（缓冲模式）");
-                        let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)));
-                    }
+        loop {
+            tokio::select! {
+                // 使用 biased 模式，优先检查 ping 定时器
+                // 避免在上游 chunk 密集时 ping 被"饿死"
+                biased;
 
-                    // 然后处理数据流
-                    chunk_result = body_stream.next() => {
-                        match chunk_result {
-                            Some(Ok(chunk)) => {
-                                // 解码事件
-                                if let Err(e) = decoder.feed(&chunk) {
-                                    tracing::warn!("缓冲区溢出: {}", e);
-                                }
+                // 优先检查 ping 保活（等待期间唯一发送的数据）
+                _ = state.ping_interval.tick() => {
+                    tracing::trace!("发送 ping 保活事件（缓冲模式）");
+                    let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
+                    return Some((stream::iter(bytes), state));
+                }
 
-                                for result in decoder.decode_iter() {
-                                    match result {
-                                        Ok(frame) => {
-                                            if let Ok(event) = Event::from_frame(frame) {
-                                                // 缓冲事件（复用 StreamContext 的处理逻辑）
-                                                ctx.process_and_buffer(&event);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("解码事件失败: {}", e);
+                // 然后处理数据流
+                chunk_result = state.body_stream.next() => {
+                    match chunk_result {
+                        Some(Ok(chunk)) => {
+                            // 解码事件
+                            if let Err(e) = state.decoder.feed(&chunk) {
+                                tracing::warn!("缓冲区溢出: {}", e);
+                            }
+
+                            for result in state.decoder.decode_iter() {
+                                match result {
+                                    Ok(frame) => {
+                                        if let Ok(event) = Event::from_frame(frame) {
+                                            // 缓冲事件（复用 StreamContext 的处理逻辑）
+                                            state.ctx.process_and_buffer(&event);
                                         }
                                     }
+                                    Err(e) => {
+                                        tracing::warn!("解码事件失败: {}", e);
+                                    }
                                 }
-                                // 继续读取下一个 chunk，不发送任何数据
                             }
-                            Some(Err(e)) => {
-                                tracing::error!("读取响应流失败: {}", e);
-                                // 发生错误，完成处理并返回所有事件
-                                let all_events = ctx.finish_and_get_all_events();
-                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                            // 继续读取下一个 chunk，不发送任何数据
+                        }
+                        Some(Err(e)) => {
+                            tracing::error!("读取响应流失败（缓冲模式）: {}", e);
+                            
+                            // 记录错误统计
+                            if !state.stats_recorded {
+                                if let Some(s) = &state.stats {
+                                    s.record_error(
+                                        state.credential_id,
+                                        Some(&state.model),
+                                        format!("读取响应流失败: {}", e),
+                                    );
+                                }
+                                state.stats_recorded = true;
                             }
-                            None => {
-                                // 流结束，完成处理并返回所有事件（已更正 input_tokens）
-                                let all_events = ctx.finish_and_get_all_events();
-                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+
+                            // 发生错误，完成处理并返回所有事件
+                            let (all_events, input_tokens, output_tokens) = state.ctx.finish_and_get_all_events_with_tokens();
+                            
+                            // 记录用量（即使出错也记录已处理的部分）
+                            if let Some(s) = &state.stats {
+                                s.add_usage(
+                                    state.credential_id,
+                                    Some(&state.model),
+                                    input_tokens as i64,
+                                    output_tokens as i64,
+                                );
                             }
+
+                            state.finished = true;
+                            let bytes: Vec<Result<Bytes, Infallible>> = all_events
+                                .into_iter()
+                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                .collect();
+                            return Some((stream::iter(bytes), state));
+                        }
+                        None => {
+                            // 流结束，完成处理并返回所有事件（已更正 input_tokens）
+                            let (all_events, input_tokens, output_tokens) = state.ctx.finish_and_get_all_events_with_tokens();
+                            
+                            // 记录成功统计和用量
+                            if !state.stats_recorded {
+                                if let Some(s) = &state.stats {
+                                    // 检查是否收到上游错误
+                                    if state.ctx.has_upstream_error() {
+                                        let error_msg = state.ctx.get_upstream_error_message()
+                                            .unwrap_or_else(|| "上游服务错误".to_string());
+                                        s.record_error(
+                                            state.credential_id,
+                                            Some(&state.model),
+                                            error_msg,
+                                        );
+                                    } else {
+                                        s.record_success(state.credential_id, Some(&state.model));
+                                    }
+                                    s.add_usage(
+                                        state.credential_id,
+                                        Some(&state.model),
+                                        input_tokens as i64,
+                                        output_tokens as i64,
+                                    );
+                                }
+                                state.stats_recorded = true;
+                            }
+
+                            tracing::info!(
+                                credential_id = state.credential_id,
+                                model = %state.model,
+                                input_tokens = input_tokens,
+                                output_tokens = output_tokens,
+                                "缓冲流处理完成，已记录统计"
+                            );
+
+                            state.finished = true;
+                            let bytes: Vec<Result<Bytes, Infallible>> = all_events
+                                .into_iter()
+                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                .collect();
+                            return Some((stream::iter(bytes), state));
                         }
                     }
                 }
             }
-        },
-    )
+        }
+    })
     .flatten()
 }
