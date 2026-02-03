@@ -278,7 +278,7 @@ pub async fn lookup_or_create(
 
                 // 写入新缓存
                 if let Err(e) = conn
-                    .set_ex(&later_key, later_bp.tokens, later_bp.ttl)
+                    .set_ex::<_, _, ()>(&later_key, later_bp.tokens, later_bp.ttl)
                     .await
                 {
                     tracing::warn!("Failed to create cache for key {}: {}", later_key, e);
@@ -300,7 +300,7 @@ pub async fn lookup_or_create(
         let mut prev_tokens = 0;
         for bp in breakpoints {
             let key = format!("cache:{}:{}", api_key, bp.hash);
-            if let Err(e) = conn.set_ex(&key, bp.tokens, bp.ttl).await {
+            if let Err(e) = conn.set_ex::<_, _, ()>(&key, bp.tokens, bp.ttl).await {
                 tracing::warn!("Failed to create cache for key {}: {}", key, e);
             }
 

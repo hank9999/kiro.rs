@@ -378,7 +378,7 @@ async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
-    total_input_tokens: i32,
+    _total_input_tokens: i32,
     cache_result: cache::CacheResult,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
