@@ -266,19 +266,26 @@ pub async fn lookup_or_create(
             result.cache_read_input_tokens = cached_tokens;
 
             // 刷新 TTL
-            let _: Result<(), _> = conn.expire(&key, bp.ttl as i64).await;
+            if let Err(e) = conn.expire(&key, bp.ttl as i64).await {
+                tracing::warn!("Failed to refresh cache TTL for key {}: {}", key, e);
+            }
 
             // 计算后续断点需要创建的缓存
+            let mut prev_tokens = cached_tokens;
             for later_bp in breakpoints.iter().skip(i + 1) {
                 let later_key = format!("cache:{}:{}", api_key, later_bp.hash);
-                let additional_tokens = later_bp.tokens - cached_tokens;
+                let additional_tokens = later_bp.tokens - prev_tokens;
 
                 // 写入新缓存
-                let _: Result<(), _> = conn
+                if let Err(e) = conn
                     .set_ex(&later_key, later_bp.tokens, later_bp.ttl)
-                    .await;
+                    .await
+                {
+                    tracing::warn!("Failed to create cache for key {}: {}", later_key, e);
+                }
 
                 result.cache_creation_input_tokens += additional_tokens;
+                prev_tokens = later_bp.tokens;
             }
 
             break;
@@ -289,12 +296,18 @@ pub async fn lookup_or_create(
 
     // 如果完全没有命中，创建所有断点的缓存
     if result.cache_read_input_tokens == 0 && !breakpoints.is_empty() {
-        let last_bp = breakpoints.last().unwrap();
-        result.cache_creation_input_tokens = last_bp.tokens;
-
+        // 计算每个断点的增量 tokens
+        let mut prev_tokens = 0;
         for bp in breakpoints {
             let key = format!("cache:{}:{}", api_key, bp.hash);
-            let _: Result<(), _> = conn.set_ex(&key, bp.tokens, bp.ttl).await;
+            if let Err(e) = conn.set_ex(&key, bp.tokens, bp.ttl).await {
+                tracing::warn!("Failed to create cache for key {}: {}", key, e);
+            }
+
+            // 累加增量 tokens
+            let additional_tokens = bp.tokens - prev_tokens;
+            result.cache_creation_input_tokens += additional_tokens;
+            prev_tokens = bp.tokens;
         }
     }
 
