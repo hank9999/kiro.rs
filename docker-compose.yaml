@@ -24,7 +24,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: kiro-redis
-    command: redis-server --appendonly yes
+    command: redis-server --appendonly yes --appendfsync everysec
     volumes:
       - redis_data:/data
     restart: unless-stopped
