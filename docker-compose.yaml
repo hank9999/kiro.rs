@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   kiro-rs:
-    image: fqdeng/kiro-rs:latest
+    image: ghcr.io/hank9999/kiro-rs:latest
     container_name: kiro-rs
     ports:
       - "8990:8990"
