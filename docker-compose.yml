@@ -1,0 +1,14 @@
+services:
+  kiro-rs:
+    # 使用国内镜像
+    # image: ghcr.nju.edu.cn/${IMAGE_OWNER:-hank9999}/kiro-rs:${IMAGE_TAG:-latest}
+    image: ghcr.io/${IMAGE_OWNER:-hank9999}/kiro-rs:${IMAGE_TAG:-latest}
+    container_name: kiro-rs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:8990:8990"
+    volumes:
+      - ./config.json:/app/config/config.json:ro
+      - ./credentials.json:/app/config/credentials.json
+    restart: unless-stopped
