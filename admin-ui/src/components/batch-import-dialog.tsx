@@ -10,7 +10,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { getCredentialBalance } from '@/api/credentials'
+import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 
 interface BatchImportDialogProps {
@@ -33,6 +33,8 @@ interface VerificationResult {
   usage?: string
   email?: string
   credentialId?: number
+  rollbackStatus?: 'success' | 'failed' | 'skipped'
+  rollbackError?: string
 }
 
 async function sha256Hex(value: string): Promise<string> {
@@ -52,6 +54,27 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   const { data: existingCredentials } = useCredentials()
   const { mutateAsync: addCredential } = useAddCredential()
   const { mutateAsync: deleteCredential } = useDeleteCredential()
+
+  const rollbackCredential = async (id: number): Promise<{ success: boolean; error?: string }> => {
+    try {
+      await setCredentialDisabled(id, true)
+    } catch (error) {
+      return {
+        success: false,
+        error: `禁用失败: ${extractErrorMessage(error)}`,
+      }
+    }
+
+    try {
+      await deleteCredential(id)
+      return { success: true }
+    } catch (error) {
+      return {
+        success: false,
+        error: `删除失败: ${extractErrorMessage(error)}`,
+      }
+    }
+  }
 
   const resetForm = () => {
     setJsonInput('')
@@ -91,6 +114,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       let successCount = 0
       let duplicateCount = 0
       let failCount = 0
+      let rollbackSuccessCount = 0
+      let rollbackFailedCount = 0
+      let rollbackSkippedCount = 0
 
       // 4. 导入并验活
       for (let i = 0; i < credentials.length; i++) {
@@ -169,13 +195,22 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             return newResults
           })
         } catch (error) {
-          // 验活失败，删除已添加的凭据
+          // 验活失败，尝试回滚（先禁用再删除）
+          let rollbackStatus: VerificationResult['rollbackStatus'] = 'skipped'
+          let rollbackError: string | undefined
+
           if (addedCredId) {
-            try {
-              await deleteCredential(addedCredId)
-            } catch (deleteError) {
-              console.error('删除失败凭据时出错:', deleteError)
+            const rollbackResult = await rollbackCredential(addedCredId)
+            if (rollbackResult.success) {
+              rollbackStatus = 'success'
+              rollbackSuccessCount++
+            } else {
+              rollbackStatus = 'failed'
+              rollbackFailedCount++
+              rollbackError = rollbackResult.error
             }
+          } else {
+            rollbackSkippedCount++
           }
 
           failCount++
@@ -185,7 +220,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               ...newResults[i],
               status: 'failed',
               error: extractErrorMessage(error),
-              email: undefined
+              email: undefined,
+              rollbackStatus,
+              rollbackError,
             }
             return newResults
           })
@@ -198,7 +235,14 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       if (failCount === 0 && duplicateCount === 0) {
         toast.success(`成功导入并验活 ${successCount} 个凭据`)
       } else {
-        toast.info(`验活完成：成功 ${successCount} 个，重复 ${duplicateCount} 个，失败 ${failCount} 个（已排除）`)
+        const failureSummary = failCount > 0
+          ? `，失败 ${failCount} 个（已排除 ${rollbackSuccessCount}，未排除 ${rollbackFailedCount}，无需排除 ${rollbackSkippedCount}）`
+          : ''
+        toast.info(`验活完成：成功 ${successCount} 个，重复 ${duplicateCount} 个${failureSummary}`)
+
+        if (rollbackFailedCount > 0) {
+          toast.warning(`有 ${rollbackFailedCount} 个失败凭据回滚未完成，请手动禁用并删除`)
+        }
       }
     } catch (error) {
       toast.error('JSON 格式错误: ' + extractErrorMessage(error))
@@ -223,8 +267,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     }
   }
 
-  const getStatusText = (status: VerificationResult['status']) => {
-    switch (status) {
+  const getStatusText = (result: VerificationResult) => {
+    switch (result.status) {
       case 'pending':
         return '等待中'
       case 'checking':
@@ -236,7 +280,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       case 'duplicate':
         return '重复凭据'
       case 'failed':
-        return '验活失败（已排除）'
+        if (result.rollbackStatus === 'success') return '验活失败（已排除）'
+        if (result.rollbackStatus === 'failed') return '验活失败（未排除）'
+        return '验活失败（未创建）'
     }
   }
 
@@ -319,7 +365,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                             {result.email || `凭据 #${result.index}`}
                           </span>
                           <span className="text-xs text-muted-foreground">
-                            {getStatusText(result.status)}
+                            {getStatusText(result)}
                           </span>
                         </div>
                         {result.usage && (
@@ -330,6 +376,11 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                         {result.error && (
                           <div className="text-xs text-red-600 dark:text-red-400 mt-1">
                             {result.error}
+                          </div>
+                        )}
+                        {result.rollbackError && (
+                          <div className="text-xs text-red-600 dark:text-red-400 mt-1">
+                            回滚失败: {result.rollbackError}
                           </div>
                         )}
                       </div>

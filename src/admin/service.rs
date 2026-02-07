@@ -220,7 +220,16 @@ impl AdminService {
     pub fn delete_credential(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
             .delete_credential(id)
-            .map_err(|e| self.classify_delete_error(e, id))
+            .map_err(|e| self.classify_delete_error(e, id))?;
+
+        // 清理已删除凭据的余额缓存
+        {
+            let mut cache = self.balance_cache.lock();
+            cache.remove(&id);
+        }
+        self.save_balance_cache();
+
+        Ok(())
     }
 
     /// 获取负载均衡模式
