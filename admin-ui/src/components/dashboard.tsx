@@ -14,6 +14,7 @@ import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import type { BalanceResponse } from '@/types/api'
 
 interface DashboardProps {
   onLogout: () => void
@@ -29,6 +30,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [verifying, setVerifying] = useState(false)
   const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(new Map())
+  const [balanceMap, setBalanceMap] = useState<Map<number, BalanceResponse>>(new Map())
+  const [loadingBalanceIds, setLoadingBalanceIds] = useState<Set<number>>(new Set())
+  const [queryingInfo, setQueryingInfo] = useState(false)
+  const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
@@ -56,6 +61,40 @@ export function Dashboard({ onLogout }: DashboardProps) {
   useEffect(() => {
     setCurrentPage(1)
   }, [data?.credentials.length])
+
+  // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
+  useEffect(() => {
+    if (!data?.credentials) {
+      setBalanceMap(new Map())
+      setLoadingBalanceIds(new Set())
+      return
+    }
+
+    const validIds = new Set(data.credentials.map(credential => credential.id))
+
+    setBalanceMap(prev => {
+      const next = new Map<number, BalanceResponse>()
+      prev.forEach((value, id) => {
+        if (validIds.has(id)) {
+          next.set(id, value)
+        }
+      })
+      return next.size === prev.size ? prev : next
+    })
+
+    setLoadingBalanceIds(prev => {
+      if (prev.size === 0) {
+        return prev
+      }
+      const next = new Set<number>()
+      prev.forEach(id => {
+        if (validIds.has(id)) {
+          next.add(id)
+        }
+      })
+      return next.size === prev.size ? prev : next
+    })
+  }, [data?.credentials])
 
   const toggleDarkMode = () => {
     setDarkMode(!darkMode)
@@ -223,6 +262,68 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
 
     deselectAll()
+  }
+
+  // 查询当前页凭据信息（逐个查询，避免瞬时并发）
+  const handleQueryCurrentPageInfo = async () => {
+    if (currentCredentials.length === 0) {
+      toast.error('当前页没有可查询的凭据')
+      return
+    }
+
+    const ids = currentCredentials
+      .filter(credential => !credential.disabled)
+      .map(credential => credential.id)
+
+    if (ids.length === 0) {
+      toast.error('当前页没有可查询的启用凭据')
+      return
+    }
+
+    setQueryingInfo(true)
+    setQueryInfoProgress({ current: 0, total: ids.length })
+
+    let successCount = 0
+    let failCount = 0
+
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i]
+
+      setLoadingBalanceIds(prev => {
+        const next = new Set(prev)
+        next.add(id)
+        return next
+      })
+
+      try {
+        const balance = await getCredentialBalance(id)
+        successCount++
+
+        setBalanceMap(prev => {
+          const next = new Map(prev)
+          next.set(id, balance)
+          return next
+        })
+      } catch (error) {
+        failCount++
+      } finally {
+        setLoadingBalanceIds(prev => {
+          const next = new Set(prev)
+          next.delete(id)
+          return next
+        })
+      }
+
+      setQueryInfoProgress({ current: i + 1, total: ids.length })
+    }
+
+    setQueryingInfo(false)
+
+    if (failCount === 0) {
+      toast.success(`查询完成：成功 ${successCount}/${ids.length}`)
+    } else {
+      toast.warning(`查询完成：成功 ${successCount} 个，失败 ${failCount} 个`)
+    }
   }
 
   // 批量验活
@@ -468,6 +569,17 @@ export function Dashboard({ onLogout }: DashboardProps) {
               )}
               {data?.credentials && data.credentials.length > 0 && (
                 <Button
+                  onClick={handleQueryCurrentPageInfo}
+                  size="sm"
+                  variant="outline"
+                  disabled={queryingInfo}
+                >
+                  <RefreshCw className={`h-4 w-4 mr-2 ${queryingInfo ? 'animate-spin' : ''}`} />
+                  {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询信息'}
+                </Button>
+              )}
+              {data?.credentials && data.credentials.length > 0 && (
+                <Button
                   onClick={handleClearAll}
                   size="sm"
                   variant="outline"
@@ -503,6 +615,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     onViewBalance={handleViewBalance}
                     selected={selectedIds.has(credential.id)}
                     onToggleSelect={() => toggleSelect(credential.id)}
+                    balance={balanceMap.get(credential.id) || null}
+                    loadingBalance={loadingBalanceIds.has(credential.id)}
                   />
                 ))}
               </div>

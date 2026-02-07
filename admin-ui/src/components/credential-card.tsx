@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { toast } from 'sonner'
 import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -22,13 +22,14 @@ import {
   useResetFailure,
   useDeleteCredential,
 } from '@/hooks/use-credentials'
-import { getCredentialBalance } from '@/api/credentials'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
   onViewBalance: (id: number) => void
   selected: boolean
   onToggleSelect: () => void
+  balance: BalanceResponse | null
+  loadingBalance: boolean
 }
 
 function formatLastUsed(lastUsedAt: string | null): string {
@@ -47,36 +48,22 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
-export function CredentialCard({ credential, onViewBalance, selected, onToggleSelect }: CredentialCardProps) {
+export function CredentialCard({
+  credential,
+  onViewBalance,
+  selected,
+  onToggleSelect,
+  balance,
+  loadingBalance,
+}: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
-  const [balance, setBalance] = useState<BalanceResponse | null>(null)
-  const [loadingBalance, setLoadingBalance] = useState(false)
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
-
-  // 组件加载时获取余额
-  useEffect(() => {
-    // 只为启用的凭据获取余额
-    if (!credential.disabled) {
-      setLoadingBalance(true)
-      getCredentialBalance(credential.id)
-        .then(data => {
-          setBalance(data)
-        })
-        .catch(error => {
-          console.error('获取余额失败:', error)
-          setBalance(null)
-        })
-        .finally(() => {
-          setLoadingBalance(false)
-        })
-    }
-  }, [credential.id, credential.disabled])
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
