@@ -382,6 +382,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+            AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
         }

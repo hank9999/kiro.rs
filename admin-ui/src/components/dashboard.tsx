@@ -56,6 +56,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const startIndex = (currentPage - 1) * itemsPerPage
   const endIndex = startIndex + itemsPerPage
   const currentCredentials = data?.credentials.slice(startIndex, endIndex) || []
+  const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
+  const selectedDisabledCount = Array.from(selectedIds).filter(id => {
+    const credential = data?.credentials.find(c => c.id === id)
+    return Boolean(credential?.disabled)
+  }).length
 
   // 当凭据列表变化时重置到第一页
   useEffect(() => {
@@ -132,21 +137,34 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setSelectedIds(new Set())
   }
 
-  // 批量删除
+  // 批量删除（仅删除已禁用项）
   const handleBatchDelete = async () => {
     if (selectedIds.size === 0) {
       toast.error('请先选择要删除的凭据')
       return
     }
 
-    if (!confirm(`确定要删除 ${selectedIds.size} 个凭据吗？此操作无法撤销。`)) {
+    const disabledIds = Array.from(selectedIds).filter(id => {
+      const credential = data?.credentials.find(c => c.id === id)
+      return Boolean(credential?.disabled)
+    })
+
+    if (disabledIds.length === 0) {
+      toast.error('选中的凭据中没有已禁用项')
+      return
+    }
+
+    const skippedCount = selectedIds.size - disabledIds.length
+    const skippedText = skippedCount > 0 ? `（将跳过 ${skippedCount} 个未禁用凭据）` : ''
+
+    if (!confirm(`确定要删除 ${disabledIds.length} 个已禁用凭据吗？此操作无法撤销。${skippedText}`)) {
       return
     }
 
     let successCount = 0
     let failCount = 0
 
-    for (const id of selectedIds) {
+    for (const id of disabledIds) {
       try {
         await new Promise<void>((resolve, reject) => {
           deleteCredential(id, {
@@ -165,10 +183,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
       }
     }
 
+    const skippedResultText = skippedCount > 0 ? `，已跳过 ${skippedCount} 个未禁用凭据` : ''
+
     if (failCount === 0) {
-      toast.success(`成功删除 ${successCount} 个凭据`)
+      toast.success(`成功删除 ${successCount} 个已禁用凭据${skippedResultText}`)
     } else {
-      toast.warning(`成功 ${successCount} 个，失败 ${failCount} 个`)
+      toast.warning(`删除已禁用凭据：成功 ${successCount} 个，失败 ${failCount} 个${skippedResultText}`)
     }
 
     deselectAll()
@@ -222,24 +242,31 @@ export function Dashboard({ onLogout }: DashboardProps) {
     deselectAll()
   }
 
-  // 一键清除所有凭据
+  // 一键清除所有已禁用凭据
   const handleClearAll = async () => {
     if (!data?.credentials || data.credentials.length === 0) {
       toast.error('没有可清除的凭据')
       return
     }
 
-    if (!confirm(`确定要清除所有 ${data.credentials.length} 个凭据吗？此操作无法撤销。`)) {
+    const disabledCredentials = data.credentials.filter(credential => credential.disabled)
+
+    if (disabledCredentials.length === 0) {
+      toast.error('没有可清除的已禁用凭据')
+      return
+    }
+
+    if (!confirm(`确定要清除所有 ${disabledCredentials.length} 个已禁用凭据吗？此操作无法撤销。`)) {
       return
     }
 
     let successCount = 0
     let failCount = 0
 
-    for (const cred of data.credentials) {
+    for (const credential of disabledCredentials) {
       try {
         await new Promise<void>((resolve, reject) => {
-          deleteCredential(cred.id, {
+          deleteCredential(credential.id, {
             onSuccess: () => {
               successCount++
               resolve()
@@ -256,9 +283,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
 
     if (failCount === 0) {
-      toast.success(`成功清除所有 ${successCount} 个凭据`)
+      toast.success(`成功清除所有 ${successCount} 个已禁用凭据`)
     } else {
-      toast.warning(`成功 ${successCount} 个，失败 ${failCount} 个`)
+      toast.warning(`清除已禁用凭据：成功 ${successCount} 个，失败 ${failCount} 个`)
     }
 
     deselectAll()
@@ -555,7 +582,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     <RotateCcw className="h-4 w-4 mr-2" />
                     恢复异常
                   </Button>
-                  <Button onClick={handleBatchDelete} size="sm" variant="destructive">
+                  <Button
+                    onClick={handleBatchDelete}
+                    size="sm"
+                    variant="destructive"
+                    disabled={selectedDisabledCount === 0}
+                    title={selectedDisabledCount === 0 ? '只能删除已禁用凭据' : undefined}
+                  >
                     <Trash2 className="h-4 w-4 mr-2" />
                     批量删除
                   </Button>
@@ -584,9 +617,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   size="sm"
                   variant="outline"
                   className="text-destructive hover:text-destructive"
+                  disabled={disabledCredentialCount === 0}
+                  title={disabledCredentialCount === 0 ? '没有可清除的已禁用凭据' : undefined}
                 >
                   <Trash2 className="h-4 w-4 mr-2" />
-                  一键清除
+                  清除已禁用
                 </Button>
               )}
               <Button onClick={() => setBatchImportDialogOpen(true)} size="sm" variant="outline">

@@ -111,6 +111,12 @@ export function CredentialCard({
   }
 
   const handleDelete = () => {
+    if (!credential.disabled) {
+      toast.error('请先禁用凭据再删除')
+      setShowDeleteDialog(false)
+      return
+    }
+
     deleteCredential.mutate(credential.id, {
       onSuccess: (res) => {
         toast.success(res.message)
@@ -302,6 +308,8 @@ export function CredentialCard({
               size="sm"
               variant="destructive"
               onClick={() => setShowDeleteDialog(true)}
+              disabled={!credential.disabled}
+              title={!credential.disabled ? '需要先禁用凭据才能删除' : undefined}
             >
               <Trash2 className="h-4 w-4 mr-1" />
               删除
@@ -330,7 +338,7 @@ export function CredentialCard({
             <Button
               variant="destructive"
               onClick={handleDelete}
-              disabled={deleteCredential.isPending}
+              disabled={deleteCredential.isPending || !credential.disabled}
             >
               确认删除
             </Button>
