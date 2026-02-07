@@ -447,6 +447,8 @@ pub struct CredentialEntrySnapshot {
     pub expires_at: Option<String>,
     /// refreshToken 的 SHA-256 哈希（用于前端重复检测）
     pub refresh_token_hash: Option<String>,
+    /// 用户邮箱（用于前端显示）
+    pub email: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -1229,6 +1231,7 @@ impl MultiTokenManager {
                     has_profile_arn: e.credentials.profile_arn.is_some(),
                     expires_at: e.credentials.expires_at.clone(),
                     refresh_token_hash: e.credentials.refresh_token.as_deref().map(sha256_hex),
+                    email: e.credentials.email.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                 })
@@ -1425,6 +1428,7 @@ impl MultiTokenManager {
         validated_cred.client_secret = new_cred.client_secret;
         validated_cred.region = new_cred.region;
         validated_cred.machine_id = new_cred.machine_id;
+        validated_cred.email = new_cred.email;
 
         {
             let mut entries = self.entries.lock();

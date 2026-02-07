@@ -352,6 +352,7 @@ mod tests {
             priority: 0,
             region: Some("eu-west-1".to_string()),
             machine_id: None,
+            email: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -479,6 +480,7 @@ mod tests {
             priority: 3,
             region: Some("us-west-2".to_string()),
             machine_id: Some("c".repeat(64)),
+            email: None,
         };
 
         let json = original.to_pretty_json().unwrap();

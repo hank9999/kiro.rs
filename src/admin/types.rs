@@ -94,6 +94,9 @@ pub struct AddCredentialRequest {
     /// 凭据级 Machine ID（可选，64 位字符串）
     /// 未配置时回退到 config.json 的 machineId
     pub machine_id: Option<String>,
+
+    /// 用户邮箱（可选，用于前端显示）
+    pub email: Option<String>,
 }
 
 fn default_auth_method() -> String {

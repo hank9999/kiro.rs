@@ -70,7 +70,7 @@ impl AdminService {
                 auth_method: entry.auth_method,
                 has_profile_arn: entry.has_profile_arn,
                 refresh_token_hash: entry.refresh_token_hash,
-                email: None,
+                email: entry.email,
                 success_count: entry.success_count,
                 last_used_at: entry.last_used_at.clone(),
             })
@@ -185,6 +185,7 @@ impl AdminService {
         req: AddCredentialRequest,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
         // 构建凭据对象
+        let email = req.email.clone();
         let new_cred = KiroCredentials {
             id: None,
             access_token: None,
@@ -197,7 +198,7 @@ impl AdminService {
             priority: req.priority,
             region: req.region,
             machine_id: req.machine_id,
-            email: None,
+            email: req.email,
         };
 
         // 调用 token_manager 添加凭据
@@ -211,7 +212,7 @@ impl AdminService {
             success: true,
             message: format!("凭据添加成功，ID: {}", credential_id),
             credential_id,
-            email: None,
+            email,
         })
     }
 
