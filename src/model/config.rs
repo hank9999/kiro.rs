@@ -74,6 +74,16 @@ pub struct Config {
     /// Admin API 密钥（可选，启用 Admin API 功能）
     #[serde(default)]
     pub admin_api_key: Option<String>,
+
+    /// 智能摘要使用的模型（可选，默认 claude-sonnet-4.5）
+    /// 可选值：claude-sonnet-4.5, claude-sonnet-4, claude-haiku-4.5
+    /// 注意：不支持 claude-opus-4.5
+    #[serde(default = "default_summary_model")]
+    pub summary_model: String,
+}
+
+fn default_summary_model() -> String {
+    "claude-sonnet-4.5".to_string()
 }
 
 fn default_host() -> String {
@@ -128,6 +138,7 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            summary_model: default_summary_model(),
         }
     }
 }

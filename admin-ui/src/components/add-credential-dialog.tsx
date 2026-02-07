@@ -9,8 +9,10 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 import { useAddCredential } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import { ALL_MODEL_IDS, MODEL_OPTIONS, type SupportedModelId } from '@/lib/models'
 
 interface AddCredentialDialogProps {
   open: boolean
@@ -26,6 +28,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
   const [priority, setPriority] = useState('0')
+  const [enabledModels, setEnabledModels] = useState<SupportedModelId[]>([...ALL_MODEL_IDS])
 
   const { mutate, isPending } = useAddCredential()
 
@@ -36,6 +39,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setClientId('')
     setClientSecret('')
     setPriority('0')
+    setEnabledModels([...ALL_MODEL_IDS])
   }
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -53,6 +57,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       return
     }
 
+    const enabledModelsPayload =
+      enabledModels.length === ALL_MODEL_IDS.length ? undefined : enabledModels
+
     mutate(
       {
         refreshToken: refreshToken.trim(),
@@ -61,6 +68,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         clientId: clientId.trim() || undefined,
         clientSecret: clientSecret.trim() || undefined,
         priority: parseInt(priority) || 0,
+        enabledModels: enabledModelsPayload,
       },
       {
         onSuccess: (data) => {
@@ -176,6 +184,52 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               />
               <p className="text-xs text-muted-foreground">
                 数字越小优先级越高，默认为 0
+              </p>
+            </div>
+
+            {/* 模型开关 */}
+            <div className="space-y-2">
+              <label className="text-sm font-medium">启用模型</label>
+              <div className="flex flex-wrap items-center gap-4 rounded-md border border-input bg-background px-3 py-3">
+                {MODEL_OPTIONS.map((m) => {
+                  const checked = enabledModels.includes(m.id)
+                  return (
+                    <div key={m.id} className="flex items-center gap-2">
+                      <Switch
+                        checked={checked}
+                        onCheckedChange={(v) => {
+                          setEnabledModels((prev) => {
+                            if (v) return Array.from(new Set([...prev, m.id]))
+                            return prev.filter((x) => x !== m.id)
+                          })
+                        }}
+                        disabled={isPending}
+                      />
+                      <span className="text-sm">{m.label}</span>
+                    </div>
+                  )
+                })}
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setEnabledModels([...ALL_MODEL_IDS])}
+                  disabled={isPending}
+                >
+                  全选
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setEnabledModels([])}
+                  disabled={isPending}
+                >
+                  全不选
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                不配置时默认全开；你也可以按凭据限制可用模型，避免请求命中不支持模型导致 400。
               </p>
             </div>
           </div>

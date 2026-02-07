@@ -177,7 +177,7 @@ impl UserInputMessageContext {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KiroImage {
-    /// 图片格式（"jpeg", "png", "gif", "webp"）
+    /// 图片格式（"jpeg", "png", "gif", "webp", "bmp"）
     pub format: String,
     /// 图片数据源
     pub source: KiroImageSource,
@@ -386,7 +386,10 @@ mod tests {
             Message::assistant("Hi! How can I help you?"),
         ];
 
-        let json = serde_json::to_string(&history).unwrap();
+        let json = match serde_json::to_string(&history) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert!(json.contains("userInputMessage"));
         assert!(json.contains("assistantResponseMessage"));
     }
@@ -400,7 +403,10 @@ mod tests {
                 "claude-3-5-sonnet",
             )));
 
-        let json = serde_json::to_string(&state).unwrap();
+        let json = match serde_json::to_string(&state) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert!(json.contains("\"conversationId\":\"conv-123\""));
         assert!(json.contains("\"agentTaskType\":\"vibe\""));
         assert!(json.contains("\"content\":\"Hello\""));

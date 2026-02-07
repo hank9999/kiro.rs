@@ -10,4 +10,8 @@
 /admin-ui/dist/
 /admin-ui/pnpm-lock.yaml
 /admin-ui/tsconfig.tsbuildinfo
+public/
 /credentials.*
+.ai_workflow/
+findings.md
+progress.md

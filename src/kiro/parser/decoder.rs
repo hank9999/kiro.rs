@@ -422,7 +422,10 @@ mod tests {
     #[test]
     fn test_decoder_insufficient_data() {
         let mut decoder = EventStreamDecoder::new();
-        decoder.feed(&[0u8; 10]).unwrap();
+        match decoder.feed(&[0u8; 10]) {
+            Ok(()) => {}
+            Err(e) => panic!("{:?}", e),
+        }
 
         let result = decoder.decode();
         assert!(matches!(result, Ok(None)));
@@ -432,7 +435,10 @@ mod tests {
     #[test]
     fn test_decoder_reset() {
         let mut decoder = EventStreamDecoder::new();
-        decoder.feed(&[1, 2, 3, 4]).unwrap();
+        match decoder.feed(&[1, 2, 3, 4]) {
+            Ok(()) => {}
+            Err(e) => panic!("{:?}", e),
+        }
 
         decoder.reset();
         assert_eq!(decoder.state(), DecoderState::Ready);

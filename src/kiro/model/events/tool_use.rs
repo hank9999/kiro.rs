@@ -15,7 +15,8 @@ use super::base::EventPayload;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolUseEvent {
-    /// 工具名称
+    /// 工具名称（分片事件可能不包含该字段）
+    #[serde(default)]
     pub name: String,
     /// 工具调用 ID
     pub tool_use_id: String,
