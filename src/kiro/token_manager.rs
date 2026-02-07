@@ -960,7 +960,7 @@ impl MultiTokenManager {
 
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
-            Err(_) => return, // file doesn't exist on first run
+            Err(_) => return, // 首次运行时文件不存在
         };
 
         let stats: HashMap<String, StatsEntry> = match serde_json::from_str(&content) {

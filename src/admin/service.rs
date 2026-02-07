@@ -17,15 +17,15 @@ use super::types::{
     CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
 };
 
-/// Balance cache TTL in seconds (5 minutes)
+/// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
 
-/// Cached balance entry with timestamp
+/// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedBalance {
-    /// Cache timestamp (Unix seconds)
+    /// 缓存时间（Unix 秒）
     cached_at: f64,
-    /// Cached balance data
+    /// 缓存的余额数据
     data: BalanceResponse,
 }
 
@@ -120,7 +120,7 @@ impl AdminService {
 
     /// 获取凭据余额（带缓存）
     pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        // Check cache first
+        // 先查缓存
         {
             let cache = self.balance_cache.lock();
             if let Some(cached) = cache.get(&id) {
@@ -132,10 +132,10 @@ impl AdminService {
             }
         }
 
-        // Cache miss or stale, fetch from upstream
+        // 缓存未命中或已过期，从上游获取
         let balance = self.fetch_balance(id).await?;
 
-        // Update cache
+        // 更新缓存
         {
             let mut cache = self.balance_cache.lock();
             cache.insert(
@@ -249,7 +249,7 @@ impl AdminService {
         Ok(LoadBalancingModeResponse { mode: req.mode })
     }
 
-    // ============ Balance cache persistence ============
+    // ============ 余额缓存持久化 ============
 
     fn load_balance_cache_from(cache_path: &Option<PathBuf>) -> HashMap<u64, CachedBalance> {
         let path = match cache_path {
@@ -262,7 +262,7 @@ impl AdminService {
             Err(_) => return HashMap::new(),
         };
 
-        // File uses string keys for JSON compatibility
+        // 文件中使用字符串 key 以兼容 JSON 格式
         let map: HashMap<String, CachedBalance> = match serde_json::from_str(&content) {
             Ok(m) => m,
             Err(e) => {
@@ -275,7 +275,7 @@ impl AdminService {
         map.into_iter()
             .filter_map(|(k, v)| {
                 let id = k.parse::<u64>().ok()?;
-                // Discard entries older than TTL
+                // 丢弃超过 TTL 的条目
                 if (now - v.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
                     Some((id, v))
                 } else {
@@ -291,7 +291,7 @@ impl AdminService {
             None => return,
         };
 
-        // Hold lock during serialize + write to prevent concurrent corruption
+        // 持有锁期间完成序列化和写入，防止并发损坏
         let cache = self.balance_cache.lock();
         let map: HashMap<String, &CachedBalance> =
             cache.iter().map(|(k, v)| (k.to_string(), v)).collect();
@@ -306,7 +306,7 @@ impl AdminService {
         }
     }
 
-    // ============ Error classification ============
+    // ============ 错误分类 ============
 
     /// 分类简单操作错误（set_disabled, set_priority, reset_and_enable）
     fn classify_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
