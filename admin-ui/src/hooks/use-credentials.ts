@@ -7,8 +7,9 @@ import {
   getCredentialBalance,
   addCredential,
   deleteCredential,
+  importTokenJson,
 } from '@/api/credentials'
-import type { AddCredentialRequest } from '@/types/api'
+import type { AddCredentialRequest, ImportTokenJsonRequest } from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -82,6 +83,20 @@ export function useDeleteCredential() {
     mutationFn: (id: number) => deleteCredential(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 批量导入 token.json
+export function useImportTokenJson() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: ImportTokenJsonRequest) => importTokenJson(req),
+    onSuccess: (data) => {
+      // 只有实际添加了凭据时才刷新列表
+      if (data.summary.added > 0) {
+        queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      }
     },
   })
 }
