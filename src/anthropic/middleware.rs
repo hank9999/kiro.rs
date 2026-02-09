@@ -12,6 +12,7 @@ use axum::{
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
+use crate::flow_monitor::FlowMonitor;
 
 use super::types::ErrorResponse;
 
@@ -25,6 +26,7 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// Profile ARN（可选，用于请求）
     pub profile_arn: Option<String>,
+    pub flow_monitor: Option<Arc<FlowMonitor>>,
 }
 
 impl AppState {
@@ -34,6 +36,7 @@ impl AppState {
             api_key: api_key.into(),
             kiro_provider: None,
             profile_arn: None,
+            flow_monitor: None,
         }
     }
 
@@ -46,6 +49,12 @@ impl AppState {
     /// 设置 Profile ARN
     pub fn with_profile_arn(mut self, arn: impl Into<String>) -> Self {
         self.profile_arn = Some(arn.into());
+        self
+    }
+
+    /// 设置 FlowMonitor
+    pub fn with_flow_monitor(mut self, monitor: Arc<FlowMonitor>) -> Self {
+        self.flow_monitor = Some(monitor);
         self
     }
 }

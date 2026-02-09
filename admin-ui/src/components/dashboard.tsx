@@ -11,16 +11,20 @@ import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
+import { FlowMonitor } from '@/components/flow-monitor'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
+import { useFlowMonitorAvailable } from '@/hooks/use-flows'
 import { getCredentialBalance } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
 
 interface DashboardProps {
   onLogout: () => void
+  currentPage: 'credentials' | 'flows'
+  onPageChange: (page: 'credentials' | 'flows') => void
 }
 
-export function Dashboard({ onLogout }: DashboardProps) {
+export function Dashboard({ onLogout, currentPage, onPageChange }: DashboardProps) {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
@@ -35,7 +39,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [queryingInfo, setQueryingInfo] = useState(false)
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
   const cancelVerifyRef = useRef(false)
-  const [currentPage, setCurrentPage] = useState(1)
+  const [paginationPage, setPaginationPage] = useState(1)
   const itemsPerPage = 12
   const [darkMode, setDarkMode] = useState(() => {
     if (typeof window !== 'undefined') {
@@ -50,10 +54,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
+  const { data: flowMonitorAvailable } = useFlowMonitorAvailable()
 
   // 计算分页
   const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
-  const startIndex = (currentPage - 1) * itemsPerPage
+  const startIndex = (paginationPage - 1) * itemsPerPage
   const endIndex = startIndex + itemsPerPage
   const currentCredentials = data?.credentials.slice(startIndex, endIndex) || []
   const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
@@ -64,7 +69,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   // 当凭据列表变化时重置到第一页
   useEffect(() => {
-    setCurrentPage(1)
+    setPaginationPage(1)
   }, [data?.credentials.length])
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
@@ -494,6 +499,24 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <div className="flex items-center gap-2">
             <Server className="h-5 w-5" />
             <span className="font-semibold">Kiro Admin</span>
+            <nav className="ml-4 flex gap-1">
+              <Button
+                variant={currentPage === 'credentials' ? 'default' : 'ghost'}
+                size="sm"
+                onClick={() => onPageChange('credentials')}
+              >
+                凭据管理
+              </Button>
+              {flowMonitorAvailable && (
+                <Button
+                  variant={currentPage === 'flows' ? 'default' : 'ghost'}
+                  size="sm"
+                  onClick={() => onPageChange('flows')}
+                >
+                  流量监控
+                </Button>
+              )}
+            </nav>
           </div>
           <div className="flex items-center gap-2">
             <Button
@@ -520,6 +543,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
       {/* 主内容 */}
       <main className="container mx-auto px-4 md:px-8 py-6">
+        {currentPage === 'flows' && <FlowMonitor />}
+        {currentPage === 'credentials' && (
+        <>
         {/* 统计卡片 */}
         <div className="grid gap-4 md:grid-cols-3 mb-6">
           <Card>
@@ -662,19 +688,19 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
-                    disabled={currentPage === 1}
+                    onClick={() => setPaginationPage(p => Math.max(1, p - 1))}
+                    disabled={paginationPage === 1}
                   >
                     上一页
                   </Button>
                   <span className="text-sm text-muted-foreground">
-                    第 {currentPage} / {totalPages} 页（共 {data?.credentials.length} 个凭据）
+                    第 {paginationPage} / {totalPages} 页（共 {data?.credentials.length} 个凭据）
                   </span>
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
-                    disabled={currentPage === totalPages}
+                    onClick={() => setPaginationPage(p => Math.min(totalPages, p + 1))}
+                    disabled={paginationPage === totalPages}
                   >
                     下一页
                   </Button>
@@ -683,6 +709,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </>
           )}
         </div>
+        </>
+        )}
       </main>
 
       {/* 余额对话框 */}

@@ -2,6 +2,7 @@ mod admin;
 mod admin_ui;
 mod anthropic;
 mod common;
+mod flow_monitor;
 mod http_client;
 mod kiro;
 mod model;
@@ -101,11 +102,33 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
+    // 初始化流量监控
+    let flow_store_path = std::path::Path::new(&config_path)
+        .parent()
+        .map(|dir| dir.join("flow_monitor.db"))
+        .unwrap_or_else(|| std::path::PathBuf::from("flow_monitor.db"));
+
+    tracing::info!("流量监控数据库路径: {}", flow_store_path.display());
+
+    let flow_monitor = match flow_monitor::FlowMonitor::new(
+        flow_store_path.to_str().unwrap_or("flow_monitor.db")
+    ) {
+        Ok(monitor) => {
+            tracing::info!("流量监控已启用");
+            Some(Arc::new(monitor))
+        }
+        Err(e) => {
+            tracing::warn!("流量监控初始化失败，将在无监控模式下运行: {}", e);
+            None
+        }
+    };
+
     // 构建 Anthropic API 路由（从第一个凭据获取 profile_arn）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),
         first_credentials.profile_arn.clone(),
+        flow_monitor.clone(),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -130,9 +153,24 @@ async fn main() {
 
             tracing::info!("Admin API 已启用");
             tracing::info!("Admin UI 已启用: /admin");
-            anthropic_app
+
+            // 只有在 flow_monitor 初始化成功时才创建 Flow Monitor 路由
+            let app_with_admin = anthropic_app
                 .nest("/api/admin", admin_app)
-                .nest("/admin", admin_ui_app)
+                .nest("/admin", admin_ui_app);
+
+            if let Some(ref monitor) = flow_monitor {
+                // 创建 Flow Monitor 路由（独立认证层）
+                let flow_app = flow_monitor::create_flow_monitor_router(
+                    admin_key,
+                    monitor.clone(),
+                );
+                tracing::info!("Flow Monitor API 已启用: /api/admin/flows");
+                app_with_admin.nest("/api/admin", flow_app)
+            } else {
+                tracing::warn!("Flow Monitor API 未启用（初始化失败）");
+                app_with_admin
+            }
         }
     } else {
         anthropic_app
@@ -155,6 +193,12 @@ async fn main() {
         tracing::info!("  GET  /api/admin/credentials/:index/balance");
         tracing::info!("Admin UI:");
         tracing::info!("  GET  /admin");
+        if flow_monitor.is_some() {
+            tracing::info!("Flow Monitor API:");
+            tracing::info!("  GET  /api/admin/flows");
+            tracing::info!("  GET  /api/admin/flows/stats");
+            tracing::info!("  DELETE /api/admin/flows");
+        }
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

@@ -1077,7 +1077,7 @@ impl StreamContext {
 /// 4. 一次性返回所有事件
 pub struct BufferedStreamContext {
     /// 内部流处理上下文（复用现有的事件处理逻辑）
-    inner: StreamContext,
+    pub inner: StreamContext,
     /// 缓冲的所有事件（包括 message_start、content_block_start 等）
     event_buffer: Vec<SseEvent>,
     /// 估算的 input_tokens（用于回退）

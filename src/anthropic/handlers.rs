@@ -20,11 +20,41 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
+use crate::flow_monitor::{FlowMonitor, model::FlowRecord};
+
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
+
+/// 从上游错误信息中提取 HTTP 状态码，提取失败时返回 502
+fn extract_upstream_status(error: &anyhow::Error) -> u16 {
+    let msg = error.to_string();
+    // 匹配 "请求失败: {3-digit-status}" 或 "请求失败（...）: {3-digit-status}"
+    if let Some(pos) = msg.rfind(": ") {
+        let after = &msg[pos + 2..];
+        if after.len() >= 3 {
+            if let Ok(code) = after[..3].parse::<u16>() {
+                if (400..=599).contains(&code) {
+                    return code;
+                }
+            }
+        }
+    }
+    502
+}
+
+/// 流量记录元数据，在流开始时捕获，在流结束时用于构建 FlowRecord
+#[derive(Clone)]
+struct FlowMeta {
+    flow_monitor: std::sync::Arc<FlowMonitor>,
+    start_time: std::time::Instant,
+    path: String,
+    model: String,
+    user_id: Option<String>,
+    stream: bool,
+}
 
 /// GET /v1/models
 ///
@@ -220,6 +250,16 @@ pub async fn post_messages(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
 
+    // 构建流量记录元数据
+    let flow_meta = state.flow_monitor.as_ref().map(|monitor| FlowMeta {
+        flow_monitor: monitor.clone(),
+        start_time: std::time::Instant::now(),
+        path: "/v1/messages".to_string(),
+        model: payload.model.clone(),
+        user_id: payload.metadata.as_ref().and_then(|m| m.user_id.clone()),
+        stream: payload.stream,
+    });
+
     if payload.stream {
         // 流式响应
         handle_stream_request(
@@ -228,11 +268,12 @@ pub async fn post_messages(
             &payload.model,
             input_tokens,
             thinking_enabled,
+            flow_meta,
         )
         .await
     } else {
         // 非流式响应
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, flow_meta).await
     }
 }
 
@@ -243,12 +284,32 @@ async fn handle_stream_request(
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
+    flow_meta: Option<FlowMeta>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!("Kiro API 调用失败: {}", e);
+            // 记录上游调用失败
+            if let Some(ref meta) = flow_meta {
+                let record = FlowRecord {
+                    id: 0,
+                    request_id: Uuid::new_v4().to_string(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    method: "POST".to_string(),
+                    path: meta.path.clone(),
+                    model: meta.model.clone(),
+                    stream: meta.stream,
+                    input_tokens: None,
+                    output_tokens: None,
+                    duration_ms: meta.start_time.elapsed().as_millis() as i64,
+                    status_code: extract_upstream_status(&e),
+                    error: Some(format!("上游 API 调用失败: {}", e)),
+                    user_id: meta.user_id.clone(),
+                };
+                meta.flow_monitor.record(record);
+            }
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
@@ -267,7 +328,7 @@ async fn handle_stream_request(
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events);
+    let stream = create_sse_stream(response, ctx, initial_events, flow_meta);
 
     // 返回 SSE 响应
     Response::builder()
@@ -292,6 +353,7 @@ fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
+    flow_meta: Option<FlowMeta>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -305,7 +367,9 @@ fn create_sse_stream(
 
     let processing_stream = stream::unfold(
         (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        move |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| {
+            let flow_meta = flow_meta.clone();
+            async move {
             if finished {
                 return None;
             }
@@ -346,6 +410,26 @@ fn create_sse_stream(
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
+                            // 记录流量（错误）
+                            if let Some(ref meta) = flow_meta {
+                                let final_input = ctx.context_input_tokens.unwrap_or(ctx.input_tokens);
+                                let record = FlowRecord {
+                                    id: 0,
+                                    request_id: Uuid::new_v4().to_string(),
+                                    timestamp: chrono::Utc::now().to_rfc3339(),
+                                    method: "POST".to_string(),
+                                    path: meta.path.clone(),
+                                    model: meta.model.clone(),
+                                    stream: meta.stream,
+                                    input_tokens: Some(final_input as i64),
+                                    output_tokens: Some(ctx.output_tokens as i64),
+                                    duration_ms: meta.start_time.elapsed().as_millis() as i64,
+                                    status_code: 502,
+                                    error: Some(format!("读取响应流失败: {}", e)),
+                                    user_id: meta.user_id.clone(),
+                                };
+                                meta.flow_monitor.record(record);
+                            }
                             // 发送最终事件并结束
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -355,6 +439,26 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
                         }
                         None => {
+                            // 记录流量（成功）
+                            if let Some(ref meta) = flow_meta {
+                                let final_input = ctx.context_input_tokens.unwrap_or(ctx.input_tokens);
+                                let record = FlowRecord {
+                                    id: 0,
+                                    request_id: Uuid::new_v4().to_string(),
+                                    timestamp: chrono::Utc::now().to_rfc3339(),
+                                    method: "POST".to_string(),
+                                    path: meta.path.clone(),
+                                    model: meta.model.clone(),
+                                    stream: meta.stream,
+                                    input_tokens: Some(final_input as i64),
+                                    output_tokens: Some(ctx.output_tokens as i64),
+                                    duration_ms: meta.start_time.elapsed().as_millis() as i64,
+                                    status_code: 200,
+                                    error: None,
+                                    user_id: meta.user_id.clone(),
+                                };
+                                meta.flow_monitor.record(record);
+                            }
                             // 流结束，发送最终事件
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -372,7 +476,7 @@ fn create_sse_stream(
                     Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
                 }
             }
-        },
+        }},
     )
     .flatten();
 
@@ -388,12 +492,32 @@ async fn handle_non_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    flow_meta: Option<FlowMeta>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api(request_body).await {
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!("Kiro API 调用失败: {}", e);
+            // 记录上游调用失败
+            if let Some(ref meta) = flow_meta {
+                let record = FlowRecord {
+                    id: 0,
+                    request_id: Uuid::new_v4().to_string(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    method: "POST".to_string(),
+                    path: meta.path.clone(),
+                    model: meta.model.clone(),
+                    stream: meta.stream,
+                    input_tokens: None,
+                    output_tokens: None,
+                    duration_ms: meta.start_time.elapsed().as_millis() as i64,
+                    status_code: extract_upstream_status(&e),
+                    error: Some(format!("上游 API 调用失败: {}", e)),
+                    user_id: meta.user_id.clone(),
+                };
+                meta.flow_monitor.record(record);
+            }
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
@@ -410,6 +534,25 @@ async fn handle_non_stream_request(
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!("读取响应体失败: {}", e);
+            // 记录上游调用失败
+            if let Some(ref meta) = flow_meta {
+                let record = FlowRecord {
+                    id: 0,
+                    request_id: Uuid::new_v4().to_string(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    method: "POST".to_string(),
+                    path: meta.path.clone(),
+                    model: meta.model.clone(),
+                    stream: meta.stream,
+                    input_tokens: None,
+                    output_tokens: None,
+                    duration_ms: meta.start_time.elapsed().as_millis() as i64,
+                    status_code: 502,
+                    error: Some(format!("读取响应失败: {}", e)),
+                    user_id: meta.user_id.clone(),
+                };
+                meta.flow_monitor.record(record);
+            }
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
@@ -544,6 +687,26 @@ async fn handle_non_stream_request(
             "output_tokens": output_tokens
         }
     });
+
+    // 记录流量
+    if let Some(ref meta) = flow_meta {
+        let record = FlowRecord {
+            id: 0,
+            request_id: Uuid::new_v4().to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            method: "POST".to_string(),
+            path: meta.path.clone(),
+            model: meta.model.clone(),
+            stream: meta.stream,
+            input_tokens: Some(final_input_tokens as i64),
+            output_tokens: Some(output_tokens as i64),
+            duration_ms: meta.start_time.elapsed().as_millis() as i64,
+            status_code: 200,
+            error: None,
+            user_id: meta.user_id.clone(),
+        };
+        meta.flow_monitor.record(record);
+    }
 
     (StatusCode::OK, Json(response_body)).into_response()
 }
@@ -720,6 +883,16 @@ pub async fn post_messages_cc(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
 
+    // 构建流量记录元数据
+    let flow_meta = state.flow_monitor.as_ref().map(|monitor| FlowMeta {
+        flow_monitor: monitor.clone(),
+        start_time: std::time::Instant::now(),
+        path: "/cc/v1/messages".to_string(),
+        model: payload.model.clone(),
+        user_id: payload.metadata.as_ref().and_then(|m| m.user_id.clone()),
+        stream: payload.stream,
+    });
+
     if payload.stream {
         // 流式响应（缓冲模式）
         handle_stream_request_buffered(
@@ -728,11 +901,12 @@ pub async fn post_messages_cc(
             &payload.model,
             input_tokens,
             thinking_enabled,
+            flow_meta,
         )
         .await
     } else {
         // 非流式响应（复用现有逻辑，已经使用正确的 input_tokens）
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, flow_meta).await
     }
 }
 
@@ -746,12 +920,32 @@ async fn handle_stream_request_buffered(
     model: &str,
     estimated_input_tokens: i32,
     thinking_enabled: bool,
+    flow_meta: Option<FlowMeta>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!("Kiro API 调用失败: {}", e);
+            // 记录上游调用失败
+            if let Some(ref meta) = flow_meta {
+                let record = FlowRecord {
+                    id: 0,
+                    request_id: Uuid::new_v4().to_string(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    method: "POST".to_string(),
+                    path: meta.path.clone(),
+                    model: meta.model.clone(),
+                    stream: meta.stream,
+                    input_tokens: None,
+                    output_tokens: None,
+                    duration_ms: meta.start_time.elapsed().as_millis() as i64,
+                    status_code: extract_upstream_status(&e),
+                    error: Some(format!("上游 API 调用失败: {}", e)),
+                    user_id: meta.user_id.clone(),
+                };
+                meta.flow_monitor.record(record);
+            }
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
@@ -767,7 +961,7 @@ async fn handle_stream_request_buffered(
     let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled);
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx);
+    let stream = create_buffered_sse_stream(response, ctx, flow_meta);
 
     // 返回 SSE 响应
     Response::builder()
@@ -789,6 +983,7 @@ async fn handle_stream_request_buffered(
 fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
+    flow_meta: Option<FlowMeta>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -800,7 +995,9 @@ fn create_buffered_sse_stream(
             false,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        move |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| {
+            let flow_meta = flow_meta.clone();
+            async move {
             if finished {
                 return None;
             }
@@ -844,6 +1041,26 @@ fn create_buffered_sse_stream(
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
+                                // 记录流量（错误）
+                                if let Some(ref meta) = flow_meta {
+                                    let final_input = ctx.inner.context_input_tokens.unwrap_or(ctx.inner.input_tokens);
+                                    let record = FlowRecord {
+                                        id: 0,
+                                        request_id: Uuid::new_v4().to_string(),
+                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                        method: "POST".to_string(),
+                                        path: meta.path.clone(),
+                                        model: meta.model.clone(),
+                                        stream: meta.stream,
+                                        input_tokens: Some(final_input as i64),
+                                        output_tokens: Some(ctx.inner.output_tokens as i64),
+                                        duration_ms: meta.start_time.elapsed().as_millis() as i64,
+                                        status_code: 502,
+                                        error: Some(format!("读取响应流失败: {}", e)),
+                                        user_id: meta.user_id.clone(),
+                                    };
+                                    meta.flow_monitor.record(record);
+                                }
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
@@ -853,6 +1070,26 @@ fn create_buffered_sse_stream(
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
                             }
                             None => {
+                                // 记录流量（成功）
+                                if let Some(ref meta) = flow_meta {
+                                    let final_input = ctx.inner.context_input_tokens.unwrap_or(ctx.inner.input_tokens);
+                                    let record = FlowRecord {
+                                        id: 0,
+                                        request_id: Uuid::new_v4().to_string(),
+                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                        method: "POST".to_string(),
+                                        path: meta.path.clone(),
+                                        model: meta.model.clone(),
+                                        stream: meta.stream,
+                                        input_tokens: Some(final_input as i64),
+                                        output_tokens: Some(ctx.inner.output_tokens as i64),
+                                        duration_ms: meta.start_time.elapsed().as_millis() as i64,
+                                        status_code: 200,
+                                        error: None,
+                                        user_id: meta.user_id.clone(),
+                                    };
+                                    meta.flow_monitor.record(record);
+                                }
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
@@ -865,6 +1102,7 @@ fn create_buffered_sse_stream(
                     }
                 }
             }
+        }
         },
     )
     .flatten()

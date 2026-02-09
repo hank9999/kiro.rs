@@ -7,6 +7,8 @@ use axum::{
     routing::{get, post},
 };
 
+use std::sync::Arc;
+use crate::flow_monitor::FlowMonitor;
 use crate::kiro::provider::KiroProvider;
 
 use super::{
@@ -38,6 +40,7 @@ pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
     profile_arn: Option<String>,
+    flow_monitor: Option<Arc<FlowMonitor>>,
 ) -> Router {
     let mut state = AppState::new(api_key);
     if let Some(provider) = kiro_provider {
@@ -45,6 +48,9 @@ pub fn create_router_with_provider(
     }
     if let Some(arn) = profile_arn {
         state = state.with_profile_arn(arn);
+    }
+    if let Some(monitor) = flow_monitor {
+        state = state.with_flow_monitor(monitor);
     }
 
     // 需要认证的 /v1 路由

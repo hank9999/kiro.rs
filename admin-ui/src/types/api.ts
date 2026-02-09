@@ -74,3 +74,56 @@ export interface AddCredentialResponse {
   credentialId: number
   email?: string
 }
+
+// ===== Flow Monitor 类型 =====
+
+export interface FlowRecord {
+  id: number
+  requestId: string
+  timestamp: string
+  path: string
+  model: string
+  stream: boolean
+  inputTokens: number | null
+  outputTokens: number | null
+  totalTokens: number | null
+  durationMs: number
+  statusCode: number
+  error: string | null
+  userId: string | null
+}
+
+export interface FlowListResponse {
+  total: number
+  page: number
+  pageSize: number
+  records: FlowRecord[]
+}
+
+export interface FlowStatsResponse {
+  totalRequests: number
+  totalInputTokens: number
+  totalOutputTokens: number
+  totalTokens: number
+  avgDurationMs: number
+  errorCount: number
+  errorRate: number
+  models: ModelStats[]
+}
+
+export interface ModelStats {
+  model: string
+  count: number
+  totalInputTokens: number
+  totalOutputTokens: number
+  avgDurationMs: number
+}
+
+export interface FlowQuery {
+  page?: number
+  pageSize?: number
+  model?: string
+  status?: 'success' | 'error'
+  startTime?: string
+  endTime?: string
+}

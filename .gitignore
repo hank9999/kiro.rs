@@ -11,6 +11,10 @@
 /admin-ui/pnpm-lock.yaml
 /admin-ui/package-lock.json
 /admin-ui/tsconfig.tsbuildinfo
-/credentials.*
-/kiro_balance_cache.json
-/kiro_stats.json
+*/credentials.*
+*/kiro_balance_cache.json
+*/kiro_stats.json
+/config/*
+.omc/*
+.ace-tool/
+.tmp/*
