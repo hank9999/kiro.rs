@@ -145,6 +145,20 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         return Err(ConversionError::EmptyMessages);
     }
 
+    // 2.5. 预处理 prefill：如果末尾是 assistant，静默丢弃并截断到最后一条 user
+    // Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持
+    let messages: &[_] = if req.messages.last().is_some_and(|m| m.role != "user") {
+        tracing::info!("检测到末尾 assistant 消息（prefill），静默丢弃");
+        let last_user_idx = req
+            .messages
+            .iter()
+            .rposition(|m| m.role == "user")
+            .ok_or(ConversionError::EmptyMessages)?;
+        &req.messages[..=last_user_idx]
+    } else {
+        &req.messages
+    };
+
     // 3. 生成会话 ID 和代理 ID
     // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
     let conversation_id = req
@@ -158,15 +172,15 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 4. 确定触发类型
     let chat_trigger_type = determine_chat_trigger_type(req);
 
-    // 5. 处理最后一条消息作为 current_message
-    let last_message = req.messages.last().unwrap();
+    // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
+    let last_message = messages.last().unwrap();
     let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
 
     // 6. 转换工具定义
     let mut tools = convert_tools(&req.tools);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let mut history = build_history(req, &model_id)?;
+    let mut history = build_history(req, messages, &model_id)?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
@@ -507,7 +521,7 @@ fn has_thinking_tags(content: &str) -> bool {
 }
 
 /// 构建历史消息
-fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, ConversionError> {
+fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -554,17 +568,16 @@ fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, 
 
     // 2. 处理常规消息历史
     // 最后一条消息作为 currentMessage，不加入历史
-    let history_end_index = req.messages.len().saturating_sub(1);
+    let history_end_index = messages.len().saturating_sub(1);
 
     // 如果最后一条是 assistant，则包含在历史中
-    let last_is_assistant = req
-        .messages
+    let last_is_assistant = messages
         .last()
         .map(|m| m.role == "assistant")
         .unwrap_or(false);
 
     let history_end_index = if last_is_assistant {
-        req.messages.len()
+        messages.len()
     } else {
         history_end_index
     };
@@ -573,7 +586,7 @@ fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, 
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
 
     for i in 0..history_end_index {
-        let msg = &req.messages[i];
+        let msg = &messages[i];
 
         if msg.role == "user" {
             user_buffer.push(msg);
