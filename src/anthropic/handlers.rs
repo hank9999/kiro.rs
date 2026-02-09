@@ -120,6 +120,17 @@ pub async fn post_messages(
     State(state): State<AppState>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    // 限制 max_tokens 最大值为 32000（Kiro 上游限制）
+    const MAX_TOKENS_LIMIT: i32 = 32000;
+    if payload.max_tokens > MAX_TOKENS_LIMIT {
+        tracing::warn!(
+            original = payload.max_tokens,
+            adjusted = MAX_TOKENS_LIMIT,
+            "max_tokens 超出上游限制，已自动调整"
+        );
+        payload.max_tokens = MAX_TOKENS_LIMIT;
+    }
+
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
