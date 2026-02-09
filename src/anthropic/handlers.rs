@@ -113,6 +113,16 @@ pub async fn get_models() -> impl IntoResponse {
     })
 }
 
+/// 对 user_id 进行掩码处理，保护隐私
+fn mask_user_id(user_id: Option<&str>) -> String {
+    match user_id {
+        Some(id) if id.len() > 25 => format!("{}***{}", &id[..13], &id[id.len() - 8..]),
+        Some(id) if id.len() > 12 => format!("{}***{}", &id[..4], &id[id.len() - 4..]),
+        Some(_) => "***".to_string(),
+        None => "None".to_string(),
+    }
+}
+
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
@@ -120,11 +130,14 @@ pub async fn post_messages(
     State(state): State<AppState>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    let user_id = payload.metadata.as_ref().and_then(|m| m.user_id.as_deref());
+
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
         message_count = %payload.messages.len(),
+        user_id = %mask_user_id(user_id),
         "Received POST /v1/messages request"
     );
     // 检查 KiroProvider 是否可用
