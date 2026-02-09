@@ -98,6 +98,23 @@ impl KiroProvider {
         )
     }
 
+    /// 从请求体中提取模型信息
+    ///
+    /// 尝试解析 JSON 请求体，提取 conversationState.currentMessage.userInputMessage.modelId
+    fn extract_model_from_request(request_body: &str) -> Option<String> {
+        use serde_json::Value;
+
+        let json: Value = serde_json::from_str(request_body).ok()?;
+
+        // 尝试提取 conversationState.currentMessage.userInputMessage.modelId
+        json.get("conversationState")?
+            .get("currentMessage")?
+            .get("userInputMessage")?
+            .get("modelId")?
+            .as_str()
+            .map(|s| s.to_string())
+    }
+
     /// 构建请求头
     ///
     /// # Arguments
@@ -253,7 +270,7 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文
-            let ctx = match self.token_manager.acquire_context().await {
+            let ctx = match self.token_manager.acquire_context(None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -380,9 +397,12 @@ impl KiroProvider {
         let mut last_error: Option<anyhow::Error> = None;
         let api_type = if is_stream { "流式" } else { "非流式" };
 
+        // 尝试从请求体中提取模型信息
+        let model = Self::extract_model_from_request(request_body);
+
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context().await {
+            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);

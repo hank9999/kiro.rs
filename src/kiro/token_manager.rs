@@ -646,9 +646,31 @@ impl MultiTokenManager {
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
     /// - balanced 模式：轮询选择可用凭据
-    fn select_next_credential(&self) -> Option<(u64, KiroCredentials)> {
+    ///
+    /// # 参数
+    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
-        let available: Vec<_> = entries.iter().filter(|e| !e.disabled).collect();
+
+        // 检查是否是 opus 模型
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+
+        // 过滤可用凭据
+        let available: Vec<_> = entries
+            .iter()
+            .filter(|e| {
+                if e.disabled {
+                    return false;
+                }
+                // 如果是 opus 模型，需要检查订阅等级
+                if is_opus && !e.credentials.supports_opus() {
+                    return false;
+                }
+                true
+            })
+            .collect();
 
         if available.is_empty() {
             return None;
@@ -682,7 +704,10 @@ impl MultiTokenManager {
     ///
     /// 如果 Token 过期或即将过期，会自动刷新
     /// Token 刷新失败时会尝试下一个可用凭据（不计入失败次数）
-    pub async fn acquire_context(&self) -> anyhow::Result<CallContext> {
+    ///
+    /// # 参数
+    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let mut tried_count = 0;
 
@@ -715,7 +740,7 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential();
+                    let mut best = self.select_next_credential(model);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -734,7 +759,7 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential();
+                            best = self.select_next_credential(model);
                         }
                     }
 
@@ -1194,7 +1219,7 @@ impl MultiTokenManager {
 
     /// 获取使用额度信息
     pub async fn get_usage_limits(&self) -> anyhow::Result<UsageLimitsResponse> {
-        let ctx = self.acquire_context().await?;
+        let ctx = self.acquire_context(None).await?;
         get_usage_limits(
             &ctx.credentials,
             &self.config,
@@ -1363,7 +1388,34 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
-        get_usage_limits(&credentials, &self.config, &token, self.proxy.as_ref()).await
+        let usage_limits = get_usage_limits(&credentials, &self.config, &token, self.proxy.as_ref()).await?;
+
+        // 更新订阅等级到凭据
+        if let Some(subscription_title) = usage_limits.subscription_title() {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                let old_title = entry.credentials.subscription_title.clone();
+                entry.credentials.subscription_title = Some(subscription_title.to_string());
+
+                // 如果订阅等级发生变化，记录日志
+                if old_title.as_deref() != Some(subscription_title) {
+                    tracing::info!(
+                        "凭据 #{} 订阅等级已更新: {:?} -> {}",
+                        id,
+                        old_title,
+                        subscription_title
+                    );
+                }
+            }
+            drop(entries);
+
+            // 持久化订阅等级更新
+            if let Err(e) = self.persist_credentials() {
+                tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", e);
+            }
+        }
+
+        Ok(usage_limits)
     }
 
     /// 添加新凭据（Admin API）
@@ -1841,7 +1893,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context().await.unwrap();
+        let ctx = manager.acquire_context(None).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -1878,7 +1930,7 @@ mod tests {
         manager.report_quota_exhausted(2);
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context().await.err().unwrap().to_string();
+        let err = manager.acquire_context(None).await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",

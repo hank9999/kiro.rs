@@ -201,6 +201,7 @@ impl AdminService {
             api_region: req.api_region,
             machine_id: req.machine_id,
             email: req.email,
+            subscription_title: None, // 将在首次获取使用额度时自动更新
         };
 
         // 调用 token_manager 添加凭据

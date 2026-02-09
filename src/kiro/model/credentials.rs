@@ -71,6 +71,11 @@ pub struct KiroCredentials {
     /// 用户邮箱（从 Anthropic API 获取）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+
+    /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub subscription_title: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -219,6 +224,21 @@ impl KiroCredentials {
             self.auth_method = Some(canonical.to_string());
         }
     }
+
+    /// 检查凭据是否支持 Opus 模型
+    ///
+    /// Free 账号不支持 Opus 模型，需要 PRO 或更高等级订阅
+    pub fn supports_opus(&self) -> bool {
+        match &self.subscription_title {
+            Some(title) => {
+                let title_upper = title.to_uppercase();
+                // 如果包含 FREE，则不支持 Opus
+                !title_upper.contains("FREE")
+            }
+            // 如果还没有获取订阅信息，暂时允许（首次使用时会获取）
+            None => true,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -272,6 +292,7 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            subscription_title: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -385,6 +406,7 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            subscription_title: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -410,6 +432,7 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            subscription_title: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -517,6 +540,7 @@ mod tests {
             api_region: None,
             machine_id: Some("c".repeat(64)),
             email: None,
+            subscription_title: None,
         };
 
         let json = original.to_pretty_json().unwrap();
