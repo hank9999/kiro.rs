@@ -14,6 +14,51 @@ use crate::kiro::model::requests::tool::{
 
 use super::types::{ContentBlock, MessagesRequest};
 
+/// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
+///
+/// Claude Code / MCP 工具定义偶尔会出现 `required: null`、`properties: null` 等，
+/// 导致上游返回 400 "Improperly formed request"。
+fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(mut obj) = schema else {
+        return serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": true
+        });
+    };
+
+    // type（必须是字符串）
+    if !obj.get("type").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
+        obj.insert("type".to_string(), serde_json::Value::String("object".to_string()));
+    }
+
+    // properties（必须是 object）
+    match obj.get("properties") {
+        Some(serde_json::Value::Object(_)) => {}
+        _ => { obj.insert("properties".to_string(), serde_json::Value::Object(serde_json::Map::new())); }
+    }
+
+    // required（必须是 string 数组）
+    let required = match obj.remove("required") {
+        Some(serde_json::Value::Array(arr)) => serde_json::Value::Array(
+            arr.into_iter()
+                .filter_map(|v| v.as_str().map(|s| serde_json::Value::String(s.to_string())))
+                .collect(),
+        ),
+        _ => serde_json::Value::Array(Vec::new()),
+    };
+    obj.insert("required".to_string(), required);
+
+    // additionalProperties（允许 bool 或 object，其他按 true 处理）
+    match obj.get("additionalProperties") {
+        Some(serde_json::Value::Bool(_)) | Some(serde_json::Value::Object(_)) => {}
+        _ => { obj.insert("additionalProperties".to_string(), serde_json::Value::Bool(true)); }
+    }
+
+    serde_json::Value::Object(obj)
+}
+
 /// 追加到 Write 工具 description 末尾的内容
 const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the content to write exceeds 150 lines, you MUST only write the first 50 lines using this tool, then use `Edit` tool to append the remaining content in chunks of no more than 50 lines each. If needed, leave a unique placeholder to help append content. Do NOT attempt to write all content at once.";
 
@@ -471,7 +516,7 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
                 tool_specification: ToolSpecification {
                     name: t.name.clone(),
                     description,
-                    input_schema: InputSchema::from_json(serde_json::json!(t.input_schema)),
+                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(t.input_schema))),
                 },
             }
         })
