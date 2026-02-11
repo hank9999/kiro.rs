@@ -29,6 +29,7 @@
 - **多模型支持**: 支持 Sonnet、Opus、Haiku 系列模型
 - **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询等
 - **多级 Region 配置**: 支持全局和凭据级别的 Auth Region / API Region 配置
+- **凭据级代理**: 支持为每个凭据单独配置 HTTP/SOCKS5 代理，优先级：凭据代理 > 全局代理 > 无代理
 
 ---
 
@@ -42,6 +43,7 @@
   - [config.json](#configjson)
   - [credentials.json](#credentialsjson)
   - [Region 配置](#region-配置)
+  - [代理配置](#代理配置)
   - [认证方式](#认证方式)
   - [环境变量](#环境变量)
 - [API 端点](#api-端点)
@@ -222,6 +224,9 @@ docker-compose up
 | `apiRegion`    | string | 凭据级 API Region，用于 API 请求                    |
 | `machineId`    | string | 凭据级机器码（64位十六进制）                             |
 | `email`        | string | 用户邮箱（可选，从 API 获取）                           |
+| `proxyUrl`     | string | 凭据级代理 URL（可选，特殊值 `direct` 表示不使用代理）       |
+| `proxyUsername`| string | 凭据级代理用户名（可选）                                |
+| `proxyPassword`| string | 凭据级代理密码（可选）                                 |
 
 说明：
 - IdC / Builder-ID / IAM 在本项目里属于同一种登录方式，配置时统一使用 `authMethod: "idc"`
@@ -258,7 +263,17 @@ docker-compose up
       "clientId": "xxxxxxxxx",
       "clientSecret": "xxxxxxxxx",
       "region": "us-east-2",
-      "priority": 1
+      "priority": 1,
+      "proxyUrl": "socks5://proxy.example.com:1080",
+      "proxyUsername": "user",
+      "proxyPassword": "pass"
+   },
+   {
+      "refreshToken": "第三个凭据（显式不走代理）",
+      "expiresAt": "2025-12-31T02:32:45.144Z",
+      "authMethod": "social",
+      "priority": 2,
+      "proxyUrl": "direct"
    }
 ]
 ```
@@ -278,6 +293,41 @@ docker-compose up
 
 **API Region**（API 请求）优先级：
 `凭据.apiRegion` > `config.apiRegion` > `config.region`
+
+### 代理配置
+
+支持全局代理和凭据级代理，凭据级代理会覆盖该凭据产生的所有出站连接（API 请求、Token 刷新、额度查询）。
+
+**代理优先级**：`凭据.proxyUrl` > `config.proxyUrl` > 无代理
+
+| 凭据 `proxyUrl` 值 | 行为 |
+|---|---|
+| 具体 URL（如 `http://proxy:8080`、`socks5://proxy:1080`） | 使用凭据指定的代理 |
+| `direct` | 显式不使用代理（即使全局配置了代理） |
+| 未配置（留空） | 回退到全局代理配置 |
+
+凭据级代理示例：
+
+```json
+[
+   {
+      "refreshToken": "凭据A：使用自己的代理",
+      "authMethod": "social",
+      "proxyUrl": "socks5://proxy-a.example.com:1080",
+      "proxyUsername": "user_a",
+      "proxyPassword": "pass_a"
+   },
+   {
+      "refreshToken": "凭据B：显式不走代理（直连）",
+      "authMethod": "social",
+      "proxyUrl": "direct"
+   },
+   {
+      "refreshToken": "凭据C：使用全局代理（或直连，取决于 config.json）",
+      "authMethod": "social"
+   }
+]
+```
 
 ### 认证方式
 

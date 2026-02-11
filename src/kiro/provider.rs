@@ -6,6 +6,7 @@
 
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, HeaderMap, HeaderValue};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -15,6 +16,8 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{CallContext, MultiTokenManager};
+use crate::model::config::TlsBackend;
+use parking_lot::Mutex;
 
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
@@ -28,7 +31,13 @@ const MAX_TOTAL_RETRIES: usize = 9;
 /// 支持多凭据故障转移和重试机制
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
-    client: Client,
+    /// 全局代理配置（用于凭据无自定义代理时的回退）
+    global_proxy: Option<ProxyConfig>,
+    /// Client 缓存：key = effective proxy config, value = reqwest::Client
+    /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client
+    client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
+    /// TLS 后端配置
+    tls_backend: TlsBackend,
 }
 
 impl KiroProvider {
@@ -39,13 +48,31 @@ impl KiroProvider {
 
     /// 创建带代理配置的 KiroProvider 实例
     pub fn with_proxy(token_manager: Arc<MultiTokenManager>, proxy: Option<ProxyConfig>) -> Self {
-        let client = build_client(proxy.as_ref(), 720, token_manager.config().tls_backend)
+        let tls_backend = token_manager.config().tls_backend;
+        // 预热：构建全局代理对应的 Client
+        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
             .expect("创建 HTTP 客户端失败");
+        let mut cache = HashMap::new();
+        cache.insert(proxy.clone(), initial_client);
 
         Self {
             token_manager,
-            client,
+            global_proxy: proxy,
+            client_cache: Mutex::new(cache),
+            tls_backend,
         }
+    }
+
+    /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
+    fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
+        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let mut cache = self.client_cache.lock();
+        if let Some(client) = cache.get(&effective) {
+            return Ok(client.clone());
+        }
+        let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
+        cache.insert(effective, client.clone());
+        Ok(client)
     }
 
     /// 获取 token_manager 的引用
@@ -290,7 +317,7 @@ impl KiroProvider {
 
             // 发送请求
             let response = match self
-                .client
+                .client_for(&ctx.credentials)?
                 .post(&url)
                 .headers(headers)
                 .body(request_body.to_string())
@@ -422,7 +449,7 @@ impl KiroProvider {
 
             // 发送请求
             let response = match self
-                .client
+                .client_for(&ctx.credentials)?
                 .post(&url)
                 .headers(headers)
                 .body(request_body.to_string())

@@ -46,6 +46,11 @@ pub struct CredentialStatusItem {
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
+    /// 是否配置了凭据级代理
+    pub has_proxy: bool,
+    /// 代理 URL（用于前端展示）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -103,6 +108,15 @@ pub struct AddCredentialRequest {
 
     /// 用户邮箱（可选，用于前端显示）
     pub email: Option<String>,
+
+    /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
+    pub proxy_url: Option<String>,
+
+    /// 凭据级代理认证用户名（可选）
+    pub proxy_username: Option<String>,
+
+    /// 凭据级代理认证密码（可选）
+    pub proxy_password: Option<String>,
 }
 
 fn default_auth_method() -> String {
