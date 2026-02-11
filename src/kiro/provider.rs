@@ -270,6 +270,7 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文
+            // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
             let ctx = match self.token_manager.acquire_context(None).await {
                 Ok(c) => c,
                 Err(e) => {
