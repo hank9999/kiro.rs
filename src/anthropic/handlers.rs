@@ -203,7 +203,10 @@ pub async fn post_messages(
         }
     };
 
+    #[cfg(feature = "sensitive-logs")]
     tracing::debug!("Kiro request body: {}", request_body);
+    #[cfg(not(feature = "sensitive-logs"))]
+    tracing::debug!(kiro_request_body_bytes = request_body.len(), "已构建 Kiro 请求体");
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
@@ -703,7 +706,10 @@ pub async fn post_messages_cc(
         }
     };
 
+    #[cfg(feature = "sensitive-logs")]
     tracing::debug!("Kiro request body: {}", request_body);
+    #[cfg(not(feature = "sensitive-logs"))]
+    tracing::debug!(kiro_request_body_bytes = request_body.len(), "已构建 Kiro 请求体");
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
