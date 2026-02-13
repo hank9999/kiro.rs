@@ -563,10 +563,14 @@ impl MultiTokenManager {
                 }
                 CredentialEntry {
                     id,
-                    credentials: cred,
+                    credentials: cred.clone(),
                     failure_count: 0,
-                    disabled: false,
-                    disabled_reason: None,
+                    disabled: cred.disabled, // 从配置文件读取 disabled 状态
+                    disabled_reason: if cred.disabled {
+                        Some(DisabledReason::Manual)
+                    } else {
+                        None
+                    },
                     success_count: 0,
                     last_used_at: None,
                 }
@@ -951,6 +955,8 @@ impl MultiTokenManager {
                 .map(|e| {
                     let mut cred = e.credentials.clone();
                     cred.canonicalize_auth_method();
+                    // 同步 disabled 状态到凭据对象
+                    cred.disabled = e.disabled;
                     cred
                 })
                 .collect()
