@@ -92,6 +92,10 @@ pub struct KiroCredentials {
     /// 凭据级代理认证密码（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_password: Option<String>,
+
+    /// 凭据是否被禁用（默认为 false）
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -334,6 +338,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            disabled: false,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -451,6 +456,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            disabled: false,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -480,6 +486,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            disabled: false,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -591,6 +598,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            disabled: false,
         };
 
         let json = original.to_pretty_json().unwrap();
