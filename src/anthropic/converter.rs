@@ -27,12 +27,38 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
+/// Agentic 模型专用分块写入系统提示
+const KIRO_AGENTIC_SYSTEM_PROMPT: &str = "\
+# CRITICAL: CHUNKED WRITE PROTOCOL (MANDATORY)\n\
+\n\
+You MUST follow these rules for ALL file operations. Violation causes server timeouts and task failure.\n\
+\n\
+## ABSOLUTE LIMITS\n\
+- **MAXIMUM 350 LINES** per single write/edit operation - NO EXCEPTIONS\n\
+- **RECOMMENDED 300 LINES** or less for optimal performance\n\
+- **NEVER** write entire files in one operation if >300 lines\n\
+\n\
+## MANDATORY CHUNKED WRITE STRATEGY\n\
+\n\
+### For NEW FILES (>300 lines total):\n\
+1. FIRST: Write initial chunk (first 250-300 lines) using write_to_file/fsWrite\n\
+2. THEN: Append remaining content in 250-300 line chunks using file append operations\n\
+3. REPEAT: Continue appending until complete\n\
+\n\
+### For EDITING EXISTING FILES:\n\
+1. Use surgical edits - change ONLY what's needed\n\
+2. NEVER rewrite entire files - use incremental modifications\n\
+3. Split large refactors into multiple small, focused edits\n\
+\n\
+REMEMBER: When in doubt, write LESS per operation. Multiple small operations > one large operation.";
+
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
 /// 按照用户要求：
 /// - 所有 sonnet → claude-sonnet-4.5
 /// - 所有 opus → claude-opus-4.5
 /// - 所有 haiku → claude-haiku-4.5
+/// - -agentic 后缀会被剥离，映射到同一底层模型
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
@@ -49,6 +75,11 @@ pub fn map_model(model: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// 检查模型名是否为 agentic 变体
+pub fn is_agentic_model(model: &str) -> bool {
+    model.to_lowercase().contains("agentic")
 }
 
 /// 转换结果
@@ -84,8 +115,8 @@ fn extract_session_id(user_id: &str) -> Option<String> {
     // 查找 "session_" 后面的内容
     if let Some(pos) = user_id.find("session_") {
         let session_part = &user_id[pos + 8..]; // "session_" 长度为 8
-        // session_part 应该是 UUID 格式: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-        // 验证是否是有效的 UUID 格式（36 字符，包含 4 个连字符）
+                                                // session_part 应该是 UUID 格式: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+                                                // 验证是否是有效的 UUID 格式（36 字符，包含 4 个连字符）
         if session_part.len() >= 36 {
             let uuid_str = &session_part[..36];
             // 简单验证 UUID 格式
@@ -445,7 +476,7 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
         return Vec::new();
     };
 
-    tools
+    let converted: Vec<Tool> = tools
         .iter()
         .map(|t| {
             let mut description = t.description.clone();
@@ -475,7 +506,10 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
                 },
             }
         })
-        .collect()
+        .collect();
+
+    // 如果工具总大小超过阈值，进行压缩
+    super::tool_compression::compress_tools_if_needed(&converted)
 }
 
 /// 生成thinking标签前缀
@@ -523,7 +557,12 @@ fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, 
 
         if !system_content.is_empty() {
             // 追加分块写入策略到系统消息
-            let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
+            let mut system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
+
+            // 如果是 agentic 模型，追加专用分块写入系统提示
+            if is_agentic_model(&req.model) {
+                system_content = format!("{}\n{}", system_content, KIRO_AGENTIC_SYSTEM_PROMPT);
+            }
 
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
             let final_content = if let Some(ref prefix) = thinking_prefix {
@@ -694,7 +733,7 @@ fn convert_assistant_message(
             format!("<thinking>{}</thinking>", thinking_content)
         }
     } else if text_content.is_empty() && !tool_uses.is_empty() {
-        " ".to_string()
+        ".".to_string()
     } else {
         text_content
     };
@@ -715,34 +754,26 @@ mod tests {
 
     #[test]
     fn test_map_model_sonnet() {
-        assert!(
-            map_model("claude-sonnet-4-20250514")
-                .unwrap()
-                .contains("sonnet")
-        );
-        assert!(
-            map_model("claude-3-5-sonnet-20241022")
-                .unwrap()
-                .contains("sonnet")
-        );
+        assert!(map_model("claude-sonnet-4-20250514")
+            .unwrap()
+            .contains("sonnet"));
+        assert!(map_model("claude-3-5-sonnet-20241022")
+            .unwrap()
+            .contains("sonnet"));
     }
 
     #[test]
     fn test_map_model_opus() {
-        assert!(
-            map_model("claude-opus-4-20250514")
-                .unwrap()
-                .contains("opus")
-        );
+        assert!(map_model("claude-opus-4-20250514")
+            .unwrap()
+            .contains("opus"));
     }
 
     #[test]
     fn test_map_model_haiku() {
-        assert!(
-            map_model("claude-haiku-4-20250514")
-                .unwrap()
-                .contains("haiku")
-        );
+        assert!(map_model("claude-haiku-4-20250514")
+            .unwrap()
+            .contains("haiku"));
     }
 
     #[test]
@@ -1007,10 +1038,9 @@ mod tests {
 
         // 测试孤立的 tool_use（有 tool_use 但没有对应的 tool_result）
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-orphan", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"})),
-        ]);
+        assistant_msg =
+            assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-orphan", "read")
+                .with_input(serde_json::json!({"path": "/test.txt"}))]);
 
         let history = vec![
             Message::User(HistoryUserMessage::new(
@@ -1039,10 +1069,8 @@ mod tests {
 
         // 测试正常配对的情况
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"})),
-        ]);
+        assistant_msg = assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
+            .with_input(serde_json::json!({"path": "/test.txt"}))]);
 
         let history = vec![
             Message::User(HistoryUserMessage::new(
@@ -1104,10 +1132,8 @@ mod tests {
         // 测试历史中已配对的 tool_use 不应该被报告为孤立
         // 场景：多轮对话中，之前的 tool_use 已经在历史中有对应的 tool_result
         let mut assistant_msg1 = AssistantMessage::new("I'll read the file.");
-        assistant_msg1 = assistant_msg1.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"})),
-        ]);
+        assistant_msg1 = assistant_msg1.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
+            .with_input(serde_json::json!({"path": "/test.txt"}))]);
 
         // 构建历史中的 user 消息，包含 tool_result
         let mut user_msg_with_result = UserMessage::new("", "claude-sonnet-4.5");
@@ -1150,10 +1176,8 @@ mod tests {
 
         // 测试重复的 tool_result（历史中已配对，当前消息又发送了相同的 tool_result）
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"})),
-        ]);
+        assistant_msg = assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
+            .with_input(serde_json::json!({"path": "/test.txt"}))]);
 
         // 历史中已有 tool_result
         let mut user_msg_with_result = UserMessage::new("", "claude-sonnet-4.5");
@@ -1205,8 +1229,8 @@ mod tests {
             "content 不应为空"
         );
         assert_eq!(
-            result.assistant_response_message.content, " ",
-            "仅 tool_use 时应使用 ' ' 占位符"
+            result.assistant_response_message.content, ".",
+            "仅 tool_use 时应使用 '.' 占位符"
         );
 
         // 验证 tool_uses 被正确保留
@@ -1296,7 +1320,7 @@ mod tests {
         // 测试移除所有 tool_use 后，tool_uses 变为 None
         let mut assistant_msg = AssistantMessage::new("I'll use a tool.");
         assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({})),
+            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({}))
         ]);
 
         let mut history = vec![

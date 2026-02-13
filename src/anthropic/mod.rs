@@ -27,6 +27,8 @@ mod handlers;
 mod middleware;
 mod router;
 mod stream;
+mod tool_compression;
+mod truncation;
 pub mod types;
 mod websearch;
 
