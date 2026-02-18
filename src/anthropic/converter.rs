@@ -30,14 +30,20 @@ Complete all chunked operations without commentary.";
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
 /// 按照用户要求：
-/// - 所有 sonnet → claude-sonnet-4.5
-/// - 所有 opus → claude-opus-4.5
+/// - sonnet 4.6/4-6 → claude-sonnet-4.6
+/// - 其他 sonnet → claude-sonnet-4.5
+/// - opus 4.5/4-5 → claude-opus-4.5
+/// - 其他 opus → claude-opus-4.6
 /// - 所有 haiku → claude-haiku-4.5
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
     if model_lower.contains("sonnet") {
-        Some("claude-sonnet-4.5".to_string())
+        if model_lower.contains("4-6") || model_lower.contains("4.6") {
+            Some("claude-sonnet-4.6".to_string())
+        } else {
+            Some("claude-sonnet-4.5".to_string())
+        }
     } else if model_lower.contains("opus") {
         if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
