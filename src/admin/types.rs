@@ -194,6 +194,54 @@ impl SuccessResponse {
     }
 }
 
+// ============ 邮件配置 ============
+
+/// 邮件配置响应（不返回密码）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmailConfigResponse {
+    /// 是否已配置
+    pub configured: bool,
+    /// SMTP 服务器地址
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smtp_host: Option<String>,
+    /// SMTP 服务器端口
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smtp_port: Option<u16>,
+    /// SMTP 用户名
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smtp_username: Option<String>,
+    /// 发件人地址
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_address: Option<String>,
+    /// 收件人列表
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipients: Option<Vec<String>>,
+}
+
+/// 更新邮件配置请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateEmailConfigRequest {
+    /// SMTP 服务器地址
+    pub smtp_host: String,
+    /// SMTP 服务器端口
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+    /// SMTP 用户名
+    pub smtp_username: String,
+    /// SMTP 密码
+    pub smtp_password: String,
+    /// 发件人地址
+    pub from_address: String,
+    /// 收件人列表
+    pub recipients: Vec<String>,
+}
+
+fn default_smtp_port() -> u16 {
+    587
+}
+
 /// 错误响应
 #[derive(Debug, Serialize)]
 pub struct AdminErrorResponse {

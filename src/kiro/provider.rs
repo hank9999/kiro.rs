@@ -644,9 +644,11 @@ mod tests {
     use super::*;
     use crate::kiro::token_manager::CallContext;
     use crate::model::config::Config;
+    use crate::notification::NotificationService;
 
     fn create_test_provider(config: Config, credentials: KiroCredentials) -> KiroProvider {
-        let tm = MultiTokenManager::new(config, vec![credentials], None, None, false).unwrap();
+        let notifier = Arc::new(NotificationService::new(None));
+        let tm = MultiTokenManager::new(config, vec![credentials], None, None, false, notifier).unwrap();
         KiroProvider::new(Arc::new(tm))
     }
 

@@ -8,6 +8,8 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  EmailConfigResponse,
+  UpdateEmailConfigRequest,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -94,5 +96,29 @@ export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'bala
 // 设置负载均衡模式
 export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
   const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
+  return data
+}
+
+// 发送测试邮件
+export async function sendTestEmail(): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/email/test')
+  return data
+}
+
+// 获取邮件配置
+export async function getEmailConfig(): Promise<EmailConfigResponse> {
+  const { data } = await api.get<EmailConfigResponse>('/email/config')
+  return data
+}
+
+// 更新邮件配置
+export async function updateEmailConfig(req: UpdateEmailConfigRequest): Promise<SuccessResponse> {
+  const { data } = await api.put<SuccessResponse>('/email/config', req)
+  return data
+}
+
+// 删除邮件配置
+export async function deleteEmailConfig(): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>('/email/config')
   return data
 }

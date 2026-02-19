@@ -7,9 +7,10 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, delete_credential, get_all_credentials, get_credential_balance,
-        get_load_balancing_mode, reset_failure_count, set_credential_disabled,
-        set_credential_priority, set_load_balancing_mode,
+        add_credential, delete_credential, delete_email_config, get_all_credentials,
+        get_credential_balance, get_email_config, get_load_balancing_mode, reset_failure_count,
+        send_test_email, set_credential_disabled, set_credential_priority,
+        set_load_balancing_mode, update_email_config,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -45,6 +46,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
+        )
+        .route("/email/test", post(send_test_email))
+        .route(
+            "/email/config",
+            get(get_email_config).put(update_email_config).delete(delete_email_config),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),

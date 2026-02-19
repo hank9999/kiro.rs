@@ -90,6 +90,10 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// 邮件通知配置（可选）
+    #[serde(default)]
+    pub email: Option<EmailConfig>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -132,6 +136,29 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+/// 邮件通知配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmailConfig {
+    /// SMTP 服务器地址
+    pub smtp_host: String,
+    /// SMTP 服务器端口
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+    /// SMTP 用户名
+    pub smtp_username: String,
+    /// SMTP 密码
+    pub smtp_password: String,
+    /// 发件人地址（如 "kiro-rs <noreply@example.com>"）
+    pub from_address: String,
+    /// 收件人列表
+    pub recipients: Vec<String>,
+}
+
+fn default_smtp_port() -> u16 {
+    587
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -154,6 +181,7 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            email: None,
             config_path: None,
         }
     }

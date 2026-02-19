@@ -315,7 +315,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           <DialogTitle>批量导入凭据（自动验活）</DialogTitle>
         </DialogHeader>
 
-        <div className="flex-1 overflow-y-auto space-y-4 py-4">
+        <div className="flex-1 overflow-y-auto space-y-4 py-4 px-2 -mx-2">
           <div className="space-y-2">
             <label className="text-sm font-medium">
               JSON 格式凭据
@@ -325,7 +325,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
-              className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
+              className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
               💡 导入时自动验活，失败的凭据会被排除

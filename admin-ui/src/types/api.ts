@@ -80,3 +80,23 @@ export interface AddCredentialResponse {
   credentialId: number
   email?: string
 }
+
+// 邮件配置响应
+export interface EmailConfigResponse {
+  configured: boolean
+  smtpHost?: string
+  smtpPort?: number
+  smtpUsername?: string
+  fromAddress?: string
+  recipients?: string[]
+}
+
+// 更新邮件配置请求
+export interface UpdateEmailConfigRequest {
+  smtpHost: string
+  smtpPort: number
+  smtpUsername: string
+  smtpPassword: string
+  fromAddress: string
+  recipients: string[]
+}

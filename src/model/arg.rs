@@ -12,3 +12,4 @@ pub struct Args {
     #[arg(long)]
     pub credentials: Option<String>,
 }
+

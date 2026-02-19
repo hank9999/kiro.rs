@@ -1,5 +1,6 @@
 //! Admin API 中间件
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
@@ -13,6 +14,7 @@ use axum::{
 use super::service::AdminService;
 use super::types::AdminErrorResponse;
 use crate::common::auth;
+use crate::notification::NotificationService;
 
 /// Admin API 共享状态
 #[derive(Clone)]
@@ -21,13 +23,24 @@ pub struct AdminState {
     pub admin_api_key: String,
     /// Admin 服务
     pub service: Arc<AdminService>,
+    /// 邮件通知服务
+    pub notifier: Arc<NotificationService>,
+    /// 配置文件路径（用于持久化 email 配置）
+    pub config_path: Option<PathBuf>,
 }
 
 impl AdminState {
-    pub fn new(admin_api_key: impl Into<String>, service: AdminService) -> Self {
+    pub fn new(
+        admin_api_key: impl Into<String>,
+        service: AdminService,
+        notifier: Arc<NotificationService>,
+        config_path: Option<PathBuf>,
+    ) -> Self {
         Self {
             admin_api_key: admin_api_key.into(),
             service: Arc::new(service),
+            notifier,
+            config_path,
         }
     }
 }

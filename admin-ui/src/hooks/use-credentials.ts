@@ -9,8 +9,12 @@ import {
   deleteCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  sendTestEmail,
+  getEmailConfig,
+  updateEmailConfig,
+  deleteEmailConfig,
 } from '@/api/credentials'
-import type { AddCredentialRequest } from '@/types/api'
+import type { AddCredentialRequest, UpdateEmailConfigRequest } from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -103,6 +107,43 @@ export function useSetLoadBalancingMode() {
     mutationFn: setLoadBalancingMode,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+    },
+  })
+}
+
+// 发送测试邮件
+export function useSendTestEmail() {
+  return useMutation({
+    mutationFn: sendTestEmail,
+  })
+}
+
+// 获取邮件配置
+export function useEmailConfig() {
+  return useQuery({
+    queryKey: ['emailConfig'],
+    queryFn: getEmailConfig,
+  })
+}
+
+// 更新邮件配置
+export function useUpdateEmailConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: UpdateEmailConfigRequest) => updateEmailConfig(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['emailConfig'] })
+    },
+  })
+}
+
+// 删除邮件配置
+export function useDeleteEmailConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: deleteEmailConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['emailConfig'] })
     },
   })
 }

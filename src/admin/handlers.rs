@@ -3,6 +3,7 @@
 use axum::{
     Json,
     extract::{Path, State},
+    http::StatusCode,
     response::IntoResponse,
 };
 
@@ -10,7 +11,7 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        SuccessResponse, UpdateEmailConfigRequest, EmailConfigResponse,
     },
 };
 
@@ -123,4 +124,123 @@ pub async fn set_load_balancing_mode(
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// POST /api/admin/email/test
+/// 发送测试邮件
+pub async fn send_test_email(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.notifier.send_test_email().await {
+        Ok(_) => Json(SuccessResponse::new("测试邮件已发送")).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(SuccessResponse {
+                success: false,
+                message: format!("{}", e),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/admin/email/config
+/// 获取邮件配置
+pub async fn get_email_config(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.notifier.get_config() {
+        Some(config) => Json(EmailConfigResponse {
+            configured: true,
+            smtp_host: Some(config.smtp_host),
+            smtp_port: Some(config.smtp_port),
+            smtp_username: Some(config.smtp_username),
+            from_address: Some(config.from_address),
+            recipients: Some(config.recipients),
+        }),
+        None => Json(EmailConfigResponse {
+            configured: false,
+            smtp_host: None,
+            smtp_port: None,
+            smtp_username: None,
+            from_address: None,
+            recipients: None,
+        }),
+    }
+}
+
+/// PUT /api/admin/email/config
+/// 更新邮件配置
+pub async fn update_email_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<UpdateEmailConfigRequest>,
+) -> impl IntoResponse {
+    use crate::model::config::EmailConfig;
+
+    let email_config = EmailConfig {
+        smtp_host: payload.smtp_host,
+        smtp_port: payload.smtp_port,
+        smtp_username: payload.smtp_username,
+        smtp_password: payload.smtp_password,
+        from_address: payload.from_address,
+        recipients: payload.recipients,
+    };
+
+    // 更新运行时配置
+    state.notifier.update_config(Some(email_config.clone()));
+
+    // 持久化到 config.json
+    if let Some(config_path) = &state.config_path {
+        match persist_email_config(config_path, Some(&email_config)) {
+            Ok(_) => {}
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(SuccessResponse {
+                        success: false,
+                        message: format!("配置已生效但持久化失败: {}", e),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    Json(SuccessResponse::new("邮件配置已更新")).into_response()
+}
+
+/// DELETE /api/admin/email/config
+/// 删除邮件配置
+pub async fn delete_email_config(State(state): State<AdminState>) -> impl IntoResponse {
+    // 清除运行时配置
+    state.notifier.update_config(None);
+
+    // 持久化到 config.json
+    if let Some(config_path) = &state.config_path {
+        match persist_email_config(config_path, None) {
+            Ok(_) => {}
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(SuccessResponse {
+                        success: false,
+                        message: format!("配置已清除但持久化失败: {}", e),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    Json(SuccessResponse::new("邮件配置已删除")).into_response()
+}
+
+/// 持久化邮件配置到 config.json
+fn persist_email_config(
+    config_path: &std::path::Path,
+    email_config: Option<&crate::model::config::EmailConfig>,
+) -> anyhow::Result<()> {
+    use crate::model::config::Config;
+
+    let mut config = Config::load(config_path)?;
+    config.email = email_config.cloned();
+    config.save()?;
+    tracing::info!("邮件配置已持久化到: {}", config_path.display());
+    Ok(())
 }

@@ -5,6 +5,7 @@ mod common;
 mod http_client;
 mod kiro;
 mod model;
+mod notification;
 pub mod token;
 
 use std::sync::Arc;
@@ -77,6 +78,13 @@ async fn main() {
         tracing::info!("已配置 HTTP 代理: {}", config.proxy_url.as_ref().unwrap());
     }
 
+    // 创建邮件通知服务（始终创建，即使未配置 email 也支持运行时热更新）
+    let notifier = Arc::new(notification::NotificationService::new(config.email.clone()));
+    if config.email.is_some() {
+        let email_config = config.email.as_ref().unwrap();
+        tracing::info!("邮件通知已启用: {} -> {:?}", email_config.smtp_host, email_config.recipients);
+    }
+
     // 创建 MultiTokenManager 和 KiroProvider
     let token_manager = MultiTokenManager::new(
         config.clone(),
@@ -84,6 +92,7 @@ async fn main() {
         proxy_config.clone(),
         Some(credentials_path.into()),
         is_multiple_format,
+        notifier.clone(),
     )
     .unwrap_or_else(|e| {
         tracing::error!("创建 Token 管理器失败: {}", e);
@@ -122,7 +131,12 @@ async fn main() {
             anthropic_app
         } else {
             let admin_service = admin::AdminService::new(token_manager.clone());
-            let admin_state = admin::AdminState::new(admin_key, admin_service);
+            let admin_state = admin::AdminState::new(
+                admin_key,
+                admin_service,
+                notifier.clone(),
+                config.config_path().map(|p| p.to_path_buf()),
+            );
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由
@@ -153,6 +167,7 @@ async fn main() {
         tracing::info!("  POST /api/admin/credentials/:index/priority");
         tracing::info!("  POST /api/admin/credentials/:index/reset");
         tracing::info!("  GET  /api/admin/credentials/:index/balance");
+        tracing::info!("  POST /api/admin/email/test");
         tracing::info!("Admin UI:");
         tracing::info!("  GET  /admin");
     }
