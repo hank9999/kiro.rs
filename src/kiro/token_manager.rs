@@ -1111,7 +1111,7 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_failure(&self, id: u64) -> bool {
-        let (result, should_notify) = {
+        let (result, should_notify, actual_failure_count) = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
@@ -1119,6 +1119,11 @@ impl MultiTokenManager {
                 Some(e) => e,
                 None => return entries.iter().any(|e| !e.disabled),
             };
+
+            // 已禁用的凭据不再累加失败计数和重复通知
+            if entry.disabled {
+                return entries.iter().any(|e| !e.disabled);
+            }
 
             entry.failure_count += 1;
             entry.last_used_at = Some(Utc::now().to_rfc3339());
@@ -1155,16 +1160,15 @@ impl MultiTokenManager {
                 }
             }
 
-            (entries.iter().any(|e| !e.disabled), should_notify)
+            (entries.iter().any(|e| !e.disabled), should_notify, failure_count)
         };
 
         // 在锁释放后发送通知
         if should_notify {
-            let failure_count = MAX_FAILURES_PER_CREDENTIAL;
             self.notifier.notify_credential_disabled(
                 crate::notification::DisableReason::TooManyFailures {
                     credential_id: id,
-                    failure_count,
+                    failure_count: actual_failure_count,
                 },
             );
         }

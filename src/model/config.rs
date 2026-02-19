@@ -136,6 +136,19 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+/// SMTP TLS 模式
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SmtpTlsMode {
+    /// STARTTLS（端口 587）
+    #[default]
+    Starttls,
+    /// 隐式 TLS（端口 465）
+    Tls,
+    /// 明文（不推荐）
+    None,
+}
+
 /// 邮件通知配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -153,6 +166,9 @@ pub struct EmailConfig {
     pub from_address: String,
     /// 收件人列表
     pub recipients: Vec<String>,
+    /// TLS 模式（默认 starttls）
+    #[serde(default)]
+    pub tls_mode: SmtpTlsMode,
 }
 
 fn default_smtp_port() -> u16 {

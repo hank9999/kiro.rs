@@ -89,6 +89,7 @@ export interface EmailConfigResponse {
   smtpUsername?: string
   fromAddress?: string
   recipients?: string[]
+  tlsMode?: string
 }
 
 // 更新邮件配置请求
@@ -96,7 +97,8 @@ export interface UpdateEmailConfigRequest {
   smtpHost: string
   smtpPort: number
   smtpUsername: string
-  smtpPassword: string
+  smtpPassword?: string
   fromAddress: string
   recipients: string[]
+  tlsMode?: string
 }

@@ -217,6 +217,9 @@ pub struct EmailConfigResponse {
     /// 收件人列表
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recipients: Option<Vec<String>>,
+    /// TLS 模式
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_mode: Option<String>,
 }
 
 /// 更新邮件配置请求
@@ -230,12 +233,14 @@ pub struct UpdateEmailConfigRequest {
     pub smtp_port: u16,
     /// SMTP 用户名
     pub smtp_username: String,
-    /// SMTP 密码
-    pub smtp_password: String,
+    /// SMTP 密码（留空保持不变）
+    pub smtp_password: Option<String>,
     /// 发件人地址
     pub from_address: String,
     /// 收件人列表
     pub recipients: Vec<String>,
+    /// TLS 模式（starttls / tls / none）
+    pub tls_mode: Option<String>,
 }
 
 fn default_smtp_port() -> u16 {

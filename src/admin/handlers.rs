@@ -10,8 +10,8 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse, UpdateEmailConfigRequest, EmailConfigResponse,
+        AddCredentialRequest, AdminErrorResponse, SetDisabledRequest, SetLoadBalancingModeRequest,
+        SetPriorityRequest, SuccessResponse, UpdateEmailConfigRequest, EmailConfigResponse,
     },
 };
 
@@ -133,10 +133,7 @@ pub async fn send_test_email(State(state): State<AdminState>) -> impl IntoRespon
         Ok(_) => Json(SuccessResponse::new("测试邮件已发送")).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
-            Json(SuccessResponse {
-                success: false,
-                message: format!("{}", e),
-            }),
+            Json(AdminErrorResponse::invalid_request(format!("{}", e))),
         )
             .into_response(),
     }
@@ -153,6 +150,9 @@ pub async fn get_email_config(State(state): State<AdminState>) -> impl IntoRespo
             smtp_username: Some(config.smtp_username),
             from_address: Some(config.from_address),
             recipients: Some(config.recipients),
+            tls_mode: Some(serde_json::to_value(&config.tls_mode).ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_else(|| "starttls".to_string())),
         }),
         None => Json(EmailConfigResponse {
             configured: false,
@@ -161,6 +161,7 @@ pub async fn get_email_config(State(state): State<AdminState>) -> impl IntoRespo
             smtp_username: None,
             from_address: None,
             recipients: None,
+            tls_mode: None,
         }),
     }
 }
@@ -171,15 +172,40 @@ pub async fn update_email_config(
     State(state): State<AdminState>,
     Json(payload): Json<UpdateEmailConfigRequest>,
 ) -> impl IntoResponse {
-    use crate::model::config::EmailConfig;
+    use crate::model::config::{EmailConfig, SmtpTlsMode};
+
+    // 解析 TLS 模式
+    let tls_mode = match payload.tls_mode.as_deref() {
+        Some("tls") => SmtpTlsMode::Tls,
+        Some("none") => SmtpTlsMode::None,
+        _ => SmtpTlsMode::Starttls,
+    };
+
+    // 处理密码：空/None 时从现有配置取
+    let smtp_password = match payload.smtp_password {
+        Some(ref pw) if !pw.is_empty() => pw.clone(),
+        _ => {
+            match state.notifier.get_config() {
+                Some(existing) => existing.smtp_password,
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(AdminErrorResponse::invalid_request("首次配置必须提供 SMTP 密码")),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
 
     let email_config = EmailConfig {
         smtp_host: payload.smtp_host,
         smtp_port: payload.smtp_port,
         smtp_username: payload.smtp_username,
-        smtp_password: payload.smtp_password,
+        smtp_password,
         from_address: payload.from_address,
         recipients: payload.recipients,
+        tls_mode,
     };
 
     // 更新运行时配置
@@ -192,10 +218,7 @@ pub async fn update_email_config(
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(SuccessResponse {
-                        success: false,
-                        message: format!("配置已生效但持久化失败: {}", e),
-                    }),
+                    Json(AdminErrorResponse::internal_error(format!("配置已生效但持久化失败: {}", e))),
                 )
                     .into_response();
             }
@@ -218,10 +241,7 @@ pub async fn delete_email_config(State(state): State<AdminState>) -> impl IntoRe
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(SuccessResponse {
-                        success: false,
-                        message: format!("配置已清除但持久化失败: {}", e),
-                    }),
+                    Json(AdminErrorResponse::internal_error(format!("配置已清除但持久化失败: {}", e))),
                 )
                     .into_response();
             }

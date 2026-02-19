@@ -24,6 +24,7 @@ export function EmailConfigDialog({ open, onOpenChange }: EmailConfigDialogProps
   const [smtpPassword, setSmtpPassword] = useState('')
   const [fromAddress, setFromAddress] = useState('')
   const [recipients, setRecipients] = useState('')
+  const [tlsMode, setTlsMode] = useState('starttls')
 
   const { data: emailConfig, isLoading } = useEmailConfig()
   const { mutate: updateConfig, isPending: isUpdating } = useUpdateEmailConfig()
@@ -41,6 +42,7 @@ export function EmailConfigDialog({ open, onOpenChange }: EmailConfigDialogProps
       setSmtpPassword('')
       setFromAddress(emailConfig.fromAddress || '')
       setRecipients(emailConfig.recipients?.join(', ') || '')
+      setTlsMode(emailConfig.tlsMode || 'starttls')
     } else if (open && emailConfig && !emailConfig.configured) {
       setSmtpHost('')
       setSmtpPort('587')
@@ -48,14 +50,22 @@ export function EmailConfigDialog({ open, onOpenChange }: EmailConfigDialogProps
       setSmtpPassword('')
       setFromAddress('')
       setRecipients('')
+      setTlsMode('starttls')
     }
   }, [open, emailConfig])
 
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault()
 
-    if (!smtpHost.trim() || !smtpUsername.trim() || !smtpPassword.trim() || !fromAddress.trim() || !recipients.trim()) {
+    const isFirstConfig = !emailConfig?.configured
+    if (!smtpHost.trim() || !smtpUsername.trim() || !fromAddress.trim() || !recipients.trim()) {
       toast.error('请填写所有必填字段')
+      return
+    }
+
+    // 首次配置时密码必填
+    if (isFirstConfig && !smtpPassword.trim()) {
+      toast.error('首次配置必须提供 SMTP 密码')
       return
     }
 
@@ -65,15 +75,21 @@ export function EmailConfigDialog({ open, onOpenChange }: EmailConfigDialogProps
       return
     }
 
+    const req: Record<string, unknown> = {
+      smtpHost: smtpHost.trim(),
+      smtpPort: parseInt(smtpPort) || 587,
+      smtpUsername: smtpUsername.trim(),
+      fromAddress: fromAddress.trim(),
+      recipients: recipientList,
+      tlsMode,
+    }
+    // 仅在非空时发送密码
+    if (smtpPassword.trim()) {
+      req.smtpPassword = smtpPassword.trim()
+    }
+
     updateConfig(
-      {
-        smtpHost: smtpHost.trim(),
-        smtpPort: parseInt(smtpPort) || 587,
-        smtpUsername: smtpUsername.trim(),
-        smtpPassword: smtpPassword.trim(),
-        fromAddress: fromAddress.trim(),
-        recipients: recipientList,
-      },
+      req as any,
       {
         onSuccess: () => {
           toast.success('邮件配置已保存')
@@ -163,7 +179,7 @@ export function EmailConfigDialog({ open, onOpenChange }: EmailConfigDialogProps
 
               <div className="space-y-2">
                 <label htmlFor="smtpPassword" className="text-sm font-medium">
-                  SMTP 密码 <span className="text-red-500">*</span>
+                  SMTP 密码 {!emailConfig?.configured && <span className="text-red-500">*</span>}
                 </label>
                 <Input
                   id="smtpPassword"
@@ -173,6 +189,23 @@ export function EmailConfigDialog({ open, onOpenChange }: EmailConfigDialogProps
                   onChange={(e) => setSmtpPassword(e.target.value)}
                   disabled={isPending}
                 />
+              </div>
+
+              <div className="space-y-2">
+                <label htmlFor="tlsMode" className="text-sm font-medium">
+                  TLS 模式
+                </label>
+                <select
+                  id="tlsMode"
+                  value={tlsMode}
+                  onChange={(e) => setTlsMode(e.target.value)}
+                  disabled={isPending}
+                  className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <option value="starttls">STARTTLS（端口 587）</option>
+                  <option value="tls">隐式 TLS（端口 465）</option>
+                  <option value="none">明文（不推荐）</option>
+                </select>
               </div>
               <div className="space-y-2">
                 <label htmlFor="fromAddress" className="text-sm font-medium">

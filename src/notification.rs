@@ -99,6 +99,8 @@ impl NotificationService {
 
 /// 发送邮件到所有收件人
 async fn send_email(config: &EmailConfig, subject: &str, body: &str) -> anyhow::Result<()> {
+    use crate::model::config::SmtpTlsMode;
+
     let from: Mailbox = config
         .from_address
         .parse()
@@ -106,11 +108,26 @@ async fn send_email(config: &EmailConfig, subject: &str, body: &str) -> anyhow::
 
     let creds = Credentials::new(config.smtp_username.clone(), config.smtp_password.clone());
 
-    let mailer: AsyncSmtpTransport<Tokio1Executor> =
-        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.smtp_host)?
-            .port(config.smtp_port)
-            .credentials(creds)
-            .build();
+    let mailer: AsyncSmtpTransport<Tokio1Executor> = match config.tls_mode {
+        SmtpTlsMode::Starttls => {
+            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.smtp_host)?
+                .port(config.smtp_port)
+                .credentials(creds)
+                .build()
+        }
+        SmtpTlsMode::Tls => {
+            AsyncSmtpTransport::<Tokio1Executor>::relay(&config.smtp_host)?
+                .port(config.smtp_port)
+                .credentials(creds)
+                .build()
+        }
+        SmtpTlsMode::None => {
+            AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&config.smtp_host)
+                .port(config.smtp_port)
+                .credentials(creds)
+                .build()
+        }
+    };
 
     for recipient in &config.recipients {
         let to: Mailbox = recipient
@@ -130,6 +147,7 @@ async fn send_email(config: &EmailConfig, subject: &str, body: &str) -> anyhow::
             .map_err(|e| anyhow::anyhow!("发送邮件到 {} 失败: {}", recipient, e))?;
     }
 
-    tracing::info!("邮件已发送: {} -> {:?}", subject, config.recipients);
+    tracing::info!("邮件已发送: {} -> {} 个收件人", subject, config.recipients.len());
+    tracing::debug!("邮件收件人列表: {:?}", config.recipients);
     Ok(())
 }

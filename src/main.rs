@@ -82,7 +82,8 @@ async fn main() {
     let notifier = Arc::new(notification::NotificationService::new(config.email.clone()));
     if config.email.is_some() {
         let email_config = config.email.as_ref().unwrap();
-        tracing::info!("邮件通知已启用: {} -> {:?}", email_config.smtp_host, email_config.recipients);
+        tracing::info!("邮件通知已启用: {} -> {} 个收件人", email_config.smtp_host, email_config.recipients.len());
+        tracing::debug!("邮件收件人列表: {:?}", email_config.recipients);
     }
 
     // 创建 MultiTokenManager 和 KiroProvider
