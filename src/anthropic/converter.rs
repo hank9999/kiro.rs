@@ -196,6 +196,20 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         return Err(ConversionError::EmptyMessages);
     }
 
+    // 2.5. 预处理 prefill：如果末尾是 assistant，静默丢弃并截断到最后一条 user
+    // Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持
+    let messages: &[_] = if req.messages.last().is_some_and(|m| m.role != "user") {
+        tracing::info!("检测到末尾 assistant 消息（prefill），静默丢弃");
+        let last_user_idx = req
+            .messages
+            .iter()
+            .rposition(|m| m.role == "user")
+            .ok_or(ConversionError::EmptyMessages)?;
+        &req.messages[..=last_user_idx]
+    } else {
+        &req.messages
+    };
+
     // 3. 生成会话 ID 和代理 ID
     // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
     let conversation_id = req
@@ -209,15 +223,15 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 4. 确定触发类型
     let chat_trigger_type = determine_chat_trigger_type(req);
 
-    // 5. 处理最后一条消息作为 current_message
-    let last_message = req.messages.last().unwrap();
+    // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
+    let last_message = messages.last().unwrap();
     let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
 
     // 6. 转换工具定义
     let mut tools = convert_tools(&req.tools);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let mut history = build_history(req, &model_id)?;
+    let mut history = build_history(req, messages, &model_id)?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
@@ -558,7 +572,14 @@ fn has_thinking_tags(content: &str) -> bool {
 }
 
 /// 构建历史消息
-fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, ConversionError> {
+///
+/// # Arguments
+/// * `req` - 原始请求，用于读取 `system`、`thinking` 等配置字段
+/// * `messages` - 经过 prefill 预处理的消息切片，末尾必定是 user 消息。
+///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
+///   调用方应始终使用此参数而非 `req.messages`。
+/// * `model_id` - 已映射的 Kiro 模型 ID
+fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -605,41 +626,40 @@ fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, 
 
     // 2. 处理常规消息历史
     // 最后一条消息作为 currentMessage，不加入历史
-    let history_end_index = req.messages.len().saturating_sub(1);
-
-    // 如果最后一条是 assistant，则包含在历史中
-    let last_is_assistant = req
-        .messages
-        .last()
-        .map(|m| m.role == "assistant")
-        .unwrap_or(false);
-
-    let history_end_index = if last_is_assistant {
-        req.messages.len()
-    } else {
-        history_end_index
-    };
+    // 经过 prefill 预处理后，messages 末尾必定是 user，故直接截掉最后一条即可
+    let history_end_index = messages.len().saturating_sub(1);
 
     // 收集并配对消息
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
+    let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
 
     for i in 0..history_end_index {
-        let msg = &req.messages[i];
+        let msg = &messages[i];
 
         if msg.role == "user" {
+            // 先处理累积的 assistant 消息
+            if !assistant_buffer.is_empty() {
+                let merged = merge_assistant_messages(&assistant_buffer)?;
+                history.push(Message::Assistant(merged));
+                assistant_buffer.clear();
+            }
             user_buffer.push(msg);
         } else if msg.role == "assistant" {
-            // 遇到 assistant，处理累积的 user 消息
+            // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
                 let merged_user = merge_user_messages(&user_buffer, model_id)?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
-
-                // 添加 assistant 消息
-                let assistant = convert_assistant_message(msg)?;
-                history.push(Message::Assistant(assistant));
             }
+            // 累积 assistant 消息（支持连续多条）
+            assistant_buffer.push(msg);
         }
+    }
+
+    // 处理末尾累积的 assistant 消息
+    if !assistant_buffer.is_empty() {
+        let merged = merge_assistant_messages(&assistant_buffer)?;
+        history.push(Message::Assistant(merged));
     }
 
     // 处理结尾的孤立 user 消息
@@ -755,6 +775,45 @@ fn convert_assistant_message(
         assistant = assistant.with_tool_uses(tool_uses);
     }
 
+    Ok(HistoryAssistantMessage {
+        assistant_response_message: assistant,
+    })
+}
+
+/// 合并多个连续的 assistant 消息为一条
+/// 用于处理网络不稳定时产生的连续 assistant 消息（Issue #79）
+fn merge_assistant_messages(
+    messages: &[&super::types::Message],
+) -> Result<HistoryAssistantMessage, ConversionError> {
+    assert!(!messages.is_empty());
+    if messages.len() == 1 {
+        return convert_assistant_message(messages[0]);
+    }
+
+    let mut all_tool_uses: Vec<ToolUseEntry> = Vec::new();
+    let mut content_parts: Vec<String> = Vec::new();
+
+    for msg in messages {
+        let converted = convert_assistant_message(msg)?;
+        let am = converted.assistant_response_message;
+        if !am.content.trim().is_empty() {
+            content_parts.push(am.content);
+        }
+        if let Some(tus) = am.tool_uses {
+            all_tool_uses.extend(tus);
+        }
+    }
+
+    let content = if content_parts.is_empty() && !all_tool_uses.is_empty() {
+        " ".to_string()
+    } else {
+        content_parts.join("\n\n")
+    };
+
+    let mut assistant = AssistantMessage::new(content);
+    if !all_tool_uses.is_empty() {
+        assistant = assistant.with_tool_uses(all_tool_uses);
+    }
     Ok(HistoryAssistantMessage {
         assistant_response_message: assistant,
     })
@@ -1371,5 +1430,101 @@ mod tests {
         } else {
             panic!("应该是 Assistant 消息");
         }
+    }
+
+    #[test]
+    fn test_merge_consecutive_assistant_messages() {
+        // 测试连续 assistant 消息被正确合并（Issue #79）
+        use super::super::types::Message as AnthropicMessage;
+
+        let msg1 = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "thinking", "thinking": "Let me think about this..."},
+                {"type": "text", "text": " "}
+            ]),
+        };
+
+        let msg2 = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "thinking", "thinking": "I should read the file."},
+                {"type": "text", "text": "Let me read that file."},
+                {"type": "tool_use", "id": "toolu_01ABC", "name": "read_file", "input": {"path": "/test.txt"}}
+            ]),
+        };
+
+        let messages: Vec<&AnthropicMessage> = vec![&msg1, &msg2];
+        let result = merge_assistant_messages(&messages).expect("合并应成功");
+
+        let content = &result.assistant_response_message.content;
+        assert!(content.contains("<thinking>"), "应包含 thinking 标签");
+        assert!(content.contains("Let me read that file"), "应包含第二条消息的 text 内容");
+
+        let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
+        assert_eq!(tool_uses.len(), 1);
+        assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
+    }
+
+    #[test]
+    fn test_consecutive_assistant_with_tool_use_result_pairing() {
+        // 测试 Issue #79 的完整场景
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Read the config file"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "thinking", "thinking": "I need to read the file..."},
+                        {"type": "text", "text": " "}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "thinking", "thinking": "Let me read the config."},
+                        {"type": "text", "text": "I'll read the config file for you."},
+                        {"type": "tool_use", "id": "toolu_01XYZ", "name": "read_file", "input": {"path": "/config.json"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "toolu_01XYZ", "content": "{\"key\": \"value\"}"}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req);
+        assert!(result.is_ok(), "连续 assistant 消息场景不应报错: {:?}", result.err());
+
+        let state = result.unwrap().conversation_state;
+        let mut found_tool_use = false;
+        for msg in &state.history {
+            if let Message::Assistant(assistant_msg) = msg {
+                if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
+                    if tool_uses.iter().any(|t| t.tool_use_id == "toolu_01XYZ") {
+                        found_tool_use = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
     }
 }
