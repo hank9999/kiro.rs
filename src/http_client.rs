@@ -8,7 +8,7 @@ use std::time::Duration;
 use crate::model::config::TlsBackend;
 
 /// 代理配置
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ProxyConfig {
     /// 代理地址，支持 http/https/socks5
     pub url: String,

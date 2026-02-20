@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, BarChart3, Trash2, Trash } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, BarChart3, Trash2, Trash, Loader2 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { Input } from '@/components/ui/input'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   Dialog,
   DialogContent,
@@ -14,7 +15,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { CredentialStatusItem } from '@/types/api'
+import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
 import {
   useDeleteCredential,
   useSetDisabled,
@@ -31,15 +32,36 @@ import { ALL_MODEL_IDS, MODEL_OPTIONS, normalizeEnabledModels, type SupportedMod
 interface CredentialCardProps {
   credential: CredentialStatusItem
   onViewBalance: (id: number) => void
+  selected: boolean
+  onToggleSelect: () => void
+  balance: BalanceResponse | null
+  loadingBalance: boolean
 }
 
-function formatAuthMethodLabel(authMethod: string | null): string {
-  if (!authMethod) return '未知'
-  if (authMethod.toLowerCase() === 'idc') return 'IdC/Builder-ID/IAM'
-  return authMethod
+function formatLastUsed(lastUsedAt: string | null): string {
+  if (!lastUsedAt) return '从未使用'
+  const date = new Date(lastUsedAt)
+  const now = new Date()
+  const diff = now.getTime() - date.getTime()
+  if (diff < 0) return '刚刚'
+  const seconds = Math.floor(diff / 1000)
+  if (seconds < 60) return `${seconds} 秒前`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes} 分钟前`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours} 小时前`
+  const days = Math.floor(hours / 24)
+  return `${days} 天前`
 }
 
-export function CredentialCard({ credential, onViewBalance }: CredentialCardProps) {
+export function CredentialCard({
+  credential,
+  onViewBalance,
+  selected,
+  onToggleSelect,
+  balance,
+  loadingBalance,
+}: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [statsDialogOpen, setStatsDialogOpen] = useState(false)
@@ -118,6 +140,12 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
   }
 
   const handleDelete = () => {
+    if (!credential.disabled) {
+      toast.error('请先禁用凭据再删除')
+      setShowDeleteDialog(false)
+      return
+    }
+
     deleteCredential.mutate(credential.id, {
       onSuccess: (res) => {
         toast.success(res.message)
@@ -141,21 +169,26 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
     if (isNaN(d.getTime())) return t
     return d.toLocaleString()
   }
-
   return (
     <>
       <Card className={credential.isCurrent ? 'ring-2 ring-primary' : ''}>
         <CardHeader className="pb-2">
           <div className="flex items-center justify-between">
-            <CardTitle className="text-lg flex items-center gap-2">
-              凭据 #{credential.id}
-              {credential.isCurrent && (
-                <Badge variant="success">当前</Badge>
-              )}
-              {credential.disabled && (
-                <Badge variant="destructive">已禁用</Badge>
-              )}
-            </CardTitle>
+            <div className="flex items-center gap-2">
+              <Checkbox
+                checked={selected}
+                onCheckedChange={onToggleSelect}
+              />
+              <CardTitle className="text-lg flex items-center gap-2">
+                {credential.email || `凭据 #${credential.id}`}
+                {credential.isCurrent && (
+                  <Badge variant="success">当前</Badge>
+                )}
+                {credential.disabled && (
+                  <Badge variant="destructive">已禁用</Badge>
+                )}
+              </CardTitle>
+            </div>
             <div className="flex items-center gap-2">
               <span className="text-sm text-muted-foreground">启用</span>
               <Switch
@@ -229,12 +262,16 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
               </span>
             </div>
             <div>
-              <span className="text-muted-foreground">认证方式：</span>
-              <span className="font-medium">{formatAuthMethodLabel(credential.authMethod)}</span>
+              <span className="text-muted-foreground">订阅等级：</span>
+              <span className="font-medium">
+                {loadingBalance ? (
+                  <Loader2 className="inline w-3 h-3 animate-spin" />
+                ) : balance?.subscriptionTitle || '未知'}
+              </span>
             </div>
             <div>
-              <span className="text-muted-foreground">Token 有效期：</span>
-              <span className="font-medium">{formatExpiry(credential.expiresAt)}</span>
+              <span className="text-muted-foreground">成功次数：</span>
+              <span className="font-medium">{credential.successCount}</span>
             </div>
             <div className="col-span-2">
               <span className="text-muted-foreground">模型开关：</span>
@@ -479,7 +516,7 @@ export function CredentialCard({ credential, onViewBalance }: CredentialCardProp
             <Button
               variant="destructive"
               onClick={handleDelete}
-              disabled={deleteCredential.isPending}
+              disabled={deleteCredential.isPending || !credential.disabled}
             >
               确认删除
             </Button>

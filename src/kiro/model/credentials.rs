@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+use crate::http_client::ProxyConfig;
+use crate::model::config::Config;
+
 /// Kiro OAuth 凭证
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +68,14 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
 
+    /// 凭据级 Auth Region（用于 Token 刷新）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_region: Option<String>,
+
+    /// 凭据级 API Region（用于 API 请求）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_region: Option<String>,
+
     /// 凭据级 Machine ID 配置（可选）
     /// 未配置时回退到 config.json 的 machineId；都未配置时由 refreshToken 派生
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -77,6 +88,34 @@ pub struct KiroCredentials {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled_models: Option<Vec<String>>,
+
+    /// 用户邮箱（从 Anthropic API 获取）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+
+    /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub subscription_title: Option<String>,
+
+    /// 凭据级代理 URL（可选）
+    /// 支持 http/https/socks5 协议
+    /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
+    /// 未配置时回退到全局代理配置
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+
+    /// 凭据级代理认证用户名（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_username: Option<String>,
+
+    /// 凭据级代理认证密码（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_password: Option<String>,
+
+    /// 凭据是否被禁用（默认为 false）
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -172,9 +211,48 @@ impl CredentialsConfig {
 }
 
 impl KiroCredentials {
+    /// 特殊值：显式不使用代理
+    pub const PROXY_DIRECT: &'static str = "direct";
+
     /// 获取默认凭证文件路径
     pub fn default_credentials_path() -> &'static str {
         "credentials.json"
+    }
+
+    /// 获取有效的 Auth Region（用于 Token 刷新）
+    /// 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
+    pub fn effective_auth_region<'a>(&'a self, config: &'a Config) -> &'a str {
+        self.auth_region
+            .as_deref()
+            .or(self.region.as_deref())
+            .unwrap_or(config.effective_auth_region())
+    }
+
+    /// 获取有效的 API Region（用于 API 请求）
+    /// 优先级：凭据.api_region > config.api_region > config.region
+    pub fn effective_api_region<'a>(&'a self, config: &'a Config) -> &'a str {
+        self.api_region
+            .as_deref()
+            .unwrap_or(config.effective_api_region())
+    }
+
+    /// 获取有效的代理配置
+    /// 优先级：凭据代理 > 全局代理 > 无代理
+    /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
+    pub fn effective_proxy(&self, global_proxy: Option<&ProxyConfig>) -> Option<ProxyConfig> {
+        match self.proxy_url.as_deref() {
+            Some(url) if url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => None,
+            Some(url) => {
+                let mut proxy = ProxyConfig::new(url);
+                if let (Some(username), Some(password)) =
+                    (&self.proxy_username, &self.proxy_password)
+                {
+                    proxy = proxy.with_auth(username, password);
+                }
+                Some(proxy)
+            }
+            None => global_proxy.cloned(),
+        }
     }
 
     /// 从 JSON 字符串解析凭证
@@ -208,11 +286,27 @@ impl KiroCredentials {
             self.auth_method = Some(canonical.to_string());
         }
     }
+
+    /// 检查凭据是否支持 Opus 模型
+    ///
+    /// Free 账号不支持 Opus 模型，需要 PRO 或更高等级订阅
+    pub fn supports_opus(&self) -> bool {
+        match &self.subscription_title {
+            Some(title) => {
+                let title_upper = title.to_uppercase();
+                // 如果包含 FREE，则不支持 Opus
+                !title_upper.contains("FREE")
+            }
+            // 如果还没有获取订阅信息，暂时允许（首次使用时会获取）
+            None => true,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::config::Config;
 
     #[test]
     fn test_from_json() {
@@ -265,8 +359,16 @@ mod tests {
             user_id: None,
             provider: None,
             region: None,
+            auth_region: None,
+            api_region: None,
             machine_id: None,
             enabled_models: None,
+            email: None,
+            subscription_title: None,
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
+            disabled: false,
         };
 
         let json = match creds.to_pretty_json() {
@@ -397,8 +499,16 @@ mod tests {
             user_id: None,
             provider: None,
             region: Some("eu-west-1".to_string()),
+            auth_region: None,
+            api_region: None,
             machine_id: None,
             enabled_models: None,
+            email: None,
+            subscription_title: None,
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
+            disabled: false,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -423,8 +533,16 @@ mod tests {
             user_id: None,
             provider: None,
             region: None,
+            auth_region: None,
+            api_region: None,
             machine_id: None,
             enabled_models: None,
+            email: None,
+            subscription_title: None,
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
+            disabled: false,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -531,8 +649,16 @@ mod tests {
             user_id: None,
             provider: None,
             region: Some("us-west-2".to_string()),
+            auth_region: None,
+            api_region: None,
             machine_id: Some("c".repeat(64)),
             enabled_models: None,
+            email: None,
+            subscription_title: None,
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
+            disabled: false,
         };
 
         let json = original.to_pretty_json().unwrap();
@@ -544,5 +670,257 @@ mod tests {
         assert_eq!(parsed.priority, original.priority);
         assert_eq!(parsed.region, original.region);
         assert_eq!(parsed.machine_id, original.machine_id);
+    }
+
+    // ============ auth_region / api_region 字段测试 ============
+
+    #[test]
+    fn test_auth_region_field_parsing() {
+        let json = r#"{
+            "refreshToken": "test_refresh",
+            "authRegion": "eu-central-1"
+        }"#;
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(creds.auth_region, Some("eu-central-1".to_string()));
+        assert_eq!(creds.api_region, None);
+    }
+
+    #[test]
+    fn test_api_region_field_parsing() {
+        let json = r#"{
+            "refreshToken": "test_refresh",
+            "apiRegion": "ap-southeast-1"
+        }"#;
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(creds.api_region, Some("ap-southeast-1".to_string()));
+        assert_eq!(creds.auth_region, None);
+    }
+
+    #[test]
+    fn test_auth_api_region_serialization() {
+        let mut creds = KiroCredentials::default();
+        creds.refresh_token = Some("test".to_string());
+        creds.auth_region = Some("eu-west-1".to_string());
+        creds.api_region = Some("us-west-2".to_string());
+
+        let json = creds.to_pretty_json().unwrap();
+        assert!(json.contains("authRegion"));
+        assert!(json.contains("eu-west-1"));
+        assert!(json.contains("apiRegion"));
+        assert!(json.contains("us-west-2"));
+    }
+
+    #[test]
+    fn test_auth_api_region_none_not_serialized() {
+        let mut creds = KiroCredentials::default();
+        creds.refresh_token = Some("test".to_string());
+        creds.auth_region = None;
+        creds.api_region = None;
+
+        let json = creds.to_pretty_json().unwrap();
+        assert!(!json.contains("authRegion"));
+        assert!(!json.contains("apiRegion"));
+    }
+
+    #[test]
+    fn test_auth_api_region_roundtrip() {
+        let mut original = KiroCredentials::default();
+        original.refresh_token = Some("refresh".to_string());
+        original.region = Some("us-east-1".to_string());
+        original.auth_region = Some("eu-west-1".to_string());
+        original.api_region = Some("ap-northeast-1".to_string());
+
+        let json = original.to_pretty_json().unwrap();
+        let parsed = KiroCredentials::from_json(&json).unwrap();
+
+        assert_eq!(parsed.region, original.region);
+        assert_eq!(parsed.auth_region, original.auth_region);
+        assert_eq!(parsed.api_region, original.api_region);
+    }
+
+    #[test]
+    fn test_backward_compat_no_auth_api_region() {
+        // 旧格式 JSON 不包含 authRegion/apiRegion，应正常解析
+        let json = r#"{
+            "refreshToken": "test_refresh",
+            "region": "us-east-1"
+        }"#;
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(creds.region, Some("us-east-1".to_string()));
+        assert_eq!(creds.auth_region, None);
+        assert_eq!(creds.api_region, None);
+    }
+
+    // ============ effective_auth_region / effective_api_region 优先级测试 ============
+
+    #[test]
+    fn test_effective_auth_region_credential_auth_region_highest() {
+        // 凭据.auth_region > 凭据.region > config.auth_region > config.region
+        let mut config = Config::default();
+        config.region = "config-region".to_string();
+        config.auth_region = Some("config-auth-region".to_string());
+
+        let mut creds = KiroCredentials::default();
+        creds.region = Some("cred-region".to_string());
+        creds.auth_region = Some("cred-auth-region".to_string());
+
+        assert_eq!(creds.effective_auth_region(&config), "cred-auth-region");
+    }
+
+    #[test]
+    fn test_effective_auth_region_fallback_to_credential_region() {
+        let mut config = Config::default();
+        config.region = "config-region".to_string();
+        config.auth_region = Some("config-auth-region".to_string());
+
+        let mut creds = KiroCredentials::default();
+        creds.region = Some("cred-region".to_string());
+        // auth_region 未设置
+
+        assert_eq!(creds.effective_auth_region(&config), "cred-region");
+    }
+
+    #[test]
+    fn test_effective_auth_region_fallback_to_config_auth_region() {
+        let mut config = Config::default();
+        config.region = "config-region".to_string();
+        config.auth_region = Some("config-auth-region".to_string());
+
+        let creds = KiroCredentials::default();
+        // auth_region 和 region 均未设置
+
+        assert_eq!(creds.effective_auth_region(&config), "config-auth-region");
+    }
+
+    #[test]
+    fn test_effective_auth_region_fallback_to_config_region() {
+        let mut config = Config::default();
+        config.region = "config-region".to_string();
+        // config.auth_region 未设置
+
+        let creds = KiroCredentials::default();
+
+        assert_eq!(creds.effective_auth_region(&config), "config-region");
+    }
+
+    #[test]
+    fn test_effective_api_region_credential_api_region_highest() {
+        // 凭据.api_region > config.api_region > config.region
+        let mut config = Config::default();
+        config.region = "config-region".to_string();
+        config.api_region = Some("config-api-region".to_string());
+
+        let mut creds = KiroCredentials::default();
+        creds.api_region = Some("cred-api-region".to_string());
+
+        assert_eq!(creds.effective_api_region(&config), "cred-api-region");
+    }
+
+    #[test]
+    fn test_effective_api_region_fallback_to_config_api_region() {
+        let mut config = Config::default();
+        config.region = "config-region".to_string();
+        config.api_region = Some("config-api-region".to_string());
+
+        let creds = KiroCredentials::default();
+
+        assert_eq!(creds.effective_api_region(&config), "config-api-region");
+    }
+
+    #[test]
+    fn test_effective_api_region_fallback_to_config_region() {
+        let mut config = Config::default();
+        config.region = "config-region".to_string();
+
+        let creds = KiroCredentials::default();
+
+        assert_eq!(creds.effective_api_region(&config), "config-region");
+    }
+
+    #[test]
+    fn test_effective_api_region_ignores_credential_region() {
+        // 凭据.region 不参与 api_region 的回退链
+        let mut config = Config::default();
+        config.region = "config-region".to_string();
+
+        let mut creds = KiroCredentials::default();
+        creds.region = Some("cred-region".to_string());
+
+        assert_eq!(creds.effective_api_region(&config), "config-region");
+    }
+
+    #[test]
+    fn test_auth_and_api_region_independent() {
+        // auth_region 和 api_region 互不影响
+        let mut config = Config::default();
+        config.region = "default".to_string();
+
+        let mut creds = KiroCredentials::default();
+        creds.auth_region = Some("auth-only".to_string());
+        creds.api_region = Some("api-only".to_string());
+
+        assert_eq!(creds.effective_auth_region(&config), "auth-only");
+        assert_eq!(creds.effective_api_region(&config), "api-only");
+    }
+
+    // ============ 凭据级代理优先级测试 ============
+
+    #[test]
+    fn test_effective_proxy_credential_overrides_global() {
+        let global = ProxyConfig::new("http://global:8080");
+        let mut creds = KiroCredentials::default();
+        creds.proxy_url = Some("socks5://cred:1080".to_string());
+
+        let result = creds.effective_proxy(Some(&global));
+        assert_eq!(result, Some(ProxyConfig::new("socks5://cred:1080")));
+    }
+
+    #[test]
+    fn test_effective_proxy_credential_with_auth() {
+        let global = ProxyConfig::new("http://global:8080");
+        let mut creds = KiroCredentials::default();
+        creds.proxy_url = Some("http://proxy:3128".to_string());
+        creds.proxy_username = Some("user".to_string());
+        creds.proxy_password = Some("pass".to_string());
+
+        let result = creds.effective_proxy(Some(&global));
+        let expected = ProxyConfig::new("http://proxy:3128").with_auth("user", "pass");
+        assert_eq!(result, Some(expected));
+    }
+
+    #[test]
+    fn test_effective_proxy_direct_bypasses_global() {
+        let global = ProxyConfig::new("http://global:8080");
+        let mut creds = KiroCredentials::default();
+        creds.proxy_url = Some("direct".to_string());
+
+        let result = creds.effective_proxy(Some(&global));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_effective_proxy_direct_case_insensitive() {
+        let global = ProxyConfig::new("http://global:8080");
+        let mut creds = KiroCredentials::default();
+        creds.proxy_url = Some("DIRECT".to_string());
+
+        let result = creds.effective_proxy(Some(&global));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_effective_proxy_fallback_to_global() {
+        let global = ProxyConfig::new("http://global:8080");
+        let creds = KiroCredentials::default();
+
+        let result = creds.effective_proxy(Some(&global));
+        assert_eq!(result, Some(ProxyConfig::new("http://global:8080")));
+    }
+
+    #[test]
+    fn test_effective_proxy_none_when_no_proxy() {
+        let creds = KiroCredentials::default();
+        let result = creds.effective_proxy(None);
+        assert_eq!(result, None);
     }
 }

@@ -75,6 +75,13 @@ pub struct Thinking {
     pub budget_tokens: i32,
 }
 
+impl Thinking {
+    /// 是否启用了 thinking（enabled 或 adaptive）
+    pub fn is_enabled(&self) -> bool {
+        self.thinking_type == "enabled" || self.thinking_type == "adaptive"
+    }
+}
+
 fn default_budget_tokens() -> i32 {
     20000
 }
@@ -84,6 +91,17 @@ where
 {
     let value = i32::deserialize(deserializer)?;
     Ok(value.min(MAX_BUDGET_TOKENS))
+}
+
+/// OutputConfig 配置
+#[derive(Debug, Deserialize, Clone)]
+pub struct OutputConfig {
+    #[serde(default = "default_effort")]
+    pub effort: String,
+}
+
+fn default_effort() -> String {
+    "high".to_string()
 }
 
 /// Claude Code 请求中的 metadata
@@ -106,6 +124,7 @@ pub struct MessagesRequest {
     pub tools: Option<Vec<Tool>>,
     pub tool_choice: Option<serde_json::Value>,
     pub thinking: Option<Thinking>,
+    pub output_config: Option<OutputConfig>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
 }

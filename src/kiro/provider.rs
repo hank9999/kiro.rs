@@ -6,6 +6,7 @@
 
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, HeaderMap, HeaderValue};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -17,7 +18,9 @@ use crate::http_client::{build_client, build_stream_client, ProxyConfig};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{CallContext, MultiTokenManager};
+use crate::model::config::TlsBackend;
 use crate::stats::StatsStore;
+use parking_lot::Mutex;
 
 /// 全局标志：是否需要在下次请求时输出详细日志
 static VERBOSE_NEXT_REQUEST: AtomicBool = AtomicBool::new(false);
@@ -368,8 +371,15 @@ fn log_response_diagnostic(
 /// 支持多凭据故障转移和重试机制
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
-    client: Client,
-    stream_client: Client,
+    /// 全局代理配置（用于凭据无自定义代理时的回退）
+    global_proxy: Option<ProxyConfig>,
+    /// Client 缓存：key = effective proxy config, value = reqwest::Client
+    /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client
+    client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
+    /// 流式 Client 缓存：关闭总超时，避免流式响应被整体 deadline 中断
+    stream_client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
+    /// TLS 后端配置
+    tls_backend: TlsBackend,
     stats: Option<Arc<StatsStore>>,
 }
 
@@ -384,16 +394,24 @@ impl KiroProvider {
         token_manager: Arc<MultiTokenManager>,
         proxy: Option<ProxyConfig>,
     ) -> anyhow::Result<Self> {
-        // 非流式请求：设置总超时，避免无限挂起
-        let client = build_client(proxy.as_ref(), 720, token_manager.config().tls_backend)?; // 12 分钟
+        let tls_backend = token_manager.config().tls_backend;
 
-        // 流式请求：关闭总超时，避免长响应被客户端整体 deadline 中断
-        let stream_client = build_stream_client(proxy.as_ref())?;
+        // 预热：构建全局代理对应的 Client
+        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)?;
+        let initial_stream_client = build_stream_client(proxy.as_ref())?;
+
+        let mut client_cache = HashMap::new();
+        client_cache.insert(proxy.clone(), initial_client);
+
+        let mut stream_client_cache = HashMap::new();
+        stream_client_cache.insert(proxy.clone(), initial_stream_client);
 
         Ok(Self {
             token_manager,
-            client,
-            stream_client,
+            global_proxy: proxy,
+            client_cache: Mutex::new(client_cache),
+            stream_client_cache: Mutex::new(stream_client_cache),
+            tls_backend,
             stats: None,
         })
     }
@@ -408,45 +426,95 @@ impl KiroProvider {
         self.stats.clone()
     }
 
+    /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
+    fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
+        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let mut cache = self.client_cache.lock();
+        if let Some(client) = cache.get(&effective) {
+            return Ok(client.clone());
+        }
+        let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
+        cache.insert(effective, client.clone());
+        Ok(client)
+    }
+
+    /// 根据凭据的代理配置获取（或创建并缓存）对应的流式 reqwest::Client
+    fn stream_client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
+        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let mut cache = self.stream_client_cache.lock();
+        if let Some(client) = cache.get(&effective) {
+            return Ok(client.clone());
+        }
+        let client = build_stream_client(effective.as_ref())?;
+        cache.insert(effective, client.clone());
+        Ok(client)
+    }
+
     /// 获取 token_manager 的引用
     pub fn token_manager(&self) -> &MultiTokenManager {
         &self.token_manager
     }
 
-    /// 获取 API 基础 URL（固定使用 config.region）
+    /// 获取 API 基础 URL（使用 config 级 api_region）
     pub fn base_url(&self) -> String {
         format!(
             "https://q.{}.amazonaws.com/generateAssistantResponse",
-            self.token_manager.config().region
+            self.token_manager.config().effective_api_region()
         )
     }
 
-    /// 获取 API 基础 URL（固定使用 config.region，忽略凭据级 region）
-    fn base_url_for_credential(&self, _credentials: &KiroCredentials) -> String {
-        self.base_url()
-    }
-
-    /// 获取 MCP API URL（固定使用 config.region）
+    /// 获取 MCP API URL（使用 config 级 api_region）
     pub fn mcp_url(&self) -> String {
         format!(
             "https://q.{}.amazonaws.com/mcp",
-            self.token_manager.config().region
+            self.token_manager.config().effective_api_region()
         )
     }
 
-    /// 获取 MCP API URL（固定使用 config.region，忽略凭据级 region）
-    fn mcp_url_for_credential(&self, _credentials: &KiroCredentials) -> String {
-        self.mcp_url()
-    }
-
-    /// 获取 API 基础域名（固定使用 config.region）
+    /// 获取 API 基础域名（使用 config 级 api_region）
     pub fn base_domain(&self) -> String {
-        format!("q.{}.amazonaws.com", self.token_manager.config().region)
+        format!("q.{}.amazonaws.com", self.token_manager.config().effective_api_region())
     }
 
-    /// 获取 API 基础域名（固定使用 config.region，忽略凭据级 region）
-    fn base_domain_for_credential(&self, _credentials: &KiroCredentials) -> String {
-        self.base_domain()
+    /// 获取凭据级 API 基础 URL
+    fn base_url_for(&self, credentials: &KiroCredentials) -> String {
+        format!(
+            "https://q.{}.amazonaws.com/generateAssistantResponse",
+            credentials.effective_api_region(self.token_manager.config())
+        )
+    }
+
+    /// 获取凭据级 MCP API URL
+    fn mcp_url_for(&self, credentials: &KiroCredentials) -> String {
+        format!(
+            "https://q.{}.amazonaws.com/mcp",
+            credentials.effective_api_region(self.token_manager.config())
+        )
+    }
+
+    /// 获取凭据级 API 基础域名
+    fn base_domain_for(&self, credentials: &KiroCredentials) -> String {
+        format!(
+            "q.{}.amazonaws.com",
+            credentials.effective_api_region(self.token_manager.config())
+        )
+    }
+
+    /// 从请求体中提取模型信息
+    ///
+    /// 尝试解析 JSON 请求体，提取 conversationState.currentMessage.userInputMessage.modelId
+    fn extract_model_from_request(request_body: &str) -> Option<String> {
+        use serde_json::Value;
+
+        let json: Value = serde_json::from_str(request_body).ok()?;
+
+        // 尝试提取 conversationState.currentMessage.userInputMessage.modelId
+        json.get("conversationState")?
+            .get("currentMessage")?
+            .get("userInputMessage")?
+            .get("modelId")?
+            .as_str()
+            .map(|s| s.to_string())
     }
 
     /// 构建请求头
@@ -490,7 +558,7 @@ impl KiroProvider {
         );
         headers.insert(
             HOST,
-            HeaderValue::from_str(&self.base_domain_for_credential(&ctx.credentials))
+            HeaderValue::from_str(&self.base_domain_for(&ctx.credentials))
                 .map_err(|e| anyhow::anyhow!("Host header 无效: {}", e))?,
         );
         headers.insert(
@@ -539,7 +607,7 @@ impl KiroProvider {
             HeaderValue::from_str(&x_amz_user_agent).unwrap(),
         );
         headers.insert("user-agent", HeaderValue::from_str(&user_agent).unwrap());
-        headers.insert("host", HeaderValue::from_str(&self.base_domain_for_credential(&ctx.credentials)).unwrap());
+        headers.insert("host", HeaderValue::from_str(&self.base_domain_for(&ctx.credentials)).unwrap());
         headers.insert(
             "amz-sdk-invocation-id",
             HeaderValue::from_str(&Uuid::new_v4().to_string()).unwrap(),
@@ -632,6 +700,7 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文
+            // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
             let ctx = match self.token_manager.acquire_context().await {
                 Ok(c) => c,
                 Err(e) => {
@@ -640,7 +709,7 @@ impl KiroProvider {
                 }
             };
 
-            let url = self.mcp_url_for_credential(&ctx.credentials);
+            let url = self.mcp_url_for(&ctx.credentials);
             let headers = match self.build_mcp_headers(&ctx) {
                 Ok(h) => h,
                 Err(e) => {
@@ -651,7 +720,7 @@ impl KiroProvider {
 
             // 发送请求
             let response = match self
-                .client
+                .client_for(&ctx.credentials)?
                 .post(&url)
                 .headers(headers)
                 .body(request_body.to_string())
@@ -763,9 +832,16 @@ impl KiroProvider {
         let mut last_error: Option<anyhow::Error> = None;
         let api_type = if is_stream { "流式" } else { "非流式" };
 
+        // 尝试从请求体中提取模型信息
+        let model = Self::extract_model_from_request(request_body);
+
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context_for_model(model).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context_for_model(model.as_deref())
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(
@@ -776,7 +852,7 @@ impl KiroProvider {
                     );
 
                     if let Some(stats) = &self.stats {
-                        stats.record_error(0, model, truncate_error(e.to_string()));
+                        stats.record_error(0, model.as_deref(), truncate_error(e.to_string()));
                     }
 
                     last_error = Some(e);
@@ -807,7 +883,7 @@ impl KiroProvider {
                 }
             };
 
-            let url = self.base_url_for_credential(&ctx.credentials);
+            let url = self.base_url_for(&ctx.credentials);
             let headers = match self.build_headers(&ctx) {
                 Ok(h) => h,
                 Err(e) => {
@@ -820,7 +896,7 @@ impl KiroProvider {
                     );
 
                     if let Some(stats) = &self.stats {
-                        stats.record_error(ctx.id, model, truncate_error(e.to_string()));
+                        stats.record_error(ctx.id, model.as_deref(), truncate_error(e.to_string()));
                     }
 
                     last_error = Some(e);
@@ -830,7 +906,7 @@ impl KiroProvider {
             };
 
             if let Some(stats) = &self.stats {
-                stats.record_attempt(ctx.id, model);
+                stats.record_attempt(ctx.id, model.as_deref());
             }
 
             // 检查是否需要输出详细日志（上次请求遇到 401/403 后设置）
@@ -857,9 +933,9 @@ impl KiroProvider {
 
             // 发送请求
             let client = if is_stream {
-                &self.stream_client
+                self.stream_client_for(&ctx.credentials)?
             } else {
-                &self.client
+                self.client_for(&ctx.credentials)?
             };
 
             if let Some(ref mut d) = diag {
@@ -888,7 +964,7 @@ impl KiroProvider {
                     );
 
                     if let Some(stats) = &self.stats {
-                        stats.record_error(ctx.id, model, truncate_error(e.to_string()));
+                        stats.record_error(ctx.id, model.as_deref(), truncate_error(e.to_string()));
                     }
 
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
@@ -975,7 +1051,7 @@ impl KiroProvider {
                     if let Some(stats) = &self.stats {
                         stats.record_error(
                             ctx.id,
-                            model,
+                            model.as_deref(),
                             truncate_error("内容长度超限 (CONTENT_LENGTH_EXCEEDS_THRESHOLD)".to_string()),
                         );
                     }
@@ -993,7 +1069,7 @@ impl KiroProvider {
                 if let Some(stats) = &self.stats {
                     stats.record_error(
                         ctx.id,
-                        model,
+                        model.as_deref(),
                         truncate_error(format!("{} API 请求失败: {} {}", api_type, status, body)),
                     );
                 }
@@ -1040,7 +1116,7 @@ impl KiroProvider {
                 if let Some(stats) = &self.stats {
                     stats.record_error(
                         ctx.id,
-                        model,
+                        model.as_deref(),
                         truncate_error(format!("{} API 请求失败: {} {}", api_type, status, body)),
                     );
                 }
@@ -1078,7 +1154,7 @@ impl KiroProvider {
                 if let Some(stats) = &self.stats {
                     stats.record_error(
                         ctx.id,
-                        model,
+                        model.as_deref(),
                         truncate_error(format!("{} API 请求失败: {} {}", api_type, status, body)),
                     );
                 }
@@ -1095,7 +1171,7 @@ impl KiroProvider {
                 if let Some(stats) = &self.stats {
                     stats.record_error(
                         ctx.id,
-                        model,
+                        model.as_deref(),
                         truncate_error(format!("{} API 请求失败: {} {}", api_type, status, body)),
                     );
                 }
@@ -1114,7 +1190,7 @@ impl KiroProvider {
             if let Some(stats) = &self.stats {
                 stats.record_error(
                     ctx.id,
-                    model,
+                    model.as_deref(),
                     truncate_error(format!("{} API 请求失败: {} {}", api_type, status, body)),
                 );
             }

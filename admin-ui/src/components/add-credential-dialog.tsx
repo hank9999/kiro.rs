@@ -24,22 +24,32 @@ type AuthMethod = 'social' | 'idc'
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
-  const [region, setRegion] = useState('')
+  const [authRegion, setAuthRegion] = useState('')
+  const [apiRegion, setApiRegion] = useState('')
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
   const [priority, setPriority] = useState('0')
   const [enabledModels, setEnabledModels] = useState<SupportedModelId[]>([...ALL_MODEL_IDS])
+  const [machineId, setMachineId] = useState('')
+  const [proxyUrl, setProxyUrl] = useState('')
+  const [proxyUsername, setProxyUsername] = useState('')
+  const [proxyPassword, setProxyPassword] = useState('')
 
   const { mutate, isPending } = useAddCredential()
 
   const resetForm = () => {
     setRefreshToken('')
     setAuthMethod('social')
-    setRegion('')
+    setAuthRegion('')
+    setApiRegion('')
     setClientId('')
     setClientSecret('')
     setPriority('0')
     setEnabledModels([...ALL_MODEL_IDS])
+    setMachineId('')
+    setProxyUrl('')
+    setProxyUsername('')
+    setProxyPassword('')
   }
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -64,11 +74,17 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       {
         refreshToken: refreshToken.trim(),
         authMethod,
-        region: region.trim() || undefined,
+        authRegion: authRegion.trim() || undefined,
+        apiRegion: apiRegion.trim() || undefined,
         clientId: clientId.trim() || undefined,
         clientSecret: clientSecret.trim() || undefined,
         priority: parseInt(priority) || 0,
         enabledModels: enabledModelsPayload,
+        enabledModels: enabledModelsPayload,
+        machineId: machineId.trim() || undefined,
+        proxyUrl: proxyUrl.trim() || undefined,
+        proxyUsername: proxyUsername.trim() || undefined,
+        proxyPassword: proxyPassword.trim() || undefined,
       },
       {
         onSuccess: (data) => {
@@ -85,13 +101,13 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col">
         <DialogHeader>
           <DialogTitle>添加凭据</DialogTitle>
         </DialogHeader>
 
-        <form onSubmit={handleSubmit}>
-          <div className="space-y-4 py-4">
+        <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
+          <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
             {/* Refresh Token */}
             <div className="space-y-2">
               <label htmlFor="refreshToken" className="text-sm font-medium">
@@ -124,17 +140,32 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </select>
             </div>
 
+            {/* Region 配置 */}
             <div className="space-y-2">
-              <label htmlFor="region" className="text-sm font-medium">
-                刷新 Token 地域
-              </label>
-              <Input
-                id="region"
-                placeholder="例如 us-east-1（留空则使用全局 region）"
-                value={region}
-                onChange={(e) => setRegion(e.target.value)}
-                disabled={isPending}
-              />
+              <label className="text-sm font-medium">Region 配置</label>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <Input
+                    id="authRegion"
+                    placeholder="Auth Region"
+                    value={authRegion}
+                    onChange={(e) => setAuthRegion(e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+                <div>
+                  <Input
+                    id="apiRegion"
+                    placeholder="API Region"
+                    value={apiRegion}
+                    onChange={(e) => setApiRegion(e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                均可留空使用全局配置。Auth Region 用于 Token 刷新，API Region 用于 API 请求
+              </p>
             </div>
 
             {/* IdC/Builder-ID/IAM 额外字段 */}
@@ -230,6 +261,55 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </div>
               <p className="text-xs text-muted-foreground">
                 不配置时默认全开；你也可以按凭据限制可用模型，避免请求命中不支持模型导致 400。
+              </p>
+            </div>
+
+            {/* Machine ID */}
+            <div className="space-y-2">
+              <label htmlFor="machineId" className="text-sm font-medium">
+                Machine ID
+              </label>
+              <Input
+                id="machineId"
+                placeholder="留空使用配置中字段, 否则由刷新Token自动派生"
+                value={machineId}
+                onChange={(e) => setMachineId(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                可选，64 位十六进制字符串，留空使用配置中字段, 否则由刷新Token自动派生
+              </p>
+            </div>
+
+            {/* 代理配置 */}
+            <div className="space-y-2">
+              <label className="text-sm font-medium">代理配置</label>
+              <Input
+                id="proxyUrl"
+                placeholder='代理 URL（留空使用全局配置，"direct" 不使用代理）'
+                value={proxyUrl}
+                onChange={(e) => setProxyUrl(e.target.value)}
+                disabled={isPending}
+              />
+              <div className="grid grid-cols-2 gap-2">
+                <Input
+                  id="proxyUsername"
+                  placeholder="代理用户名"
+                  value={proxyUsername}
+                  onChange={(e) => setProxyUsername(e.target.value)}
+                  disabled={isPending}
+                />
+                <Input
+                  id="proxyPassword"
+                  type="password"
+                  placeholder="代理密码"
+                  value={proxyPassword}
+                  onChange={(e) => setProxyPassword(e.target.value)}
+                  disabled={isPending}
+                />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                留空使用全局代理。输入 "direct" 可显式不使用代理
               </p>
             </div>
           </div>

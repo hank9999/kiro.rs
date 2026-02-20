@@ -9,9 +9,9 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, CredentialAccountInfoResponse, SetDisabledRequest,
-        SetEnabledModelsRequest, SetPriorityRequest, SetSummaryModelRequest,
-        SummaryModelResponse, SuccessResponse, AVAILABLE_SUMMARY_MODELS,
+    AddCredentialRequest, CredentialAccountInfoResponse, SetDisabledRequest,
+    SetEnabledModelsRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
+    SetSummaryModelRequest, SummaryModelResponse, SuccessResponse, AVAILABLE_SUMMARY_MODELS,
     },
 };
 
@@ -217,5 +217,24 @@ pub async fn set_summary_model(
             )),
         )
             .into_response()
+    }
+}
+
+/// GET /api/admin/config/load-balancing
+/// 获取负载均衡模式
+pub async fn get_load_balancing_mode(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_load_balancing_mode();
+    Json(response)
+}
+
+/// PUT /api/admin/config/load-balancing
+/// 设置负载均衡模式
+pub async fn set_load_balancing_mode(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetLoadBalancingModeRequest>,
+) -> impl IntoResponse {
+    match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

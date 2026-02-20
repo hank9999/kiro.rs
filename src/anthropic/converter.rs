@@ -13,19 +13,83 @@ use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
 
-use super::types::{ContentBlock, MessagesRequest, Thinking};
+use super::types::{ContentBlock, MessagesRequest};
+
+/// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
+///
+/// Claude Code / MCP 工具定义偶尔会出现 `required: null`、`properties: null` 等，
+/// 导致上游返回 400 "Improperly formed request"。
+fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(mut obj) = schema else {
+        return serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": true
+        });
+    };
+
+    // type（必须是字符串）
+    if !obj.get("type").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
+        obj.insert("type".to_string(), serde_json::Value::String("object".to_string()));
+    }
+
+    // properties（必须是 object）
+    match obj.get("properties") {
+        Some(serde_json::Value::Object(_)) => {}
+        _ => { obj.insert("properties".to_string(), serde_json::Value::Object(serde_json::Map::new())); }
+    }
+
+    // required（必须是 string 数组）
+    let required = match obj.remove("required") {
+        Some(serde_json::Value::Array(arr)) => serde_json::Value::Array(
+            arr.into_iter()
+                .filter_map(|v| v.as_str().map(|s| serde_json::Value::String(s.to_string())))
+                .collect(),
+        ),
+        _ => serde_json::Value::Array(Vec::new()),
+    };
+    obj.insert("required".to_string(), required);
+
+    // additionalProperties（允许 bool 或 object，其他按 true 处理）
+    match obj.get("additionalProperties") {
+        Some(serde_json::Value::Bool(_)) | Some(serde_json::Value::Object(_)) => {}
+        _ => { obj.insert("additionalProperties".to_string(), serde_json::Value::Bool(true)); }
+    }
+
+    serde_json::Value::Object(obj)
+}
+
+/// 追加到 Write 工具 description 末尾的内容
+const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the content to write exceeds 150 lines, you MUST only write the first 50 lines using this tool, then use `Edit` tool to append the remaining content in chunks of no more than 50 lines each. If needed, leave a unique placeholder to help append content. Do NOT attempt to write all content at once.";
+
+/// 追加到 Edit 工具 description 末尾的内容
+const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder.";
+
+/// 追加到系统提示词的分块写入策略
+const SYSTEM_CHUNKED_POLICY: &str = "\
+When the Write or Edit tool has content size limits, always comply silently. \
+Never suggest bypassing these limits via alternative tools. \
+Never ask the user whether to switch approaches. \
+Complete all chunked operations without commentary.";
 
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
 /// 按照用户要求：
-/// - 所有 sonnet → claude-sonnet-4.5
-/// - 所有 opus → claude-opus-4.5
+/// - sonnet 4.6/4-6 → claude-sonnet-4.6
+/// - 其他 sonnet → claude-sonnet-4.5
+/// - opus 4.5/4-5 → claude-opus-4.5
+/// - 其他 opus → claude-opus-4.6
 /// - 所有 haiku → claude-haiku-4.5
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
     if model_lower.contains("sonnet") {
-        Some("claude-sonnet-4.5".to_string())
+        if model_lower.contains("4-6") || model_lower.contains("4.6") {
+            Some("claude-sonnet-4.6".to_string())
+        } else {
+            Some("claude-sonnet-4.5".to_string())
+        }
     } else if model_lower.contains("opus") {
         if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
@@ -139,6 +203,20 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         return Err(ConversionError::EmptyMessages);
     }
 
+    // 2.5. 预处理 prefill：如果末尾是 assistant，静默丢弃并截断到最后一条 user
+    // Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持
+    let messages: &[_] = if req.messages.last().is_some_and(|m| m.role != "user") {
+        tracing::info!("检测到末尾 assistant 消息（prefill），静默丢弃");
+        let last_user_idx = req
+            .messages
+            .iter()
+            .rposition(|m| m.role == "user")
+            .ok_or(ConversionError::EmptyMessages)?;
+        &req.messages[..=last_user_idx]
+    } else {
+        &req.messages
+    };
+
     // 3. 生成会话 ID 和代理 ID
     // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
     let conversation_id = req
@@ -152,24 +230,26 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 4. 确定触发类型
     let chat_trigger_type = determine_chat_trigger_type(req);
 
-    // 5. 处理最后一条消息作为 current_message
-    let last_message = req
-        .messages
-        .last()
-        .ok_or(ConversionError::EmptyMessages)?;
+    // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
+    let last_message = messages.last().ok_or(ConversionError::EmptyMessages)?;
     let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
 
     // 6. 转换工具定义
     let mut tools = convert_tools(&req.tools);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let history = build_history(req, &model_id)?;
+    let mut history = build_history(req, messages, &model_id)?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
-    let validated_tool_results = validate_tool_pairing(&history, &tool_results);
+    // 同时返回孤立的 tool_use_id 集合，用于后续清理
+    let (validated_tool_results, orphaned_tool_use_ids) =
+        validate_tool_pairing(&history, &tool_results);
 
-    // 9. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
+    // 9. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
+    remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
+
+    // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
     // 注意：Kiro 匹配工具名称时忽略大小写，所以这里也需要忽略大小写比较
     let history_tool_names = collect_history_tool_names(&history);
@@ -184,7 +264,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         }
     }
 
-    // 10. 构建 UserInputMessageContext
+    // 11. 构建 UserInputMessageContext
     let mut context = UserInputMessageContext::new();
     if !tools.is_empty() {
         context = context.with_tools(tools);
@@ -193,7 +273,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         context = context.with_tool_results(validated_tool_results);
     }
 
-    // 11. 构建当前消息
+    // 12. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
     let content = text_content;
 
@@ -207,7 +287,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     let current_message = CurrentMessage::new(user_input);
 
-    // 12. 构建 ConversationState
+    // 13. 构建 ConversationState
     let conversation_state = ConversationState::new(conversation_id)
         .with_agent_continuation_id(agent_continuation_id)
         .with_agent_task_type("vibe")
@@ -576,8 +656,11 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
 /// * `tool_results` - 当前消息中的 tool_result 列表
 ///
 /// # Returns
-/// 经过验证和过滤后的 tool_result 列表
-fn validate_tool_pairing(history: &[Message], tool_results: &[ToolResult]) -> Vec<ToolResult> {
+/// 元组：(经过验证和过滤后的 tool_result 列表, 孤立的 tool_use_id 集合)
+fn validate_tool_pairing(
+    history: &[Message],
+    tool_results: &[ToolResult],
+) -> (Vec<ToolResult>, std::collections::HashSet<String>) {
     use std::collections::HashSet;
 
     // 1. 收集所有历史中的 tool_use_id
@@ -639,12 +722,48 @@ fn validate_tool_pairing(history: &[Message], tool_results: &[ToolResult]) -> Ve
     // 5. 检测真正孤立的 tool_use（有 tool_use 但在历史和当前消息中都没有 tool_result）
     for orphaned_id in &unpaired_tool_use_ids {
         tracing::warn!(
-            "检测到孤立的 tool_use：找不到对应的 tool_result，tool_use_id={}",
+            "检测到孤立的 tool_use：找不到对应的 tool_result，将从历史中移除，tool_use_id={}",
             orphaned_id
         );
     }
 
-    filtered_results
+    (filtered_results, unpaired_tool_use_ids)
+}
+
+/// 从历史消息中移除孤立的 tool_use
+///
+/// Kiro API 要求每个 tool_use 必须有对应的 tool_result，否则返回 400 Bad Request。
+/// 此函数遍历历史中的 assistant 消息，移除没有对应 tool_result 的 tool_use。
+///
+/// # Arguments
+/// * `history` - 可变的历史消息列表
+/// * `orphaned_ids` - 需要移除的孤立 tool_use_id 集合
+fn remove_orphaned_tool_uses(
+    history: &mut [Message],
+    orphaned_ids: &std::collections::HashSet<String>,
+) {
+    if orphaned_ids.is_empty() {
+        return;
+    }
+
+    for msg in history.iter_mut() {
+        if let Message::Assistant(assistant_msg) = msg {
+            if let Some(ref mut tool_uses) = assistant_msg.assistant_response_message.tool_uses {
+                let original_len = tool_uses.len();
+                tool_uses.retain(|tu| !orphaned_ids.contains(&tu.tool_use_id));
+
+                // 如果移除后为空，设置为 None
+                if tool_uses.is_empty() {
+                    assistant_msg.assistant_response_message.tool_uses = None;
+                } else if tool_uses.len() != original_len {
+                    tracing::debug!(
+                        "从 assistant 消息中移除了 {} 个孤立的 tool_use",
+                        original_len - tool_uses.len()
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// 转换工具定义
@@ -656,7 +775,19 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
     tools
         .iter()
         .map(|t| {
-            let description = t.description.clone();
+            let mut description = t.description.clone();
+
+            // 对 Write/Edit 工具追加自定义描述后缀
+            let suffix = match t.name.as_str() {
+                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
+                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
+                _ => "",
+            };
+            if !suffix.is_empty() {
+                description.push('\n');
+                description.push_str(suffix);
+            }
+
             // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
             let description = match description.char_indices().nth(10000) {
                 Some((idx, _)) => description[..idx].to_string(),
@@ -667,7 +798,7 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
                 tool_specification: ToolSpecification {
                     name: t.name.clone(),
                     description,
-                    input_schema: InputSchema::from_json(serde_json::json!(t.input_schema)),
+                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(t.input_schema))),
                 },
             }
         })
@@ -675,12 +806,22 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
 }
 
 /// 生成thinking标签前缀
-fn generate_thinking_prefix(thinking: &Option<Thinking>) -> Option<String> {
-    if let Some(t) = thinking {
+fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
+    if let Some(t) = &req.thinking {
         if t.thinking_type == "enabled" {
             return Some(format!(
                 "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
                 t.budget_tokens
+            ));
+        } else if t.thinking_type == "adaptive" {
+            let effort = req
+                .output_config
+                .as_ref()
+                .map(|c| c.effort.as_str())
+                .unwrap_or("high");
+            return Some(format!(
+                "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
+                effort
             ));
         }
     }
@@ -693,11 +834,18 @@ fn has_thinking_tags(content: &str) -> bool {
 }
 
 /// 构建历史消息
-fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, ConversionError> {
+///
+/// # Arguments
+/// * `req` - 原始请求，用于读取 `system`、`thinking` 等配置字段
+/// * `messages` - 经过 prefill 预处理的消息切片，末尾必定是 user 消息。
+///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
+///   调用方应始终使用此参数而非 `req.messages`。
+/// * `model_id` - 已映射的 Kiro 模型 ID
+fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
-    let thinking_prefix = generate_thinking_prefix(&req.thinking);
+    let thinking_prefix = generate_thinking_prefix(req);
 
     // 1. 处理系统消息
     if let Some(ref system) = req.system {
@@ -708,6 +856,9 @@ fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, 
             .join("\n");
 
         if !system_content.is_empty() {
+            // 追加分块写入策略到系统消息
+            let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
+
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
             let final_content = if let Some(ref prefix) = thinking_prefix {
                 if !has_thinking_tags(&system_content) {
@@ -737,26 +888,14 @@ fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, 
 
     // 2. 处理常规消息历史
     // 最后一条消息作为 currentMessage，不加入历史
-    let history_end_index = req.messages.len().saturating_sub(1);
-
-    // 如果最后一条是 assistant，则包含在历史中
-    let last_is_assistant = req
-        .messages
-        .last()
-        .map(|m| m.role == "assistant")
-        .unwrap_or(false);
-
-    let history_end_index = if last_is_assistant {
-        req.messages.len()
-    } else {
-        history_end_index
-    };
+    // 经过 prefill 预处理后，messages 末尾必定是 user，故直接截掉最后一条即可
+    let history_end_index = messages.len().saturating_sub(1);
 
     // 收集并配对消息
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
 
     for i in 0..history_end_index {
-        let msg = &req.messages[i];
+        let msg = &messages[i];
 
         if msg.role == "user" {
             user_buffer.push(msg);
@@ -929,6 +1068,34 @@ mod tests {
     }
 
     #[test]
+    fn test_map_model_thinking_suffix_sonnet() {
+        // thinking 后缀不应影响 sonnet 模型映射
+        let result = map_model("claude-sonnet-4-5-20250929-thinking");
+        assert_eq!(result, Some("claude-sonnet-4.5".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_thinking_suffix_opus_4_5() {
+        // thinking 后缀不应影响 opus 4.5 模型映射
+        let result = map_model("claude-opus-4-5-20251101-thinking");
+        assert_eq!(result, Some("claude-opus-4.5".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_thinking_suffix_opus_4_6() {
+        // thinking 后缀不应影响 opus 4.6 模型映射
+        let result = map_model("claude-opus-4-6-thinking");
+        assert_eq!(result, Some("claude-opus-4.6".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_thinking_suffix_haiku() {
+        // thinking 后缀不应影响 haiku 模型映射
+        let result = map_model("claude-haiku-4-5-20251001-thinking");
+        assert_eq!(result, Some("claude-haiku-4.5".to_string()));
+    }
+
+    #[test]
     fn test_determine_chat_trigger_type() {
         // 无工具时返回 MANUAL
         let req = MessagesRequest {
@@ -940,6 +1107,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
+            output_config: None,
             metadata: None,
         };
         assert_eq!(determine_chat_trigger_type(&req), "MANUAL");
@@ -1056,6 +1224,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
+            output_config: None,
             metadata: None,
         };
 
@@ -1119,6 +1288,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
+            output_config: None,
             metadata: Some(Metadata {
                 user_id: Some(
                     "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd_account__session_a0662283-7fd3-4399-a7eb-52b9a717ae88".to_string(),
@@ -1150,6 +1320,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
+            output_config: None,
             metadata: None,
         };
 
@@ -1178,7 +1349,7 @@ mod tests {
 
         let tool_results = vec![ToolResult::success("orphan-123", "some result")];
 
-        let filtered = validate_tool_pairing(&history, &tool_results);
+        let (filtered, _) = validate_tool_pairing(&history, &tool_results);
 
         // 孤立的 tool_result 应该被过滤掉
         assert!(filtered.is_empty(), "孤立的 tool_result 应该被过滤");
@@ -1208,11 +1379,12 @@ mod tests {
         // 没有 tool_result
         let tool_results: Vec<ToolResult> = vec![];
 
-        let filtered = validate_tool_pairing(&history, &tool_results);
+        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
 
         // 结果应该为空（因为没有 tool_result）
-        // 同时应该输出警告日志（孤立的 tool_use）
+        // 同时应该返回孤立的 tool_use_id
         assert!(filtered.is_empty());
+        assert!(orphaned.contains("tool-orphan"));
     }
 
     #[test]
@@ -1238,11 +1410,12 @@ mod tests {
 
         let tool_results = vec![ToolResult::success("tool-1", "file content")];
 
-        let filtered = validate_tool_pairing(&history, &tool_results);
+        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
 
-        // 配对成功，应该保留
+        // 配对成功，应该保留，无孤立
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].tool_use_id, "tool-1");
+        assert!(orphaned.is_empty());
     }
 
     #[test]
@@ -1269,12 +1442,13 @@ mod tests {
             ToolResult::success("tool-3", "orphan result"), // 孤立
         ];
 
-        let filtered = validate_tool_pairing(&history, &tool_results);
+        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
 
         // 只有 tool-1 应该保留
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].tool_use_id, "tool-1");
         // tool-2 是孤立的 tool_use（无 result），tool-3 是孤立的 tool_result
+        assert!(orphaned.contains("tool-2"));
     }
 
     #[test]
@@ -1316,11 +1490,12 @@ mod tests {
         // 当前消息没有 tool_results（用户只是继续对话）
         let tool_results: Vec<ToolResult> = vec![];
 
-        let filtered = validate_tool_pairing(&history, &tool_results);
+        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
 
-        // 结果应该为空，且不应该有孤立 tool_use 的警告
+        // 结果应该为空，且不应该有孤立 tool_use
         // 因为 tool-1 已经在历史中配对了
         assert!(filtered.is_empty());
+        assert!(orphaned.is_empty());
     }
 
     #[test]
@@ -1357,7 +1532,7 @@ mod tests {
         // 当前消息又发送了相同的 tool_result（重复）
         let tool_results = vec![ToolResult::success("tool-1", "file content again")];
 
-        let filtered = validate_tool_pairing(&history, &tool_results);
+        let (filtered, _) = validate_tool_pairing(&history, &tool_results);
 
         // 重复的 tool_result 应该被过滤掉
         assert!(filtered.is_empty(), "重复的 tool_result 应该被过滤");
@@ -1426,5 +1601,78 @@ mod tests {
             .expect("应该有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_02XYZ");
+    }
+
+    #[test]
+    fn test_remove_orphaned_tool_uses() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        // 测试从历史中移除孤立的 tool_use
+        let mut assistant_msg = AssistantMessage::new("I'll use multiple tools.");
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({})),
+            ToolUseEntry::new("tool-2", "write").with_input(serde_json::json!({})),
+            ToolUseEntry::new("tool-3", "delete").with_input(serde_json::json!({})),
+        ]);
+
+        let mut history = vec![
+            Message::User(HistoryUserMessage::new("Do something", "claude-sonnet-4.5")),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: assistant_msg,
+            }),
+        ];
+
+        // 移除 tool-1 和 tool-3
+        let mut orphaned = std::collections::HashSet::new();
+        orphaned.insert("tool-1".to_string());
+        orphaned.insert("tool-3".to_string());
+
+        remove_orphaned_tool_uses(&mut history, &orphaned);
+
+        // 验证只剩下 tool-2
+        if let Message::Assistant(ref assistant_msg) = history[1] {
+            let tool_uses = assistant_msg
+                .assistant_response_message
+                .tool_uses
+                .as_ref()
+                .expect("应该还有 tool_uses");
+            assert_eq!(tool_uses.len(), 1);
+            assert_eq!(tool_uses[0].tool_use_id, "tool-2");
+        } else {
+            panic!("应该是 Assistant 消息");
+        }
+    }
+
+    #[test]
+    fn test_remove_orphaned_tool_uses_all_removed() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        // 测试移除所有 tool_use 后，tool_uses 变为 None
+        let mut assistant_msg = AssistantMessage::new("I'll use a tool.");
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({})),
+        ]);
+
+        let mut history = vec![
+            Message::User(HistoryUserMessage::new("Do something", "claude-sonnet-4.5")),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: assistant_msg,
+            }),
+        ];
+
+        let mut orphaned = std::collections::HashSet::new();
+        orphaned.insert("tool-1".to_string());
+
+        remove_orphaned_tool_uses(&mut history, &orphaned);
+
+        // 验证 tool_uses 变为 None
+        if let Message::Assistant(ref assistant_msg) = history[1] {
+            assert!(
+                assistant_msg.assistant_response_message.tool_uses.is_none(),
+                "移除所有 tool_use 后应为 None"
+            );
+        } else {
+            panic!("应该是 Assistant 消息");
+        }
     }
 }

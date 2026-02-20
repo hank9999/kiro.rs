@@ -82,12 +82,26 @@ pub struct CredentialStatusItem {
     pub auth_method: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
+    /// refreshToken 的 SHA-256 哈希（用于前端重复检测）
+    pub refresh_token_hash: Option<String>,
+    /// 用户邮箱（用于前端显示）
+    pub email: Option<String>,
     /// 账户邮箱（尽力从 token 中解析，仅用于展示）
     pub account_email: Option<String>,
     /// 用户 ID（从 API 获取，持久化保存）
     pub user_id: Option<String>,
     /// 该凭据启用的模型列表（None 表示默认全开）
     pub enabled_models: Option<Vec<String>>,
+
+    /// API 调用成功次数
+    pub success_count: u64,
+    /// 最后一次 API 调用时间（RFC3339 格式）
+    pub last_used_at: Option<String>,
+    /// 是否配置了凭据级代理
+    pub has_proxy: bool,
+    /// 代理 URL（用于前端展示）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
 
     // ===== 统计（可持久化） =====
 
@@ -165,6 +179,12 @@ pub struct AddCredentialRequest {
     /// 未配置时回退到 config.json 的全局 region
     pub region: Option<String>,
 
+    /// 凭据级 Auth Region（用于 Token 刷新）
+    pub auth_region: Option<String>,
+
+    /// 凭据级 API Region（用于 API 请求）
+    pub api_region: Option<String>,
+
     /// 凭据级 Machine ID（可选，64 位字符串）
     /// 未配置时回退到 config.json 的 machineId
     pub machine_id: Option<String>,
@@ -172,6 +192,18 @@ pub struct AddCredentialRequest {
     /// 该凭据启用的模型列表（可选；不填/为 null 表示默认全开）
     #[serde(default)]
     pub enabled_models: Option<Vec<String>>,
+
+    /// 用户邮箱（可选，用于前端显示）
+    pub email: Option<String>,
+
+    /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
+    pub proxy_url: Option<String>,
+
+    /// 凭据级代理认证用户名（可选）
+    pub proxy_username: Option<String>,
+
+    /// 凭据级代理认证密码（可选）
+    pub proxy_password: Option<String>,
 }
 
 fn default_auth_method() -> String {
@@ -186,12 +218,15 @@ pub struct AddCredentialResponse {
     pub message: String,
     /// 新添加的凭据 ID
     pub credential_id: u64,
+    /// 用户邮箱（如果获取成功）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
 }
 
 // ============ 余额查询 ============
 
 /// 余额查询响应
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BalanceResponse {
     /// 凭据 ID
@@ -216,6 +251,24 @@ pub struct BalanceResponse {
 pub struct CredentialAccountInfoResponse {
     pub id: u64,
     pub account: crate::kiro::web_portal::AccountAggregateInfo,
+}
+
+// ============ 负载均衡配置 ============
+
+/// 负载均衡模式响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadBalancingModeResponse {
+    /// 当前模式（"priority" 或 "balanced"）
+    pub mode: String,
+}
+
+/// 设置负载均衡模式请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetLoadBalancingModeRequest {
+    /// 模式（"priority" 或 "balanced"）
+    pub mode: String,
 }
 
 // ============ 通用响应 ============

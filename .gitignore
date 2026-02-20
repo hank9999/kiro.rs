@@ -9,9 +9,9 @@
 /admin-ui/node_modules/
 /admin-ui/dist/
 /admin-ui/pnpm-lock.yaml
+/admin-ui/package-lock.json
 /admin-ui/tsconfig.tsbuildinfo
-public/
 /credentials.*
-.ai_workflow/
-findings.md
-progress.md
+/kiro_balance_cache.json
+/kiro_stats.json
+/.ai_workflow/

@@ -9,6 +9,6 @@ services:
     ports:
       - "127.0.0.1:8990:8990"
     volumes:
-      - ./config.json:/app/config/config.json:ro
+      - ./config.json:/app/config/config.json
       - ./credentials.json:/app/config/credentials.json
     restart: unless-stopped

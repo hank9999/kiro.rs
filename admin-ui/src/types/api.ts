@@ -16,9 +16,17 @@ export interface CredentialStatusItem {
   expiresAt: string | null
   authMethod: string | null
   hasProfileArn: boolean
-  accountEmail: string | null
-  userId: string | null
+
+  refreshTokenHash?: string | null
+  email?: string | null
+  accountEmail?: string | null
+  userId?: string | null
   enabledModels?: string[] | null
+
+  successCount: number
+  lastUsedAt: string | null
+  hasProxy: boolean
+  proxyUrl?: string | null
 
   // ===== 统计（可持久化） =====
   callsTotal: number
@@ -110,6 +118,14 @@ export interface AddCredentialRequest {
   priority?: number
   region?: string
   enabledModels?: string[]
+  provider?: string
+  authRegion?: string
+  apiRegion?: string
+  machineId?: string
+  email?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
 }
 
 // 添加凭据响应
@@ -117,6 +133,7 @@ export interface AddCredentialResponse {
   success: boolean
   message: string
   credentialId: number
+  email?: string
 }
 
 // ===== 账号信息（套餐/用量/邮箱等） =====
