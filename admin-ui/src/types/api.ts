@@ -71,6 +71,7 @@ export interface AddCredentialRequest {
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
+  email?: string
 }
 
 // 添加凭据响应

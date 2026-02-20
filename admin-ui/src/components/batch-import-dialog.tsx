@@ -27,6 +27,7 @@ interface CredentialInput {
   apiRegion?: string
   priority?: number
   machineId?: string
+  email?: string
 }
 
 interface VerificationResult {
@@ -90,7 +91,31 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     try {
       // 1. 解析 JSON
       const parsed = JSON.parse(jsonInput)
-      let credentials: CredentialInput[] = Array.isArray(parsed) ? parsed : [parsed]
+      let credentials: CredentialInput[]
+
+      // 检测外部格式（含 accounts 数组）
+      if (parsed && Array.isArray(parsed.accounts)) {
+        credentials = parsed.accounts
+          .filter((account: any) => !account.status || account.status === 'active')
+          .map((account: any) => {
+            const creds = account.credentials || {}
+            const authMethodRaw = creds.authMethod?.toLowerCase()
+            const hasIdcFields = creds.clientId && creds.clientSecret
+            return {
+              refreshToken: creds.refreshToken || '',
+              clientId: hasIdcFields || authMethodRaw === 'idc' ? creds.clientId : undefined,
+              clientSecret: hasIdcFields || authMethodRaw === 'idc' ? creds.clientSecret : undefined,
+              region: creds.region,
+              machineId: account.machineId,
+              email: account.email,
+            } as CredentialInput
+          })
+      } else {
+        credentials = Array.isArray(parsed) ? parsed : [parsed]
+      }
+
+      // 过滤无效条目
+      credentials = credentials.filter(c => c.refreshToken?.trim())
 
       if (credentials.length === 0) {
         toast.error('没有可导入的凭据')
@@ -101,9 +126,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       setProgress({ current: 0, total: credentials.length })
 
       // 2. 初始化结果
-      const initialResults: VerificationResult[] = credentials.map((_, i) => ({
+      const initialResults: VerificationResult[] = credentials.map((cred, i) => ({
         index: i + 1,
-        status: 'pending'
+        status: 'pending',
+        email: cred.email,
       }))
       setResults(initialResults)
 
@@ -124,7 +150,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       // 4. 导入并验活
       for (let i = 0; i < credentials.length; i++) {
         const cred = credentials[i]
-        const token = cred.refreshToken.trim()
+        const token = (cred.refreshToken || '').trim()
         const tokenHash = await sha256Hex(token)
 
         // 更新状态为检查中
@@ -182,6 +208,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             clientSecret,
             priority: cred.priority || 0,
             machineId: cred.machineId?.trim() || undefined,
+            email: cred.email?.trim() || undefined,
           })
 
           addedCredId = addedCred.credentialId
@@ -195,14 +222,14 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           // 验活成功
           successCount++
           existingTokenHashes.add(tokenHash)
-          setCurrentProcessing(addedCred.email ? `验活成功: ${addedCred.email}` : `验活成功: 凭据 ${i + 1}`)
+          setCurrentProcessing(addedCred.email ? `验活成功: ${addedCred.email}` : cred.email ? `验活成功: ${cred.email}` : `验活成功: 凭据 ${i + 1}`)
           setResults(prev => {
             const newResults = [...prev]
             newResults[i] = {
               ...newResults[i],
               status: 'verified',
               usage: `${balance.currentUsage}/${balance.usageLimit}`,
-              email: addedCred.email || undefined,
+              email: addedCred.email || cred.email || undefined,
               credentialId: addedCred.credentialId
             }
             return newResults
@@ -321,7 +348,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n例如: [{"refreshToken":"...","clientId":"...","clientSecret":"...","authRegion":"us-east-1","apiRegion":"us-west-2"}]\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象、数组或外部账号管理工具导出格式）\n例如: [{"refreshToken":"...","clientId":"...","clientSecret":"...","authRegion":"us-east-1"}]\n外部格式: {"accounts":[{"email":"...","credentials":{...}}]}'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
@@ -374,10 +401,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                       {getStatusIcon(result.status)}
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2">
-                          <span className="text-sm font-medium">
+                          <span className="text-sm font-medium truncate max-w-[200px]" title={result.email}>
                             {result.email || `凭据 #${result.index}`}
                           </span>
-                          <span className="text-xs text-muted-foreground">
+                          <span className="text-xs text-muted-foreground shrink-0">
                             {getStatusText(result)}
                           </span>
                         </div>
