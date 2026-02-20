@@ -475,14 +475,18 @@ async fn handle_non_stream_request(
 
                             // 如果是完整的工具调用，添加到列表
                             if tool_use.stop {
-                                let input: serde_json::Value = serde_json::from_str(buffer)
-                                    .unwrap_or_else(|e| {
-                                        tracing::warn!(
-                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}, 原始内容: {}",
-                                            e, tool_use.tool_use_id, buffer
-                                        );
-                                        serde_json::json!({})
-                                    });
+                                let input: serde_json::Value = if buffer.is_empty() {
+                                    serde_json::json!({})
+                                } else {
+                                    serde_json::from_str(buffer)
+                                        .unwrap_or_else(|e| {
+                                            tracing::warn!(
+                                                "工具输入 JSON 解析失败: {}, tool_use_id: {}",
+                                                e, tool_use.tool_use_id
+                                            );
+                                            serde_json::json!({})
+                                        })
+                                };
 
                                 tool_uses.push(json!({
                                     "type": "tool_use",
