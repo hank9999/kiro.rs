@@ -27,21 +27,31 @@ use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
 
-/// 判断是否为输入过长错误（确定性请求问题，不应返回 5xx 诱发重试）
-fn is_input_too_long_error(err: &Error) -> bool {
-    let s = err.to_string();
-    s.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") || s.contains("Input is too long")
-}
-
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
-    if is_input_too_long_error(&err) {
+    let err_str = err.to_string();
+
+    // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
+    if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+        tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "Context window is full. Reduce conversation history, system prompt, or tools.",
+            )),
+        )
+            .into_response();
+    }
+
+    // 单次输入太长（请求体本身超出上游限制）
+    if err_str.contains("Input is too long") {
         tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
                 "invalid_request_error",
-                "Input is too long. Reduce conversation history, system prompt, or tools.",
+                "Input is too long. Reduce the size of your messages.",
             )),
         )
             .into_response();
