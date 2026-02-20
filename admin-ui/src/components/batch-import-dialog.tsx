@@ -401,7 +401,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                       {getStatusIcon(result.status)}
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2">
-                          <span className="text-sm font-medium truncate max-w-[200px]" title={result.email}>
+                          <span className="text-sm font-medium truncate max-w-[10em]" title={result.email}>
                             {result.email || `凭据 #${result.index}`}
                           </span>
                           <span className="text-xs text-muted-foreground shrink-0">

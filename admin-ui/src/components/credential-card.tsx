@@ -138,8 +138,10 @@ export function CredentialCard({
                 checked={selected}
                 onCheckedChange={onToggleSelect}
               />
-              <CardTitle className="text-lg flex items-center gap-2">
-                {credential.email || `凭据 #${credential.id}`}
+              <CardTitle className="text-lg flex items-center gap-2 min-w-0">
+                <span className="truncate max-w-[10em]" title={credential.email}>
+                  {credential.email || `凭据 #${credential.id}`}
+                </span>
                 {credential.isCurrent && (
                   <Badge variant="success">当前</Badge>
                 )}
