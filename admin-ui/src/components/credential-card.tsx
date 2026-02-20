@@ -26,7 +26,7 @@ import {
   useCredentialBalance,
 } from '@/hooks/use-credentials'
 import { StatsDialog } from '@/components/stats-dialog'
-import { formatExpiry, formatTokensPair } from '@/lib/format'
+import { formatTokensPair } from '@/lib/format'
 import { ALL_MODEL_IDS, MODEL_OPTIONS, normalizeEnabledModels, type SupportedModelId } from '@/lib/models'
 
 interface CredentialCardProps {
@@ -36,22 +36,6 @@ interface CredentialCardProps {
   onToggleSelect: () => void
   balance: BalanceResponse | null
   loadingBalance: boolean
-}
-
-function formatLastUsed(lastUsedAt: string | null): string {
-  if (!lastUsedAt) return '从未使用'
-  const date = new Date(lastUsedAt)
-  const now = new Date()
-  const diff = now.getTime() - date.getTime()
-  if (diff < 0) return '刚刚'
-  const seconds = Math.floor(diff / 1000)
-  if (seconds < 60) return `${seconds} 秒前`
-  const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes} 分钟前`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours} 小时前`
-  const days = Math.floor(hours / 24)
-  return `${days} 天前`
 }
 
 export function CredentialCard({

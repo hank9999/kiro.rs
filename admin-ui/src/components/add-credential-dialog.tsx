@@ -80,7 +80,6 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         clientSecret: clientSecret.trim() || undefined,
         priority: parseInt(priority) || 0,
         enabledModels: enabledModelsPayload,
-        enabledModels: enabledModelsPayload,
         machineId: machineId.trim() || undefined,
         proxyUrl: proxyUrl.trim() || undefined,
         proxyUsername: proxyUsername.trim() || undefined,
