@@ -521,6 +521,13 @@ fn has_thinking_tags(content: &str) -> bool {
 }
 
 /// 构建历史消息
+///
+/// # Arguments
+/// * `req` - 原始请求，用于读取 `system`、`thinking` 等配置字段
+/// * `messages` - 经过 prefill 预处理的消息切片，末尾必定是 user 消息。
+///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
+///   调用方应始终使用此参数而非 `req.messages`。
+/// * `model_id` - 已映射的 Kiro 模型 ID
 fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
@@ -568,19 +575,8 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 
     // 2. 处理常规消息历史
     // 最后一条消息作为 currentMessage，不加入历史
+    // 经过 prefill 预处理后，messages 末尾必定是 user，故直接截掉最后一条即可
     let history_end_index = messages.len().saturating_sub(1);
-
-    // 如果最后一条是 assistant，则包含在历史中
-    let last_is_assistant = messages
-        .last()
-        .map(|m| m.role == "assistant")
-        .unwrap_or(false);
-
-    let history_end_index = if last_is_assistant {
-        messages.len()
-    } else {
-        history_end_index
-    };
 
     // 收集并配对消息
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
