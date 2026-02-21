@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -10,6 +10,7 @@ import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
+import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance } from '@/api/credentials'
@@ -25,6 +26,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
+  const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
@@ -624,6 +626,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   清除已禁用
                 </Button>
               )}
+              <Button onClick={() => setKamImportDialogOpen(true)} size="sm" variant="outline">
+                <FileUp className="h-4 w-4 mr-2" />
+                KAM 导入
+              </Button>
               <Button onClick={() => setBatchImportDialogOpen(true)} size="sm" variant="outline">
                 <Upload className="h-4 w-4 mr-2" />
                 批量导入
@@ -702,6 +708,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <BatchImportDialog
         open={batchImportDialogOpen}
         onOpenChange={setBatchImportDialogOpen}
+      />
+
+      {/* KAM 账号导入对话框 */}
+      <KamImportDialog
+        open={kamImportDialogOpen}
+        onOpenChange={setKamImportDialogOpen}
       />
 
       {/* 批量验活对话框 */}
