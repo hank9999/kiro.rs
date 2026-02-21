@@ -176,6 +176,94 @@ pub struct SetLoadBalancingModeRequest {
     pub mode: String,
 }
 
+// ============ Webhook 配置 ============
+
+/// Webhook URL 响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookUrlResponse {
+    /// 当前 Webhook URL（null 表示未配置）
+    pub url: Option<String>,
+    /// 当前 Webhook JSON 模板（null 表示使用默认格式）
+    pub body: Option<String>,
+}
+
+/// 设置 Webhook URL 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetWebhookUrlRequest {
+    /// Webhook URL（null 或空字符串表示禁用）
+    pub url: Option<String>,
+    /// Webhook JSON 模板（null 或空字符串表示使用默认格式）
+    pub body: Option<String>,
+}
+
+/// 测试 Webhook 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestWebhookRequest {
+    /// Webhook URL
+    pub url: String,
+    /// Webhook JSON 模板（null 或空字符串表示使用默认格式）
+    pub body: Option<String>,
+}
+
+// ============ 通用响应 ============
+
+/// 邮件配置响应（密码脱敏）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmailConfigResponse {
+    pub enabled: bool,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_username: String,
+    /// 密码是否已配置（不返回明文）
+    pub smtp_password_set: bool,
+    pub smtp_tls: bool,
+    pub from_address: String,
+    pub to_addresses: Vec<String>,
+}
+
+/// 保存邮件配置请求（密码空字符串 = 保留原密码）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveEmailConfigRequest {
+    pub enabled: bool,
+    pub smtp_host: String,
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+    pub smtp_username: String,
+    /// 空字符串表示保留原密码
+    #[serde(default)]
+    pub smtp_password: String,
+    #[serde(default = "default_smtp_tls")]
+    pub smtp_tls: bool,
+    pub from_address: String,
+    pub to_addresses: Vec<String>,
+}
+
+fn default_smtp_port() -> u16 {
+    587
+}
+
+fn default_smtp_tls() -> bool {
+    true
+}
+
+/// 测试邮件请求（必须提供完整密码）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestEmailRequest {
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_username: String,
+    pub smtp_password: String,
+    pub smtp_tls: bool,
+    pub from_address: String,
+    pub to_addresses: Vec<String>,
+}
+
 // ============ 通用响应 ============
 
 /// 操作成功响应

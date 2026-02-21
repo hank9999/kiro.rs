@@ -80,3 +80,44 @@ export interface AddCredentialResponse {
   credentialId: number
   email?: string
 }
+
+// 邮件配置响应（密码脱敏）
+export interface EmailConfigResponse {
+  enabled: boolean
+  smtpHost: string
+  smtpPort: number
+  smtpUsername: string
+  smtpPasswordSet: boolean
+  smtpTls: boolean
+  fromAddress: string
+  toAddresses: string[]
+}
+
+// 保存邮件配置请求
+export interface SaveEmailConfigRequest {
+  enabled: boolean
+  smtpHost: string
+  smtpPort: number
+  smtpUsername: string
+  smtpPassword: string
+  smtpTls: boolean
+  fromAddress: string
+  toAddresses: string[]
+}
+
+// 测试邮件请求
+export interface TestEmailRequest {
+  smtpHost: string
+  smtpPort: number
+  smtpUsername: string
+  smtpPassword: string
+  smtpTls: boolean
+  fromAddress: string
+  toAddresses: string[]
+}
+
+// 测试 Webhook 请求
+export interface TestWebhookRequest {
+  url: string
+  body?: string | null
+}
