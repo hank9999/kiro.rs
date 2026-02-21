@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { toast } from 'sonner'
 import { CheckCircle2, XCircle, AlertCircle, Loader2 } from 'lucide-react'
 import {
@@ -314,15 +314,14 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   }
 
   // 预览解析结果
-  let previewAccounts: KamAccount[] = []
-  let parseError = ''
-  if (jsonInput.trim()) {
+  const { previewAccounts, parseError } = useMemo(() => {
+    if (!jsonInput.trim()) return { previewAccounts: [] as KamAccount[], parseError: '' }
     try {
-      previewAccounts = parseKamJson(jsonInput)
+      return { previewAccounts: parseKamJson(jsonInput), parseError: '' }
     } catch (e) {
-      parseError = extractErrorMessage(e)
+      return { previewAccounts: [] as KamAccount[], parseError: extractErrorMessage(e) }
     }
-  }
+  }, [jsonInput])
 
   const errorAccountCount = previewAccounts.filter(a => a.status === 'error').length
 
