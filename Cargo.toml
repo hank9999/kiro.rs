@@ -7,6 +7,9 @@ edition = "2024"
 lto = true
 strip = true
 
+[features]
+sensitive-logs = []  # 启用后输出完整请求/响应体日志（仅用于调试）
+
 [dependencies]
 axum = "0.8"
 tokio = { version = "1.0", features = ["full"] }
