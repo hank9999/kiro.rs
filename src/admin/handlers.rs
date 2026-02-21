@@ -9,8 +9,8 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, SaveEmailConfigRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse, TestEmailRequest,
     },
 };
 
@@ -121,6 +121,37 @@ pub async fn set_load_balancing_mode(
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
         Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/email
+/// 获取邮件配置
+pub async fn get_email_config(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_email_config();
+    Json(response)
+}
+
+/// PUT /api/admin/config/email
+/// 保存邮件配置
+pub async fn save_email_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SaveEmailConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.save_email_config(payload) {
+        Ok(_) => Json(SuccessResponse::new("邮件配置已保存")).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/config/email/test
+/// 发送测试邮件
+pub async fn test_email(
+    State(state): State<AdminState>,
+    Json(payload): Json<TestEmailRequest>,
+) -> impl IntoResponse {
+    match state.service.test_email(payload).await {
+        Ok(_) => Json(SuccessResponse::new("测试邮件发送成功")).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

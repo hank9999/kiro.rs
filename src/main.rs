@@ -78,7 +78,7 @@ async fn main() {
     }
 
     // 创建 MultiTokenManager 和 KiroProvider
-    let token_manager = MultiTokenManager::new(
+    let mut token_manager = MultiTokenManager::new(
         config.clone(),
         credentials_list,
         proxy_config.clone(),
@@ -89,6 +89,16 @@ async fn main() {
         tracing::error!("创建 Token 管理器失败: {}", e);
         std::process::exit(1);
     });
+
+    // 初始化邮件通知器（如果配置了且已启用）
+    if let Some(email_config) = &config.email
+        && email_config.enabled
+    {
+        let notifier = admin::email::EmailNotifier::new(email_config.clone());
+        token_manager.set_email_notifier(notifier);
+        tracing::info!("邮件通知已启用");
+    }
+
     let token_manager = Arc::new(token_manager);
     let kiro_provider = KiroProvider::with_proxy(token_manager.clone(), proxy_config.clone());
 
@@ -121,7 +131,7 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
-            let admin_service = admin::AdminService::new(token_manager.clone());
+            let admin_service = admin::AdminService::new(token_manager.clone(), config.clone());
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 

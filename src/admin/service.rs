@@ -10,11 +10,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::model::config::{Config, EmailConfig};
 
+use super::email::EmailNotifier;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    CredentialsStatusResponse, EmailConfigResponse, LoadBalancingModeResponse,
+    SaveEmailConfigRequest, SetLoadBalancingModeRequest, TestEmailRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -36,10 +39,11 @@ pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     cache_path: Option<PathBuf>,
+    config: Mutex<Config>,
 }
 
 impl AdminService {
-    pub fn new(token_manager: Arc<MultiTokenManager>) -> Self {
+    pub fn new(token_manager: Arc<MultiTokenManager>, config: Config) -> Self {
         let cache_path = token_manager
             .cache_dir()
             .map(|d| d.join("kiro_balance_cache.json"));
@@ -50,6 +54,7 @@ impl AdminService {
             token_manager,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
+            config: Mutex::new(config),
         }
     }
 
@@ -272,6 +277,97 @@ impl AdminService {
         Ok(LoadBalancingModeResponse { mode: req.mode })
     }
 
+    // ============ 邮件配置 ============
+
+    /// 获取邮件配置（密码脱敏）
+    pub fn get_email_config(&self) -> EmailConfigResponse {
+        let config = self.config.lock();
+        match &config.email {
+            Some(email) => EmailConfigResponse {
+                enabled: email.enabled,
+                smtp_host: email.smtp_host.clone(),
+                smtp_port: email.smtp_port,
+                smtp_username: email.smtp_username.clone(),
+                smtp_password_set: !email.smtp_password.is_empty(),
+                smtp_tls: email.smtp_tls,
+                from_address: email.from_address.clone(),
+                to_addresses: email.to_addresses.clone(),
+            },
+            None => EmailConfigResponse {
+                enabled: false,
+                smtp_host: String::new(),
+                smtp_port: 587,
+                smtp_username: String::new(),
+                smtp_password_set: false,
+                smtp_tls: true,
+                from_address: String::new(),
+                to_addresses: Vec::new(),
+            },
+        }
+    }
+
+    /// 保存邮件配置并热更新通知器
+    pub fn save_email_config(&self, req: SaveEmailConfigRequest) -> Result<(), AdminServiceError> {
+        let mut config = self.config.lock();
+
+        // 如果密码为空字符串，保留原密码
+        let password = if req.smtp_password.is_empty() {
+            config
+                .email
+                .as_ref()
+                .map(|e| e.smtp_password.clone())
+                .unwrap_or_default()
+        } else {
+            req.smtp_password
+        };
+
+        let email_config = EmailConfig {
+            enabled: req.enabled,
+            smtp_host: req.smtp_host,
+            smtp_port: req.smtp_port,
+            smtp_username: req.smtp_username,
+            smtp_password: password,
+            smtp_tls: req.smtp_tls,
+            from_address: req.from_address,
+            to_addresses: req.to_addresses,
+        };
+
+        config.email = Some(email_config.clone());
+        config
+            .save()
+            .map_err(|e| AdminServiceError::InternalError(format!("保存配置失败: {}", e)))?;
+
+        // 热更新通知器
+        if email_config.enabled {
+            let notifier = EmailNotifier::new(email_config);
+            self.token_manager.update_email_notifier(notifier);
+            tracing::info!("邮件通知已启用并更新");
+        } else {
+            self.token_manager.remove_email_notifier();
+            tracing::info!("邮件通知已禁用");
+        }
+
+        Ok(())
+    }
+
+    /// 发送测试邮件
+    pub async fn test_email(&self, req: TestEmailRequest) -> Result<(), AdminServiceError> {
+        let email_config = EmailConfig {
+            enabled: true,
+            smtp_host: req.smtp_host,
+            smtp_port: req.smtp_port,
+            smtp_username: req.smtp_username,
+            smtp_password: req.smtp_password,
+            smtp_tls: req.smtp_tls,
+            from_address: req.from_address,
+            to_addresses: req.to_addresses,
+        };
+
+        EmailNotifier::send_test(&email_config)
+            .await
+            .map_err(|e| AdminServiceError::InternalError(format!("发送测试邮件失败: {}", e)))
+    }
+
     // ============ 余额缓存持久化 ============
 
     fn load_balance_cache_from(cache_path: &Option<PathBuf>) -> HashMap<u64, CachedBalance> {
@@ -405,7 +501,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
