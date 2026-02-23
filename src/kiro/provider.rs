@@ -142,6 +142,31 @@ impl KiroProvider {
             .map(|s| s.to_string())
     }
 
+    /// 从请求体中提取 user_id
+    ///
+    /// 尝试从 conversationState.currentMessage.userInputMessage.metadata.user_id 提取
+    ///
+    /// # 参数
+    /// - `request_body`: JSON 格式的 Kiro 请求体字符串
+    ///
+    /// # 返回
+    /// - Some(user_id): 提取到的完整 user_id 字符串
+    /// - None: 请求体中没有 user_id 字段
+    fn extract_user_id_from_request(request_body: &str) -> Option<String> {
+        use serde_json::Value;
+
+        let json: Value = serde_json::from_str(request_body).ok()?;
+
+        // 路径：conversationState.currentMessage.userInputMessage.metadata.user_id
+        json.get("conversationState")?
+            .get("currentMessage")?
+            .get("userInputMessage")?
+            .get("metadata")?
+            .get("user_id")?
+            .as_str()
+            .map(|s| s.to_string())
+    }
+
     /// 构建请求头
     ///
     /// # Arguments
@@ -297,8 +322,8 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文
-            // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            // MCP 调用（WebSearch 等工具）不涉及模型选择和用户会话，无需按模型或用户过滤凭据
+            let ctx = match self.token_manager.acquire_context(None, None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -428,9 +453,12 @@ impl KiroProvider {
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
 
+        // 尝试从请求体中提取 user_id（用于 affinity 模式）
+        let user_id = Self::extract_user_id_from_request(request_body);
+
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let ctx = match self.token_manager.acquire_context(model.as_deref(), user_id.as_deref()).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);

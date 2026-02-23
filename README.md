@@ -33,7 +33,7 @@
 - **流式响应**: 支持 SSE (Server-Sent Events) 流式输出
 - **Token 自动刷新**: 自动管理和刷新 OAuth Token
 - **多凭据支持**: 支持配置多个凭据，按优先级自动故障转移
-- **负载均衡**: 支持 `priority`（按优先级）和 `balanced`（均衡分配）两种模式
+- **负载均衡**: 支持 `priority`（按优先级）、`balanced`（均衡分配）和 `affinity`（用户亲和）三种模式
 - **智能重试**: 单凭据最多重试 3 次，单请求最多重试 9 次
 - **凭据回写**: 多凭据格式下自动回写刷新后的 Token
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
@@ -187,7 +187,7 @@ docker-compose up
 | `proxyUsername` | string | - | 代理用户名 |
 | `proxyPassword` | string | - | 代理密码 |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
-| `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
+| `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）、`balanced`（均衡分配）或 `affinity`（用户亲和） |
 
 完整配置示例：
 
@@ -296,6 +296,64 @@ docker-compose up
 - 单凭据最多重试 3 次，单请求最多重试 9 次
 - 自动故障转移到下一个可用凭据
 - 多凭据格式下 Token 刷新后自动回写到源文件
+
+#### 负载均衡模式
+
+kiro-rs 支持三种负载均衡模式，可通过 `config.json` 的 `loadBalancingMode` 配置：
+
+**1. Priority 模式（默认）**
+```json
+{
+  "loadBalancingMode": "priority"
+}
+```
+- 始终使用优先级最高（priority 数字最小）的凭据
+- 仅在失败或额度用尽时切换到下一优先级凭据
+- 适合主备凭据架构
+
+**2. Balanced 模式**
+```json
+{
+  "loadBalancingMode": "balanced"
+}
+```
+- 均匀分配请求到所有可用凭据
+- 使用 Least-Used 策略：选择成功次数最少的凭据
+- 适合多个等价凭据的负载均衡场景
+
+**3. Affinity 模式（用户亲和）**
+```json
+{
+  "loadBalancingMode": "affinity"
+}
+```
+- 根据 `metadata.user_id` 将用户绑定到特定凭据
+- 首次请求：随机分配凭据
+- 后续请求：优先使用亲和凭据（保持会话延续性）
+- 亲和凭据不可用时：自动重新分配
+- 亲和关系仅存储在内存中，重启后清空
+- 适合多用户场景，确保同一用户始终使用相同凭据
+
+**Affinity 模式使用示例**：
+
+客户端请求时在 `metadata` 中传递 `user_id`：
+```json
+{
+  "model": "claude-sonnet-4-20250514",
+  "max_tokens": 1024,
+  "metadata": {
+    "user_id": "user_alice_session_123"
+  },
+  "messages": [...]
+}
+```
+
+特性：
+- 同一 `user_id` 的所有请求会使用相同凭据（除非该凭据不可用）
+- 不同 `user_id` 可能分配到不同凭据
+- 没有 `user_id` 的请求仍可正常工作（随机选择，不记录亲和）
+- 删除凭据时自动清理关联的亲和关系
+
 
 ### Region 配置
 

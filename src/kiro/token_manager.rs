@@ -498,6 +498,8 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 用户亲和关系映射：user_id -> credential_id（仅内存存储，重启后清空）
+    user_affinity: Mutex<HashMap<String, u64>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -608,6 +610,7 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            user_affinity: Mutex::new(HashMap::new()),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -655,10 +658,16 @@ impl MultiTokenManager {
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
     /// - balanced 模式：轮询选择可用凭据
+    /// - affinity 模式：基于 user_id 进行凭据亲和
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    /// - `user_id`: 可选的用户标识，用于 affinity 模式的凭据绑定
+    fn select_next_credential(
+        &self,
+        model: Option<&str>,
+        user_id: Option<&str>,
+    ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
 
         // 检查是否是 opus 模型
@@ -689,6 +698,51 @@ impl MultiTokenManager {
         let mode = mode.as_str();
 
         match mode {
+            "affinity" => {
+                // ========== Affinity 模式核心逻辑 ==========
+
+                // 1. 如果有 user_id，尝试使用亲和凭据
+                if let Some(uid) = user_id {
+                    let affinity_map = self.user_affinity.lock();
+                    if let Some(&cred_id) = affinity_map.get(uid) {
+                        drop(affinity_map); // 提前释放锁
+
+                        // 2. 检查亲和凭据是否在可用列表中
+                        if let Some(entry) = available.iter().find(|e| e.id == cred_id) {
+                            // 亲和凭据可用，直接返回
+                            tracing::debug!("使用亲和凭据: user_id={}, credential_id={}", uid, cred_id);
+                            return Some((entry.id, entry.credentials.clone()));
+                        }
+
+                        // 亲和凭据不可用（已禁用或不支持当前模型）
+                        tracing::warn!(
+                            "亲和凭据不可用，重新分配: user_id={}, credential_id={}",
+                            uid, cred_id
+                        );
+                    }
+                }
+
+                // 3. 首次分配或亲和凭据不可用：直接随机选择
+                if available.is_empty() {
+                    return None;
+                }
+
+                // 随机选择一个可用凭据
+                let selected = available[fastrand::usize(0..available.len())];
+
+                // 4. 如果有 user_id，记录新的亲和关系
+                if let Some(uid) = user_id {
+                    let mut affinity_map = self.user_affinity.lock();
+                    affinity_map.insert(uid.to_string(), selected.id);
+
+                    tracing::info!(
+                        "建立新亲和关系: user_id={}, credential_id={}",
+                        uid, selected.id
+                    );
+                }
+
+                Some((selected.id, selected.credentials.clone()))
+            }
             "balanced" => {
                 // Least-Used 策略：选择成功次数最少的凭据
                 // 平局时按优先级排序（数字越小优先级越高）
@@ -716,7 +770,12 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+    /// - `user_id`: 可选的用户标识，用于 affinity 模式的凭据绑定
+    pub async fn acquire_context(
+        &self,
+        model: Option<&str>,
+        user_id: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let mut tried_count = 0;
 
@@ -749,7 +808,7 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model);
+                    let mut best = self.select_next_credential(model, user_id);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -768,7 +827,7 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model);
+                            best = self.select_next_credential(model, user_id);
                         }
                     }
 
@@ -1231,7 +1290,7 @@ impl MultiTokenManager {
 
     /// 获取使用额度信息
     pub async fn get_usage_limits(&self) -> anyhow::Result<UsageLimitsResponse> {
-        let ctx = self.acquire_context(None).await?;
+        let ctx = self.acquire_context(None, None).await?;
         let effective_proxy = ctx.credentials.effective_proxy(self.proxy.as_ref());
         get_usage_limits(
             &ctx.credentials,
@@ -1573,6 +1632,12 @@ impl MultiTokenManager {
             was_current
         };
 
+        // 清理关联的亲和关系
+        {
+            let mut affinity_map = self.user_affinity.lock();
+            affinity_map.retain(|_, &mut cred_id| cred_id != id);
+        }
+
         // 如果删除的是当前凭据，切换到优先级最高的可用凭据
         if was_current {
             self.select_highest_priority();
@@ -1626,8 +1691,8 @@ impl MultiTokenManager {
 
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
-        // 验证模式值
-        if mode != "priority" && mode != "balanced" {
+        // 验证模式值（新增 affinity）
+        if mode != "priority" && mode != "balanced" && mode != "affinity" {
             anyhow::bail!("无效的负载均衡模式: {}", mode);
         }
 
@@ -1923,7 +1988,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -1960,7 +2025,7 @@ mod tests {
         manager.report_quota_exhausted(2);
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager.acquire_context(None, None).await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -2120,5 +2185,185 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    // ============ Affinity 模式测试 ============
+
+    #[tokio::test]
+    async fn test_affinity_mode_first_request_random_selection() {
+        // 测试 affinity 模式首次请求时的随机选择
+        let mut config = Config::default();
+        config.load_balancing_mode = "affinity".to_string();
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        // 首次请求应该从可用凭据中随机选择一个
+        let ctx = manager
+            .acquire_context(None, Some("user_test_123"))
+            .await
+            .unwrap();
+        assert!(
+            ctx.token == "t1" || ctx.token == "t2",
+            "应该选择一个可用凭据"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_affinity_mode_preserves_user_credential_binding() {
+        // 测试 affinity 模式保持用户与凭据的绑定关系
+        let mut config = Config::default();
+        config.load_balancing_mode = "affinity".to_string();
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        // 第一次请求
+        let ctx1 = manager
+            .acquire_context(None, Some("user_alice"))
+            .await
+            .unwrap();
+        let first_token = ctx1.token.clone();
+
+        // 第二次请求（同一用户）应该使用相同凭据
+        let ctx2 = manager
+            .acquire_context(None, Some("user_alice"))
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx2.token, first_token,
+            "同一用户的后续请求应使用相同凭据"
+        );
+
+        // 第三次请求（同一用户）仍应使用相同凭据
+        let ctx3 = manager
+            .acquire_context(None, Some("user_alice"))
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx3.token, first_token,
+            "同一用户的后续请求应使用相同凭据"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_affinity_mode_fallback_when_credential_disabled() {
+        // 测试亲和凭据被禁用时的退化行为
+        let mut config = Config::default();
+        config.load_balancing_mode = "affinity".to_string();
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        // 第一次请求，建立亲和关系
+        let ctx1 = manager
+            .acquire_context(None, Some("user_test"))
+            .await
+            .unwrap();
+        let first_cred_id = ctx1.id;
+        manager.report_success(first_cred_id);
+
+        // 禁用亲和凭据
+        manager.set_disabled(first_cred_id, true).unwrap();
+
+        // 再次请求，应该重新分配到其他可用凭据
+        let ctx2 = manager
+            .acquire_context(None, Some("user_test"))
+            .await
+            .unwrap();
+        assert_ne!(
+            ctx2.id, first_cred_id,
+            "亲和凭据被禁用后应分配到其他凭据"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_affinity_mode_without_user_id() {
+        // 测试没有 user_id 时的行为（不记录亲和关系）
+        let mut config = Config::default();
+        config.load_balancing_mode = "affinity".to_string();
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![cred1], None, None, false).unwrap();
+
+        // 没有 user_id，应该能正常工作
+        let ctx = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(ctx.token, "t1");
+    }
+
+    #[test]
+    fn test_affinity_cleared_on_credential_deletion() {
+        // 测试删除凭据时清理亲和关系
+        let mut config = Config::default();
+        config.load_balancing_mode = "affinity".to_string();
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![cred1], None, None, false).unwrap();
+
+        // 手动添加亲和关系
+        {
+            let mut affinity = manager.user_affinity.lock();
+            affinity.insert("user_test".to_string(), 1);
+        }
+
+        // 禁用并删除凭据
+        manager.set_disabled(1, true).unwrap();
+        manager.delete_credential(1).unwrap();
+
+        // 验证亲和关系已清除
+        let affinity = manager.user_affinity.lock();
+        assert!(
+            !affinity.contains_key("user_test"),
+            "删除凭据后应清除相关亲和关系"
+        );
+    }
+
+    #[test]
+    fn test_set_load_balancing_mode_accepts_affinity() {
+        // 测试 affinity 模式配置验证
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 应该接受 "affinity" 模式
+        assert!(manager
+            .set_load_balancing_mode("affinity".to_string())
+            .is_ok());
+        assert_eq!(manager.get_load_balancing_mode(), "affinity");
+
+        // 应该拒绝无效模式
+        assert!(manager
+            .set_load_balancing_mode("invalid".to_string())
+            .is_err());
     }
 }
