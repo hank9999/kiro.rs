@@ -2,6 +2,7 @@
 //!
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::kiro::model::requests::conversation::{
@@ -72,6 +73,34 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
+/// 工具名中需要替换为下划线的特殊字符
+/// Kiro API 仅支持字母、数字、下划线、连字符
+const SPECIAL_CHARS: &[char] = &[
+    '.', '/', ':', '@', '#', '$', '%', '&', '*', '+', '=', '|', '\\',
+    '~', '`', '!', '^', '(', ')', '[', ']', '{', '}', '<', '>',
+    ',', ';', '?', '\'', '"', ' '
+];
+
+/// 工具名最大长度
+const MAX_TOOL_NAME_LENGTH: usize = 64;
+
+/// 净化工具名称，将特殊字符替换为下划线，并限制长度
+///
+/// Kiro API 对工具名有严格限制：仅支持字母、数字、下划线、连字符
+/// 此函数将不支持的字符替换为下划线，并限制最大长度为 64 字符
+pub fn sanitize_tool_name(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| if SPECIAL_CHARS.contains(&c) { '_' } else { c })
+        .collect();
+
+    // 限制最大长度64字符，UTF-8安全截断
+    match sanitized.char_indices().nth(MAX_TOOL_NAME_LENGTH) {
+        Some((idx, _)) => sanitized[..idx].to_string(),
+        None => sanitized,
+    }
+}
+
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
 /// 按照用户要求：
@@ -107,6 +136,9 @@ pub fn map_model(model: &str) -> Option<String> {
 pub struct ConversionResult {
     /// 转换后的 Kiro 请求
     pub conversation_state: ConversationState,
+    /// 工具名映射表：净化后的名称 → 原始名称
+    /// 仅包含被修改过的工具名
+    pub tool_name_map: HashMap<String, String>,
 }
 
 /// 转换错误
@@ -228,7 +260,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
 
     // 6. 转换工具定义
-    let mut tools = convert_tools(&req.tools);
+    let (mut tools, mut tool_name_map) = convert_tools(&req.tools);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     let mut history = build_history(req, messages, &model_id)?;
@@ -253,7 +285,12 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     for tool_name in history_tool_names {
         if !existing_tool_names.contains(&tool_name.to_lowercase()) {
-            tools.push(create_placeholder_tool(&tool_name));
+            // 净化历史工具名
+            let sanitized_name = sanitize_tool_name(&tool_name);
+            if sanitized_name != tool_name {
+                tool_name_map.insert(sanitized_name.clone(), tool_name.clone());
+            }
+            tools.push(create_placeholder_tool(&sanitized_name));
         }
     }
 
@@ -288,7 +325,10 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .with_current_message(current_message)
         .with_history(history);
 
-    Ok(ConversionResult { conversation_state })
+    Ok(ConversionResult {
+        conversation_state,
+        tool_name_map,
+    })
 }
 
 /// 确定聊天触发类型
@@ -505,15 +545,26 @@ fn remove_orphaned_tool_uses(
 }
 
 /// 转换工具定义
-fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
+fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> (Vec<Tool>, HashMap<String, String>) {
     let Some(tools) = tools else {
-        return Vec::new();
+        return (Vec::new(), HashMap::new());
     };
 
-    tools
+    let mut tool_name_map = HashMap::new();
+
+    let converted_tools: Vec<Tool> = tools
         .iter()
         .map(|t| {
             let mut description = t.description.clone();
+
+            // 净化工具名
+            let original_name = t.name.clone();
+            let sanitized_name = sanitize_tool_name(&original_name);
+
+            // 仅当名称被修改时才添加到映射表
+            if sanitized_name != original_name {
+                tool_name_map.insert(sanitized_name.clone(), original_name.clone());
+            }
 
             // 对 Write/Edit 工具追加自定义描述后缀
             let suffix = match t.name.as_str() {
@@ -534,13 +585,15 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
 
             Tool {
                 tool_specification: ToolSpecification {
-                    name: t.name.clone(),
+                    name: sanitized_name,  // 使用净化后的名称
                     description,
                     input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(t.input_schema))),
                 },
             }
         })
-        .collect()
+        .collect();
+
+    (converted_tools, tool_name_map)
 }
 
 /// 生成thinking标签前缀
@@ -740,8 +793,10 @@ fn convert_assistant_message(
                         }
                         "tool_use" => {
                             if let (Some(id), Some(name)) = (block.id, block.name) {
+                                // 净化工具名（历史消息中的工具名也需要净化）
+                                let sanitized_name = sanitize_tool_name(&name);
                                 let input = block.input.unwrap_or(serde_json::json!({}));
-                                tool_uses.push(ToolUseEntry::new(id, name).with_input(input));
+                                tool_uses.push(ToolUseEntry::new(id, sanitized_name).with_input(input));
                             }
                         }
                         _ => {}
@@ -1526,5 +1581,56 @@ mod tests {
             }
         }
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
+    }
+
+    #[test]
+    fn test_sanitize_tool_name_basic() {
+        // 基本特殊字符替换
+        assert_eq!(sanitize_tool_name("web.search"), "web_search");
+        assert_eq!(sanitize_tool_name("foo:bar"), "foo_bar");
+        assert_eq!(sanitize_tool_name("a/b/c"), "a_b_c");
+    }
+
+    #[test]
+    fn test_sanitize_tool_name_multiple_special_chars() {
+        // 多个连续特殊字符
+        assert_eq!(sanitize_tool_name("foo..bar"), "foo__bar");
+        assert_eq!(sanitize_tool_name("a@#$b"), "a___b");
+    }
+
+    #[test]
+    fn test_sanitize_tool_name_no_change() {
+        // 不包含特殊字符时不修改
+        assert_eq!(sanitize_tool_name("read_file"), "read_file");
+        assert_eq!(sanitize_tool_name("Write"), "Write");
+        assert_eq!(sanitize_tool_name("tool123"), "tool123");
+    }
+
+    #[test]
+    fn test_sanitize_tool_name_length_limit() {
+        // 超长工具名被截断为64字符
+        let long_name = "a".repeat(100);
+        let sanitized = sanitize_tool_name(&long_name);
+        assert_eq!(sanitized.len(), 64);
+    }
+
+    #[test]
+    fn test_sanitize_tool_name_utf8_safe() {
+        // UTF-8 安全截断（不在多字节字符中间切割）
+        assert_eq!(sanitize_tool_name("工具.测试"), "工具_测试");
+
+        // 带中文的超长名称
+        let mixed = format!("{}{}", "中".repeat(30), "a".repeat(50));
+        let sanitized = sanitize_tool_name(&mixed);
+        // 应该在字符边界截断，不会导致无效UTF-8
+        assert!(sanitized.is_ascii() || sanitized.chars().count() <= 64);
+    }
+
+    #[test]
+    fn test_sanitize_tool_name_all_special_chars() {
+        // 测试所有31个特殊字符
+        let input = "./:@#$%&*+=|\\~`!^()[]{}><,;?'\" ";
+        let expected = "_".repeat(31);
+        assert_eq!(sanitize_tool_name(input), expected);
     }
 }
