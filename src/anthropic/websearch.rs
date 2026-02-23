@@ -256,7 +256,6 @@ fn generate_websearch_events(
                 "model": model,
                 "content": [],
                 "stop_reason": null,
-                "stop_sequence": null,
                 "usage": {
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
@@ -267,31 +266,53 @@ fn generate_websearch_events(
         }),
     ));
 
-    // 2. content_block_start (server_tool_use)
+    // 2. content_block_start (text - 搜索决策说明, index 0)
+    let decision_text = format!("I'll search for \"{}\".", query);
     events.push(SseEvent::new(
         "content_block_start",
         json!({
             "type": "content_block_start",
             "index": 0,
             "content_block": {
-                "id": tool_use_id,
-                "type": "server_tool_use",
-                "name": "web_search",
-                "input": {}
+                "type": "text",
+                "text": ""
             }
         }),
     ));
 
-    // 3. content_block_delta (input_json_delta)
-    let input_json = json!({"query": query});
     events.push(SseEvent::new(
         "content_block_delta",
         json!({
             "type": "content_block_delta",
             "index": 0,
             "delta": {
-                "type": "input_json_delta",
-                "partial_json": serde_json::to_string(&input_json).unwrap_or_default()
+                "type": "text_delta",
+                "text": decision_text
+            }
+        }),
+    ));
+
+    events.push(SseEvent::new(
+        "content_block_stop",
+        json!({
+            "type": "content_block_stop",
+            "index": 0
+        }),
+    ));
+
+    // 3. content_block_start (server_tool_use, index 1)
+    // server_tool_use 是服务端工具，input 在 content_block_start 中一次性完整发送，
+    // 不像客户端 tool_use 需要通过 input_json_delta 增量传输。
+    events.push(SseEvent::new(
+        "content_block_start",
+        json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {
+                "id": tool_use_id,
+                "type": "server_tool_use",
+                "name": "web_search",
+                "input": {"query": query}
             }
         }),
     ));
@@ -301,22 +322,27 @@ fn generate_websearch_events(
         "content_block_stop",
         json!({
             "type": "content_block_stop",
-            "index": 0
+            "index": 1
         }),
     ));
 
-    // 5. content_block_start (web_search_tool_result)
+    // 5. content_block_start (web_search_tool_result, index 2)
+    // 官方 API 的 web_search_tool_result 没有 tool_use_id 字段
     let search_content = if let Some(ref results) = search_results {
         results
             .results
             .iter()
             .map(|r| {
+                let page_age = r.published_date.and_then(|ms| {
+                    chrono::DateTime::from_timestamp_millis(ms)
+                        .map(|dt| dt.format("%B %-d, %Y").to_string())
+                });
                 json!({
                     "type": "web_search_result",
                     "title": r.title,
                     "url": r.url,
                     "encrypted_content": r.snippet.clone().unwrap_or_default(),
-                    "page_age": null
+                    "page_age": page_age
                 })
             })
             .collect::<Vec<_>>()
@@ -328,10 +354,9 @@ fn generate_websearch_events(
         "content_block_start",
         json!({
             "type": "content_block_start",
-            "index": 1,
+            "index": 2,
             "content_block": {
                 "type": "web_search_tool_result",
-                "tool_use_id": tool_use_id,
                 "content": search_content
             }
         }),
@@ -342,16 +367,16 @@ fn generate_websearch_events(
         "content_block_stop",
         json!({
             "type": "content_block_stop",
-            "index": 1
+            "index": 2
         }),
     ));
 
-    // 7. content_block_start (text)
+    // 7. content_block_start (text, index 3)
     events.push(SseEvent::new(
         "content_block_start",
         json!({
             "type": "content_block_start",
-            "index": 2,
+            "index": 3,
             "content_block": {
                 "type": "text",
                 "text": ""
@@ -370,7 +395,7 @@ fn generate_websearch_events(
             "content_block_delta",
             json!({
                 "type": "content_block_delta",
-                "index": 2,
+                "index": 3,
                 "delta": {
                     "type": "text_delta",
                     "text": text
@@ -384,22 +409,25 @@ fn generate_websearch_events(
         "content_block_stop",
         json!({
             "type": "content_block_stop",
-            "index": 2
+            "index": 3
         }),
     ));
 
     // 10. message_delta
+    // 官方 API 的 message_delta.delta 中没有 stop_sequence 字段
     let output_tokens = (summary.len() as i32 + 3) / 4; // 简单估算
     events.push(SseEvent::new(
         "message_delta",
         json!({
             "type": "message_delta",
             "delta": {
-                "stop_reason": "end_turn",
-                "stop_sequence": null
+                "stop_reason": "end_turn"
             },
             "usage": {
-                "output_tokens": output_tokens
+                "output_tokens": output_tokens,
+                "server_tool_use": {
+                    "web_search_requests": 1
+                }
             }
         }),
     ));

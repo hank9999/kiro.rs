@@ -2195,6 +2195,9 @@ impl MultiTokenManager {
         // 持久化更改
         self.persist_credentials()?;
 
+        // 立即回写统计数据，清除已删除凭据的残留条目
+        self.save_stats();
+
         tracing::info!("已删除凭据 #{}", id);
         Ok(())
     }
