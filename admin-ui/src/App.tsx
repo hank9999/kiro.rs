@@ -8,8 +8,8 @@ function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false)
 
   useEffect(() => {
-    // 检查是否已经有保存的 API Key
-    if (storage.getApiKey()) {
+    // 检查是否已经有保存的 JWT token
+    if (storage.getToken()) {
       setIsLoggedIn(true)
     }
   }, [])

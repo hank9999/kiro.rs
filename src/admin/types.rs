@@ -237,3 +237,32 @@ impl AdminErrorResponse {
         Self::new("internal_error", message)
     }
 }
+
+// ============ 认证相关 ============
+
+/// CAPTCHA 响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptchaResponse {
+    pub token: String,
+    pub image: String,
+}
+
+/// 登录请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginRequest {
+    pub api_key: String,
+    pub captcha_token: String,
+    pub captcha_answer: String,
+}
+
+/// 登录响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginResponse {
+    pub success: bool,
+    pub message: String,
+    pub token: String,
+    pub expires_in: u64,
+}

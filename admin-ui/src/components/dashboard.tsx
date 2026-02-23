@@ -119,7 +119,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   }
 
   const handleLogout = () => {
-    storage.removeApiKey()
+    storage.removeToken()
     queryClient.clear()
     onLogout()
   }

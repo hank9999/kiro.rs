@@ -10,9 +10,9 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 
+use super::jwt;
 use super::service::AdminService;
 use super::types::AdminErrorResponse;
-use crate::common::auth;
 
 /// Admin API 共享状态
 #[derive(Clone)]
@@ -38,12 +38,28 @@ pub async fn admin_auth_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let api_key = auth::extract_api_key(&request);
+    let token = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
 
-    match api_key {
-        Some(key) if auth::constant_time_eq(&key, &state.admin_api_key) => next.run(request).await,
-        _ => {
-            let error = AdminErrorResponse::authentication_error();
+    match token {
+        Some(token) => match jwt::verify_token(token, &state.admin_api_key) {
+            Ok(_) => next.run(request).await,
+            Err(_) => {
+                let error = AdminErrorResponse::new(
+                    "authentication_error",
+                    "Invalid or expired token",
+                );
+                (StatusCode::UNAUTHORIZED, Json(error)).into_response()
+            }
+        },
+        None => {
+            let error = AdminErrorResponse::new(
+                "authentication_error",
+                "Missing authorization token",
+            );
             (StatusCode::UNAUTHORIZED, Json(error)).into_response()
         }
     }

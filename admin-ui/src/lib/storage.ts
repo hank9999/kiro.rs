@@ -1,7 +1,7 @@
-const API_KEY_STORAGE_KEY = 'adminApiKey'
+const TOKEN_STORAGE_KEY = 'adminToken'
 
 export const storage = {
-  getApiKey: () => localStorage.getItem(API_KEY_STORAGE_KEY),
-  setApiKey: (key: string) => localStorage.setItem(API_KEY_STORAGE_KEY, key),
-  removeApiKey: () => localStorage.removeItem(API_KEY_STORAGE_KEY),
+  getToken: () => localStorage.getItem(TOKEN_STORAGE_KEY),
+  setToken: (token: string) => localStorage.setItem(TOKEN_STORAGE_KEY, token),
+  removeToken: () => localStorage.removeItem(TOKEN_STORAGE_KEY),
 }

@@ -8,6 +8,7 @@ mod model;
 pub mod token;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
@@ -123,9 +124,21 @@ async fn main() {
         } else {
             let admin_service = admin::AdminService::new(token_manager.clone());
             let admin_state = admin::AdminState::new(admin_key, admin_service);
-            let admin_app = admin::create_admin_router(admin_state);
 
-            // 创建 Admin UI 路由
+            // 创建 CAPTCHA 存储
+            let captcha_store = Arc::new(admin::CaptchaStore::new());
+
+            // 启动后台清理任务（每60秒清理过期 CAPTCHA）
+            let cleanup_store = captcha_store.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    cleanup_store.cleanup_expired();
+                }
+            });
+
+            let admin_app = admin::create_admin_router(admin_state, captcha_store);
             let admin_ui_app = admin_ui::create_admin_ui_router();
 
             tracing::info!("Admin API 已启用");

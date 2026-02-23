@@ -32,3 +32,6 @@ parking_lot = "0.12"  # 高性能同步原语
 subtle = "2.6"        # 常量时间比较（防止时序攻击）
 rust-embed = "8"      # 嵌入静态文件
 mime_guess = "2"      # MIME 类型推断
+captcha = "1.0"       # CAPTCHA 图片生成
+base64 = "0.22"       # Base64 编码
+jsonwebtoken = "9"    # JWT token 生成和验证

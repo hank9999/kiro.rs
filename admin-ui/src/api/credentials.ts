@@ -18,11 +18,11 @@ const api = axios.create({
   },
 })
 
-// 请求拦截器添加 API Key
+// 请求拦截器添加 JWT token
 api.interceptors.request.use((config) => {
-  const apiKey = storage.getApiKey()
-  if (apiKey) {
-    config.headers['x-api-key'] = apiKey
+  const token = storage.getToken()
+  if (token) {
+    config.headers['Authorization'] = `Bearer ${token}`
   }
   return config
 })

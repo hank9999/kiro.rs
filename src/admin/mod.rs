@@ -16,13 +16,17 @@
 //! let admin_router = create_admin_router(admin_state);
 //! ```
 
+mod auth_handlers;
+mod captcha;
 mod error;
 mod handlers;
+mod jwt;
 mod middleware;
 mod router;
 mod service;
 pub mod types;
 
+pub use captcha::CaptchaStore;
 pub use middleware::AdminState;
 pub use router::create_admin_router;
 pub use service::AdminService;
