@@ -444,15 +444,28 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setVerifying(false)
   }
 
-  // 切换负载均衡模式
+  // 切换负载均衡模式（循环切换：priority -> balanced -> affinity -> priority）
   const handleToggleLoadBalancing = () => {
     const currentMode = loadBalancingData?.mode || 'priority'
-    const newMode = currentMode === 'priority' ? 'balanced' : 'priority'
+
+    // 循环切换逻辑
+    let newMode: 'priority' | 'balanced' | 'affinity'
+    if (currentMode === 'priority') {
+      newMode = 'balanced'
+    } else if (currentMode === 'balanced') {
+      newMode = 'affinity'
+    } else {
+      newMode = 'priority'
+    }
 
     setLoadBalancingMode(newMode, {
       onSuccess: () => {
-        const modeName = newMode === 'priority' ? '优先级模式' : '均衡负载模式'
-        toast.success(`已切换到${modeName}`)
+        const modeNames = {
+          priority: '优先级模式',
+          balanced: '均衡负载模式',
+          affinity: '亲和性模式'
+        }
+        toast.success(`已切换到${modeNames[newMode]}`)
       },
       onError: (error) => {
         toast.error(`切换失败: ${extractErrorMessage(error)}`)
@@ -505,7 +518,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
               disabled={isLoadingMode || isSettingMode}
               title="切换负载均衡模式"
             >
-              {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
+              {isLoadingMode ? '加载中...' : (() => {
+                const modeNames = {
+                  priority: '优先级模式',
+                  balanced: '均衡负载',
+                  affinity: '亲和性'
+                }
+                return modeNames[loadBalancingData?.mode || 'priority']
+              })()}
             </Button>
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
