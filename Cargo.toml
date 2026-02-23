@@ -3,6 +3,11 @@ name = "kiro-rs"
 version = "2026.2.6"
 edition = "2024"
 
+[profile.dev]
+codegen-units = 256  # 最大化并行编译
+split-debuginfo = "unpacked"  # macOS 加速
+opt-level = 0  # 开发时不优化
+
 [profile.release]
 lto = true
 strip = true

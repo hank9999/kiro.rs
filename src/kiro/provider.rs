@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use uuid::Uuid;
+use std::fs::OpenOptions;
+use std::io::Write;
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
@@ -73,6 +75,43 @@ impl KiroProvider {
         let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
         cache.insert(effective, client.clone());
         Ok(client)
+    }
+
+    /// 将请求和响应写入日志文件
+    ///
+    /// 日志文件格式：/tmp/kiro_req_{UUID}_{STATUS}.log
+    /// 每个请求都会生成一个新的 UUID 文件
+    fn log_request_response(request_body: &str, response_body: &str, status: u16) {
+        let log_uuid = Uuid::new_v4();
+        let log_path = format!("/tmp/kiro_req_{}_{}.log", log_uuid, status);
+
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&log_path)
+        {
+            let log_content = format!(
+                "=== Kiro API Request/Response Log ===\n\
+                 UUID: {}\n\
+                 Timestamp: {}\n\
+                 Status: {}\n\n\
+                 === REQUEST ===\n\
+                 {}\n\n\
+                 === RESPONSE ===\n\
+                 {}\n",
+                log_uuid,
+                chrono::Utc::now().to_rfc3339(),
+                status,
+                request_body,
+                response_body
+            );
+
+            let _ = file.write_all(log_content.as_bytes());
+            tracing::info!("已将请求/响应写入日志: {}", log_path);
+        } else {
+            tracing::warn!("无法创建日志文件: {}", log_path);
+        }
     }
 
     /// 获取 token_manager 的引用
@@ -376,6 +415,9 @@ impl KiroProvider {
             // 失败响应
             let body = response.text().await.unwrap_or_default();
 
+            // 记录失败的请求/响应
+            Self::log_request_response(request_body, &body, status.as_u16());
+
             // 402 额度用尽
             if status.as_u16() == 402 && Self::is_monthly_request_limit(&body) {
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
@@ -512,6 +554,9 @@ impl KiroProvider {
 
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
+
+            // 记录失败的请求/响应
+            Self::log_request_response(request_body, &body, status.as_u16());
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && Self::is_monthly_request_limit(&body) {
