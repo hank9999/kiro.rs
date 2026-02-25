@@ -1,6 +1,5 @@
 import { clsx, type ClassValue } from 'clsx'
 import { twMerge } from 'tailwind-merge'
-import type { ImportableCredentialData } from '@/types/api'
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
@@ -104,6 +103,22 @@ function parseNestedErrorMessage(message: string): { title: string; detail?: str
   }
 
   return { title: message }
+}
+
+/**
+ * 可导入的 JSON 凭据数据格式
+ */
+interface ImportableCredentialData {
+  success?: boolean
+  ssoToken?: string
+  accessToken?: string
+  refreshToken?: string
+  clientId?: string
+  clientSecret?: string
+  name?: string
+  password?: string
+  email?: string
+  generatedEmail?: string
 }
 
 /**
