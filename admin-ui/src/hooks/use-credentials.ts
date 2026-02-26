@@ -9,8 +9,14 @@ import {
   deleteCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getEmailConfig,
+  saveEmailConfig,
+  testEmail,
+  getWebhookUrl,
+  setWebhookUrl,
+  testWebhook,
 } from '@/api/credentials'
-import type { AddCredentialRequest } from '@/types/api'
+import type { AddCredentialRequest, SaveEmailConfigRequest, TestEmailRequest, TestWebhookRequest } from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -104,5 +110,57 @@ export function useSetLoadBalancingMode() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
     },
+  })
+}
+
+// 获取邮件配置
+export function useEmailConfig() {
+  return useQuery({
+    queryKey: ['emailConfig'],
+    queryFn: getEmailConfig,
+  })
+}
+
+// 保存邮件配置
+export function useSaveEmailConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: SaveEmailConfigRequest) => saveEmailConfig(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['emailConfig'] })
+    },
+  })
+}
+
+// 发送测试邮件
+export function useTestEmail() {
+  return useMutation({
+    mutationFn: (req: TestEmailRequest) => testEmail(req),
+  })
+}
+
+// 获取 Webhook URL
+export function useWebhookUrl() {
+  return useQuery({
+    queryKey: ['webhookUrl'],
+    queryFn: getWebhookUrl,
+  })
+}
+
+// 设置 Webhook URL
+export function useSetWebhookUrl() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setWebhookUrl,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['webhookUrl'] })
+    },
+  })
+}
+
+// 发送测试 Webhook
+export function useTestWebhook() {
+  return useMutation({
+    mutationFn: (req: TestWebhookRequest) => testWebhook(req),
   })
 }

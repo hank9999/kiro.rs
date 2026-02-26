@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
+use crate::admin::email::{CredentialDisabledEvent, DisableReason, EmailNotifier};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -498,6 +499,10 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 邮件通知器（用 Mutex 包装以支持热更新）
+    email_notifier: Mutex<Option<EmailNotifier>>,
+    /// Webhook 通知器（用 Mutex 包装以支持热更新）
+    webhook_notifier: Mutex<Option<crate::webhook::WebhookNotifier>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -608,6 +613,8 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            email_notifier: Mutex::new(None),
+            webhook_notifier: Mutex::new(None),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -984,6 +991,41 @@ impl MultiTokenManager {
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
     }
 
+    /// 设置邮件通知器（初始化时调用，Arc 包装前）
+    pub fn set_email_notifier(&mut self, notifier: EmailNotifier) {
+        *self.email_notifier.get_mut() = Some(notifier);
+    }
+
+    /// 热更新邮件通知器（保存配置后重建 notifier）
+    pub fn update_email_notifier(&self, notifier: EmailNotifier) {
+        *self.email_notifier.lock() = Some(notifier);
+    }
+
+    /// 移除邮件通知器（禁用通知）
+    pub fn remove_email_notifier(&self) {
+        *self.email_notifier.lock() = None;
+    }
+
+    /// 设置 Webhook 通知器（初始化时调用，Arc 包装前）
+    pub fn set_webhook_notifier(&mut self, notifier: crate::webhook::WebhookNotifier) {
+        *self.webhook_notifier.get_mut() = Some(notifier);
+    }
+
+    /// 热更新 Webhook 通知器
+    pub fn update_webhook_notifier(&self, notifier: crate::webhook::WebhookNotifier) {
+        *self.webhook_notifier.lock() = Some(notifier);
+    }
+
+    /// 移除 Webhook 通知器（禁用通知）
+    pub fn remove_webhook_notifier(&self) {
+        *self.webhook_notifier.lock() = None;
+    }
+
+    /// 获取当前 Webhook URL
+    pub fn get_webhook_url(&self) -> Option<String> {
+        self.config.webhook_url.clone()
+    }
+
     /// 统计数据文件路径
     fn stats_path(&self) -> Option<PathBuf> {
         self.cache_dir().map(|d| d.join("kiro_stats.json"))
@@ -1105,7 +1147,7 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_failure(&self, id: u64) -> bool {
-        let result = {
+        let (result, notify_event) = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
@@ -1125,9 +1167,12 @@ impl MultiTokenManager {
                 MAX_FAILURES_PER_CREDENTIAL
             );
 
+            let mut notify_event = None;
+
             if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::TooManyFailures);
+                let email = entry.credentials.email.clone();
                 tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
 
                 // 切换到优先级最高的可用凭据
@@ -1145,10 +1190,31 @@ impl MultiTokenManager {
                 } else {
                     tracing::error!("所有凭据均已禁用！");
                 }
+
+                let available = entries.iter().filter(|e| !e.disabled).count();
+                let total = entries.len();
+                notify_event = Some(CredentialDisabledEvent {
+                    id,
+                    email,
+                    reason: DisableReason::TooManyFailures,
+                    remaining_available: available,
+                    total,
+                });
             }
 
-            entries.iter().any(|e| !e.disabled)
+            (entries.iter().any(|e| !e.disabled), notify_event)
         };
+
+        // 在释放 entries 锁后发送通知
+        if let Some(event) = notify_event {
+            if let Some(notifier) = self.email_notifier.lock().as_ref() {
+                notifier.notify(event.clone());
+            }
+            if let Some(notifier) = self.webhook_notifier.lock().as_ref() {
+                notifier.notify(event);
+            }
+        }
+
         self.save_stats_debounced();
         result
     }
@@ -1160,7 +1226,7 @@ impl MultiTokenManager {
     /// - 切换到下一个可用凭据继续重试
     /// - 返回是否还有可用凭据
     pub fn report_quota_exhausted(&self, id: u64) -> bool {
-        let result = {
+        let (result, notify_event) = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
@@ -1176,13 +1242,13 @@ impl MultiTokenManager {
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
             entry.last_used_at = Some(Utc::now().to_rfc3339());
-            // 设为阈值，便于在管理面板中直观看到该凭据已不可用
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+            let email = entry.credentials.email.clone();
 
             tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
 
             // 切换到优先级最高的可用凭据
-            if let Some(next) = entries
+            let has_available = if let Some(next) = entries
                 .iter()
                 .filter(|e| !e.disabled)
                 .min_by_key(|e| e.credentials.priority)
@@ -1197,8 +1263,31 @@ impl MultiTokenManager {
             } else {
                 tracing::error!("所有凭据均已禁用！");
                 false
-            }
+            };
+
+            let available = entries.iter().filter(|e| !e.disabled).count();
+            let total = entries.len();
+            let event = CredentialDisabledEvent {
+                id,
+                email,
+                reason: DisableReason::QuotaExceeded,
+                remaining_available: available,
+                total,
+            };
+
+            (has_available, Some(event))
         };
+
+        // 在释放 entries 锁后发送通知
+        if let Some(event) = notify_event {
+            if let Some(notifier) = self.email_notifier.lock().as_ref() {
+                notifier.notify(event.clone());
+            }
+            if let Some(notifier) = self.webhook_notifier.lock().as_ref() {
+                notifier.notify(event);
+            }
+        }
+
         self.save_stats_debounced();
         result
     }
@@ -1405,7 +1494,8 @@ impl MultiTokenManager {
         };
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let usage_limits =
+            get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -1414,8 +1504,7 @@ impl MultiTokenManager {
                 if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                     let old_title = entry.credentials.subscription_title.clone();
                     if old_title.as_deref() != Some(subscription_title) {
-                        entry.credentials.subscription_title =
-                            Some(subscription_title.to_string());
+                        entry.credentials.subscription_title = Some(subscription_title.to_string());
                         tracing::info!(
                             "凭据 #{} 订阅等级已更新: {:?} -> {}",
                             id,
@@ -1872,21 +1961,14 @@ mod tests {
 
     #[test]
     fn test_set_load_balancing_mode_persists_to_config_file() {
-        let config_path = std::env::temp_dir().join(format!(
-            "kiro-load-balancing-{}.json",
-            uuid::Uuid::new_v4()
-        ));
+        let config_path =
+            std::env::temp_dir().join(format!("kiro-load-balancing-{}.json", uuid::Uuid::new_v4()));
         std::fs::write(&config_path, r#"{"loadBalancingMode":"priority"}"#).unwrap();
 
         let config = Config::load(&config_path).unwrap();
-        let manager = MultiTokenManager::new(
-            config,
-            vec![KiroCredentials::default()],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
 
         manager
             .set_load_balancing_mode("balanced".to_string())
@@ -1960,7 +2042,12 @@ mod tests {
         manager.report_quota_exhausted(2);
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager
+            .acquire_context(None)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
