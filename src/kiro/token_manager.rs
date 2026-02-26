@@ -96,6 +96,11 @@ pub(crate) fn is_token_expiring_within(
 
 /// 检查 Token 是否已过期（提前 5 分钟判断）
 pub(crate) fn is_token_expired(credentials: &KiroCredentials) -> bool {
+    // 如果没有 access_token，认为已过期需要刷新
+    if credentials.access_token.is_none() {
+        return true;
+    }
+
     is_token_expiring_within(credentials, 5).unwrap_or(true)
 }
 
@@ -175,7 +180,6 @@ async fn refresh_social_token(
     let region = credentials.effective_auth_region(config);
 
     let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
-    let refresh_domain = format!("prod.{}.auth.desktop.kiro.dev", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config)
         .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
     let kiro_version = &config.kiro_version;
@@ -185,17 +189,15 @@ async fn refresh_social_token(
         refresh_token: refresh_token.to_string(),
     };
 
+    let user_agent = format!(
+        "aws-sdk-js/1.0.18 ua/2.1 os/windows lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E KiroIDE-{}-{}",
+        kiro_version, machine_id
+    );
+
     let response = client
         .post(&refresh_url)
-        .header("Accept", "application/json, text/plain, */*")
         .header("Content-Type", "application/json")
-        .header(
-            "User-Agent",
-            format!("KiroIDE-{}-{}", kiro_version, machine_id),
-        )
-        .header("Accept-Encoding", "gzip, compress, deflate, br")
-        .header("host", &refresh_domain)
-        .header("Connection", "close")
+        .header("User-Agent", user_agent)
         .json(&body)
         .send()
         .await?;
@@ -259,6 +261,9 @@ async fn refresh_idc_token(
     let region = credentials.effective_auth_region(config);
     let refresh_url = format!("https://oidc.{}.amazonaws.com/token", region);
 
+    tracing::info!("IdC 刷新 URL: {}", refresh_url);
+    tracing::info!("使用 clientId: {}...", &client_id[..std::cmp::min(20, client_id.len())]);
+
     let client = build_client(proxy, 60, config.tls_backend)?;
     let body = IdcRefreshRequest {
         client_id: client_id.to_string(),
@@ -267,24 +272,19 @@ async fn refresh_idc_token(
         grant_type: "refresh_token".to_string(),
     };
 
+    tracing::info!("发送 IdC 刷新请求...");
     let response = client
         .post(&refresh_url)
         .header("Content-Type", "application/json")
-        .header("Host", format!("oidc.{}.amazonaws.com", region))
-        .header("Connection", "keep-alive")
-        .header("x-amz-user-agent", IDC_AMZ_USER_AGENT)
-        .header("Accept", "*/*")
-        .header("Accept-Language", "*")
-        .header("sec-fetch-mode", "cors")
-        .header("User-Agent", "node")
-        .header("Accept-Encoding", "br, gzip, deflate")
         .json(&body)
         .send()
         .await?;
 
+    tracing::info!("收到 IdC 刷新响应，状态码: {}", response.status());
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+        tracing::error!("IdC 刷新失败，响应内容: {}", body_text);
         let error_msg = match status.as_u16() {
             401 => "IdC 凭证已过期或无效，需要重新认证",
             403 => "权限不足，无法刷新 Token",
@@ -296,6 +296,7 @@ async fn refresh_idc_token(
     }
 
     let data: IdcRefreshResponse = response.json().await?;
+    tracing::info!("IdC Token 刷新成功");
 
     let mut new_credentials = credentials.clone();
     new_credentials.access_token = Some(data.access_token);
@@ -307,6 +308,7 @@ async fn refresh_idc_token(
     if let Some(expires_in) = data.expires_in {
         let expires_at = Utc::now() + Duration::seconds(expires_in);
         new_credentials.expires_at = Some(expires_at.to_rfc3339());
+        tracing::info!("新 Token 将于 {} 过期", expires_at.to_rfc3339());
     }
 
     Ok(new_credentials)
