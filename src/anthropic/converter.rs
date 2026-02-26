@@ -2,6 +2,7 @@
 //!
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
+use base64::{engine::general_purpose, Engine as _};
 use uuid::Uuid;
 
 use crate::kiro::model::requests::conversation::{
@@ -103,10 +104,14 @@ pub fn map_model(model: &str) -> Option<String> {
 }
 
 /// 转换结果
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ConversionResult {
     /// 转换后的 Kiro 请求
     pub conversation_state: ConversationState,
+    /// 原始历史消息（用于截断重试）
+    pub original_history: Vec<Message>,
+    /// 模型 ID
+    pub model_id: String,
 }
 
 /// 转换错误
@@ -114,6 +119,7 @@ pub struct ConversionResult {
 pub enum ConversionError {
     UnsupportedModel(String),
     EmptyMessages,
+    InvalidRequest(String),
 }
 
 impl std::fmt::Display for ConversionError {
@@ -121,6 +127,7 @@ impl std::fmt::Display for ConversionError {
         match self {
             ConversionError::UnsupportedModel(model) => write!(f, "模型不支持: {}", model),
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
+            ConversionError::InvalidRequest(msg) => write!(f, "{}", msg),
         }
     }
 }
@@ -224,7 +231,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let chat_trigger_type = determine_chat_trigger_type(req);
 
     // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
-    let last_message = messages.last().unwrap();
+    let last_message = messages.last().ok_or(ConversionError::EmptyMessages)?;
     let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
 
     // 6. 转换工具定义
@@ -286,9 +293,27 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .with_agent_task_type("vibe")
         .with_chat_trigger_type(chat_trigger_type)
         .with_current_message(current_message)
-        .with_history(history);
+        .with_history(history.clone());
 
-    Ok(ConversionResult { conversation_state })
+    Ok(ConversionResult {
+        conversation_state,
+        original_history: history,
+        model_id,
+    })
+}
+
+/// 使用截断后的历史重新构建 ConversationState
+///
+/// 用于内容长度超限后的截断重试
+pub fn rebuild_with_truncated_history(
+    original_result: &ConversionResult,
+    truncated_history: Vec<Message>,
+) -> ConversationState {
+    let mut new_state = original_result.conversation_state.clone();
+    new_state.history = truncated_history;
+    // 生成新的 agent_continuation_id
+    new_state.agent_continuation_id = Some(Uuid::new_v4().to_string());
+    new_state
 }
 
 /// 确定聊天触发类型
@@ -296,6 +321,9 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
     "MANUAL".to_string()
 }
+
+/// 最大图片大小 (20MB)
+const MAX_IMAGE_SIZE_BYTES: usize = 20 * 1024 * 1024;
 
 /// 处理消息内容，提取文本、图片和工具结果
 fn process_message_content(
@@ -311,6 +339,14 @@ fn process_message_content(
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
+                // OpenAI 风格：{ "type": "image_url", "image_url": {"url": "data:..."} }
+                // 对齐 kiro2api-main：仅支持 data URL，不支持远程 HTTP 图片。
+                if is_image_url_block(item) {
+                    let img = parse_image_url_block_to_kiro_image(item)?;
+                    images.push(img);
+                    continue;
+                }
+
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
                     match block.block_type.as_str() {
                         "text" => {
@@ -319,11 +355,15 @@ fn process_message_content(
                             }
                         }
                         "image" => {
-                            if let Some(source) = block.source {
-                                if let Some(format) = get_image_format(&source.media_type) {
-                                    images.push(KiroImage::from_base64(format, source.data));
-                                }
-                            }
+                            let source = block
+                                .source
+                                .ok_or_else(|| ConversionError::InvalidRequest("图片数据为空".to_string()))?;
+                            let img = validate_and_convert_image_source(
+                                &source.source_type,
+                                &source.media_type,
+                                &source.data,
+                            )?;
+                            images.push(img);
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
@@ -362,8 +402,230 @@ fn get_image_format(media_type: &str) -> Option<String> {
         "image/png" => Some("png".to_string()),
         "image/gif" => Some("gif".to_string()),
         "image/webp" => Some("webp".to_string()),
+        "image/bmp" => Some("bmp".to_string()),
         _ => None,
     }
+}
+
+fn is_image_url_block(item: &serde_json::Value) -> bool {
+    item.get("type")
+        .and_then(|v| v.as_str())
+        .map(|t| t == "image_url")
+        .unwrap_or(false)
+}
+
+fn parse_image_url_block_to_kiro_image(item: &serde_json::Value) -> Result<KiroImage, ConversionError> {
+    let image_url = item
+        .get("image_url")
+        .ok_or_else(|| ConversionError::InvalidRequest("image_url缺少image_url字段".to_string()))?;
+
+    let url = image_url
+        .get("url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ConversionError::InvalidRequest("image_url缺少url字段".to_string()))?;
+
+    if !url.starts_with("data:") {
+        return Err(ConversionError::InvalidRequest(
+            "目前仅支持data URL格式的图片".to_string(),
+        ));
+    }
+
+    let (media_type, base64_data) = parse_data_url(url)?;
+    validate_base64_image(&media_type, &base64_data)?;
+
+    let format = get_image_format(&media_type)
+        .ok_or_else(|| ConversionError::InvalidRequest(format!("不支持的图片格式: {}", media_type)))?;
+
+    Ok(KiroImage::from_base64(format, base64_data))
+}
+
+fn validate_and_convert_image_source(
+    source_type: &str,
+    media_type: &str,
+    data: &str,
+) -> Result<KiroImage, ConversionError> {
+    if !source_type.eq_ignore_ascii_case("base64") {
+        return Err(ConversionError::InvalidRequest(format!(
+            "不支持的图片类型: {}",
+            source_type
+        )));
+    }
+
+    if media_type.is_empty() {
+        return Err(ConversionError::InvalidRequest(
+            "不支持的图片格式: ".to_string(),
+        ));
+    }
+
+    let (normalized_media_type, normalized_base64) = if data.starts_with("data:") {
+        let (parsed_media_type, parsed_base64) = parse_data_url(data)?;
+        if parsed_media_type != media_type {
+            return Err(ConversionError::InvalidRequest(format!(
+                "图片格式不匹配: 声明为 {}，实际为 {}",
+                media_type, parsed_media_type
+            )));
+        }
+        (parsed_media_type, parsed_base64)
+    } else {
+        (media_type.to_string(), data.to_string())
+    };
+
+    validate_base64_image(&normalized_media_type, &normalized_base64)?;
+
+    let format = get_image_format(&normalized_media_type).ok_or_else(|| {
+        ConversionError::InvalidRequest(format!("不支持的图片格式: {}", normalized_media_type))
+    })?;
+
+    Ok(KiroImage::from_base64(format, normalized_base64))
+}
+
+fn parse_data_url(data_url: &str) -> Result<(String, String), ConversionError> {
+    // data URL 格式：data:[<mediatype>][;base64],<data>
+    // 对齐 kiro2api-main：仅支持带 ;base64 的 data URL。
+    let rest = data_url
+        .strip_prefix("data:")
+        .ok_or_else(|| ConversionError::InvalidRequest("无效的data URL格式".to_string()))?;
+
+    let (header, data) = rest
+        .split_once(',')
+        .ok_or_else(|| ConversionError::InvalidRequest("无效的data URL格式".to_string()))?;
+
+    if data.is_empty() {
+        return Err(ConversionError::InvalidRequest("图片数据为空".to_string()));
+    }
+
+    let mut parts = header.split(';');
+    let media_type = parts
+        .next()
+        .ok_or_else(|| ConversionError::InvalidRequest("无效的data URL格式".to_string()))?;
+
+    let base64_flag = parts.next();
+    if base64_flag != Some("base64") || parts.next().is_some() {
+        return Err(ConversionError::InvalidRequest(
+            "仅支持base64编码的data URL".to_string(),
+        ));
+    }
+
+    if get_image_format(media_type).is_none() {
+        return Err(ConversionError::InvalidRequest(format!(
+            "不支持的图片格式: {}",
+            media_type
+        )));
+    }
+
+    Ok((media_type.to_string(), data.to_string()))
+}
+
+fn validate_base64_image(media_type: &str, base64_data: &str) -> Result<(), ConversionError> {
+    if base64_data.is_empty() {
+        return Err(ConversionError::InvalidRequest("图片数据为空".to_string()));
+    }
+
+    let estimated = estimate_base64_decoded_len(base64_data)?;
+    if estimated > MAX_IMAGE_SIZE_BYTES {
+        return Err(ConversionError::InvalidRequest(format!(
+            "图片数据过大: {} 字节，最大支持 {} 字节",
+            estimated, MAX_IMAGE_SIZE_BYTES
+        )));
+    }
+
+    let decoded = general_purpose::STANDARD
+        .decode(base64_data)
+        .map_err(|e| ConversionError::InvalidRequest(format!("无效的 base64 编码: {}", e)))?;
+
+    if decoded.len() > MAX_IMAGE_SIZE_BYTES {
+        return Err(ConversionError::InvalidRequest(format!(
+            "图片数据过大: {} 字节，最大支持 {} 字节",
+            decoded.len(), MAX_IMAGE_SIZE_BYTES
+        )));
+    }
+
+    if let Some(detected) = detect_image_media_type(&decoded) {
+        if detected != media_type {
+            return Err(ConversionError::InvalidRequest(format!(
+                "图片格式不匹配: 声明为 {}，实际为 {}",
+                media_type, detected
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn estimate_base64_decoded_len(base64_data: &str) -> Result<usize, ConversionError> {
+    let len = base64_data.len();
+    if len == 0 {
+        return Ok(0);
+    }
+
+    if len % 4 != 0 {
+        return Err(ConversionError::InvalidRequest(
+            "无效的 base64 编码: 长度不是4的倍数".to_string(),
+        ));
+    }
+
+    let padding = base64_data
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|&&b| b == b'=')
+        .count();
+
+    if padding > 2 {
+        return Err(ConversionError::InvalidRequest(
+            "无效的 base64 编码: padding 不合法".to_string(),
+        ));
+    }
+
+    let decoded_len = (len / 4) * 3;
+    Ok(decoded_len.saturating_sub(padding))
+}
+
+fn detect_image_media_type(data: &[u8]) -> Option<&'static str> {
+    // JPEG: FF D8
+    if data.len() >= 2 && data[0] == 0xFF && data[1] == 0xD8 {
+        return Some("image/jpeg");
+    }
+
+    // PNG: 89 50 4E 47 0D 0A 1A 0A
+    if data.len() >= 8
+        && data[0] == 0x89
+        && data[1] == 0x50
+        && data[2] == 0x4E
+        && data[3] == 0x47
+        && data[4] == 0x0D
+        && data[5] == 0x0A
+        && data[6] == 0x1A
+        && data[7] == 0x0A
+    {
+        return Some("image/png");
+    }
+
+    // GIF: GIF87a / GIF89a
+    if data.len() >= 6 && (data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a")) {
+        return Some("image/gif");
+    }
+
+    // WebP: RIFF....WEBP
+    if data.len() >= 12
+        && data[0] == b'R'
+        && data[1] == b'I'
+        && data[2] == b'F'
+        && data[3] == b'F'
+        && data[8] == b'W'
+        && data[9] == b'E'
+        && data[10] == b'B'
+        && data[11] == b'P'
+    {
+        return Some("image/webp");
+    }
+
+    // BMP: BM
+    if data.len() >= 2 && data[0] == b'B' && data[1] == b'M' {
+        return Some("image/bmp");
+    }
+
+    None
 }
 
 /// 提取工具结果内容
@@ -823,36 +1085,31 @@ fn merge_assistant_messages(
 mod tests {
     use super::*;
 
+    fn must_ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
+        match r {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        }
+    }
+
     #[test]
     fn test_map_model_sonnet() {
-        assert!(
-            map_model("claude-sonnet-4-20250514")
-                .unwrap()
-                .contains("sonnet")
-        );
-        assert!(
-            map_model("claude-3-5-sonnet-20241022")
-                .unwrap()
-                .contains("sonnet")
-        );
+        let m1 = map_model("claude-sonnet-4-20250514");
+        let m2 = map_model("claude-3-5-sonnet-20241022");
+        assert!(m1.as_deref().unwrap_or("").contains("sonnet"));
+        assert!(m2.as_deref().unwrap_or("").contains("sonnet"));
     }
 
     #[test]
     fn test_map_model_opus() {
-        assert!(
-            map_model("claude-opus-4-20250514")
-                .unwrap()
-                .contains("opus")
-        );
+        let m = map_model("claude-opus-4-20250514");
+        assert!(m.as_deref().unwrap_or("").contains("opus"));
     }
 
     #[test]
     fn test_map_model_haiku() {
-        assert!(
-            map_model("claude-haiku-4-20250514")
-                .unwrap()
-                .contains("haiku")
-        );
+        let m = map_model("claude-haiku-4-20250514");
+        assert!(m.as_deref().unwrap_or("").contains("haiku"));
     }
 
     #[test]
@@ -907,10 +1164,50 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_data_url_ok() {
+        let (media_type, b64) = must_ok(parse_data_url("data:image/png;base64,AAAA"));
+        assert_eq!(media_type, "image/png");
+        assert_eq!(b64, "AAAA");
+    }
+
+    #[test]
+    fn test_parse_data_url_requires_base64() {
+        let err = parse_data_url("data:image/png,AAAA").err();
+        assert!(matches!(err, Some(ConversionError::InvalidRequest(_))));
+    }
+
+    #[test]
+    fn test_validate_base64_image_magic_mismatch() {
+        // JPEG 魔数，但声明为 PNG
+        let jpeg_bytes = [0xFFu8, 0xD8u8, 0xFFu8, 0xE0u8];
+        let b64 = general_purpose::STANDARD.encode(jpeg_bytes);
+        let err = validate_base64_image("image/png", &b64).err();
+        assert!(matches!(err, Some(ConversionError::InvalidRequest(_))));
+    }
+
+    #[test]
+    fn test_validate_and_convert_image_source_bmp_ok() {
+        let bmp_bytes = [b'B', b'M', 0u8, 0u8];
+        let b64 = general_purpose::STANDARD.encode(bmp_bytes);
+        let img = must_ok(validate_and_convert_image_source("base64", "image/bmp", &b64));
+        assert_eq!(img.format, "bmp");
+    }
+
+    #[test]
+    fn test_size_limit_estimate_rejects_large_input() {
+        // 构造一个超过 20MB 的 base64 字符串（不做真实解码，仅触发估算路径）
+        let target_decoded = MAX_IMAGE_SIZE_BYTES + 1;
+        // base64 每 4 字符约等于 3 字节
+        let b64_len = ((target_decoded + 2) / 3) * 4;
+        let huge = "A".repeat(b64_len);
+        let err = validate_base64_image("image/png", &huge).err();
+        assert!(matches!(err, Some(ConversionError::InvalidRequest(_))));
+    }
+
+    #[test]
     fn test_collect_history_tool_names() {
         use crate::kiro::model::requests::tool::ToolUseEntry;
 
-        // 创建包含工具使用的历史消息
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
         assistant_msg = assistant_msg.with_tool_uses(vec![
             ToolUseEntry::new("tool-1", "read")
@@ -920,10 +1217,7 @@ mod tests {
         ]);
 
         let history = vec![
-            Message::User(HistoryUserMessage::new(
-                "Read the file",
-                "claude-sonnet-4.5",
-            )),
+            Message::User(HistoryUserMessage::new("Read the file", "claude-sonnet-4.5")),
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg,
             }),
@@ -942,8 +1236,10 @@ mod tests {
         assert_eq!(tool.tool_specification.name, "my_custom_tool");
         assert!(!tool.tool_specification.description.is_empty());
 
-        // 验证 JSON 序列化正确
-        let json = serde_json::to_string(&tool).unwrap();
+        let json = match serde_json::to_string(&tool) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert!(json.contains("\"name\":\"my_custom_tool\""));
     }
 
@@ -951,7 +1247,6 @@ mod tests {
     fn test_history_tools_added_to_tools_list() {
         use super::super::types::Message as AnthropicMessage;
 
-        // 创建一个请求，历史中有工具使用，但 tools 列表为空
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
@@ -976,16 +1271,15 @@ mod tests {
             ],
             stream: false,
             system: None,
-            tools: None, // 没有提供工具定义
+            tools: None,
             tool_choice: None,
             thinking: None,
             output_config: None,
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = must_ok(convert_request(&req));
 
-        // 验证 tools 列表中包含了历史中使用的工具的占位符定义
         let tools = &result
             .conversation_state
             .current_message

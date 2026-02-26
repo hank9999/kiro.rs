@@ -165,7 +165,10 @@ mod tests {
     #[test]
     fn test_tool_result_serialize() {
         let result = ToolResult::success("tool-789", "Done");
-        let json = serde_json::to_string(&result).unwrap();
+        let json = match serde_json::to_string(&result) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
 
         assert!(json.contains("\"toolUseId\":\"tool-789\""));
         assert!(json.contains("\"status\":\"success\""));
@@ -178,7 +181,10 @@ mod tests {
         let entry = ToolUseEntry::new("use-123", "read_file")
             .with_input(serde_json::json!({"path": "/test.txt"}));
 
-        let json = serde_json::to_string(&entry).unwrap();
+        let json = match serde_json::to_string(&entry) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert!(json.contains("\"toolUseId\":\"use-123\""));
         assert!(json.contains("\"name\":\"read_file\""));
         assert!(json.contains("\"path\":\"/test.txt\""));

@@ -9,6 +9,12 @@ use axum::{
 };
 use rust_embed::Embed;
 
+fn plain_response(status: StatusCode, body: impl Into<Body>) -> Response<Body> {
+    let mut resp = Response::new(body.into());
+    *resp.status_mut() = status;
+    resp
+}
+
 /// 嵌入前端构建产物
 #[derive(Embed)]
 #[folder = "admin-ui/dist"]
@@ -32,10 +38,16 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
 
     // 安全检查：拒绝包含 .. 的路径
     if path.contains("..") {
-        return Response::builder()
+        return match Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(Body::from("Invalid path"))
-            .expect("Failed to build response");
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::error!("构建 Admin UI 响应失败: {}", e);
+                plain_response(StatusCode::INTERNAL_SERVER_ERROR, Body::from("Internal error"))
+            }
+        };
     }
 
     // 尝试获取请求的文件
@@ -47,12 +59,27 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
         // 根据文件类型设置不同的缓存策略
         let cache_control = get_cache_control(path);
 
-        return Response::builder()
+        return match Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, mime)
             .header(header::CACHE_CONTROL, cache_control)
             .body(Body::from(content.data.into_owned()))
-            .expect("Failed to build response");
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::error!("构建 Admin UI 响应失败: {}", e);
+                match Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from("Internal error"))
+                {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        tracing::error!("构建 Admin UI 响应失败: {}", e);
+                        plain_response(StatusCode::INTERNAL_SERVER_ERROR, Body::from("Internal error"))
+                    }
+                }
+            }
+        };
     }
 
     // SPA fallback: 如果文件不存在且不是资源文件，返回 index.html
@@ -61,27 +88,48 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
     }
 
     // 404
-    Response::builder()
+    match Response::builder()
         .status(StatusCode::NOT_FOUND)
         .body(Body::from("Not found"))
-        .expect("Failed to build response")
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::error!("构建 Admin UI 响应失败: {}", e);
+            plain_response(StatusCode::NOT_FOUND, Body::from("Not found"))
+        }
+    }
 }
 
 /// 提供 index.html
 fn serve_index() -> Response<Body> {
     match Asset::get("index.html") {
-        Some(content) => Response::builder()
+        Some(content) => match Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .header(header::CACHE_CONTROL, "no-cache")
             .body(Body::from(content.data.into_owned()))
-            .expect("Failed to build response"),
-        None => Response::builder()
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::error!("构建 Admin UI 响应失败: {}", e);
+                plain_response(StatusCode::INTERNAL_SERVER_ERROR, Body::from("Internal error"))
+            }
+        },
+        None => match Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from(
                 "Admin UI not built. Run 'pnpm build' in admin-ui directory.",
             ))
-            .expect("Failed to build response"),
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::error!("构建 Admin UI 响应失败: {}", e);
+                plain_response(
+                    StatusCode::NOT_FOUND,
+                    Body::from("Admin UI not built. Run 'pnpm build' in admin-ui directory."),
+                )
+            }
+        },
     }
 }
 

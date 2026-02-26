@@ -1,6 +1,8 @@
+import { useQueryClient } from '@tanstack/react-query'
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
@@ -15,11 +17,26 @@ interface BalanceDialogProps {
 }
 
 export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialogProps) {
+  const queryClient = useQueryClient()
   const { data: balance, isLoading, error } = useCredentialBalance(credentialId)
 
-  const formatDate = (timestamp: number | null) => {
-    if (!timestamp) return '未知'
-    return new Date(timestamp * 1000).toLocaleString('zh-CN')
+  const handleOpenChange = (newOpen: boolean) => {
+    if (!newOpen && credentialId !== null) {
+      // 关闭对话框时，使账户信息查询失效，触发主账户信息卡片刷新
+      queryClient.invalidateQueries({ queryKey: ['credential-account', credentialId] })
+    }
+    onOpenChange(newOpen)
+  }
+
+  const formatDate = (dateStr: string | null) => {
+    if (!dateStr) return '未知'
+    const date = new Date(dateStr)
+    if (isNaN(date.getTime())) return '未知'
+    return date.toLocaleDateString('zh-CN', {
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+    })
   }
 
   const formatNumber = (num: number) => {
@@ -27,12 +44,15 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>
             凭据 #{credentialId} 余额信息
           </DialogTitle>
+          <DialogDescription className="sr-only">
+            查看凭据的使用额度和剩余余额
+          </DialogDescription>
         </DialogHeader>
 
         {isLoading && (

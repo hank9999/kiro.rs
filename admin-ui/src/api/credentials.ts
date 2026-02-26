@@ -6,8 +6,11 @@ import type {
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
+  SetEnabledModelsRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  CredentialStatsResponse,
+  CredentialAccountInfoResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -30,6 +33,12 @@ api.interceptors.request.use((config) => {
 // 获取所有凭据状态
 export async function getCredentials(): Promise<CredentialsStatusResponse> {
   const { data } = await api.get<CredentialsStatusResponse>('/credentials')
+  return data
+}
+
+// 删除指定凭据
+export async function deleteCredential(id: number): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>(`/credentials/${id}`)
   return data
 }
 
@@ -57,6 +66,18 @@ export async function setCredentialPriority(
   return data
 }
 
+// 设置凭据启用模型列表
+export async function setCredentialEnabledModels(
+  id: number,
+  enabledModels: string[]
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/models`,
+    { enabledModels } as SetEnabledModelsRequest
+  )
+  return data
+}
+
 // 重置失败计数
 export async function resetCredentialFailure(
   id: number
@@ -71,6 +92,14 @@ export async function getCredentialBalance(id: number): Promise<BalanceResponse>
   return data
 }
 
+// 获取凭据账号信息（套餐/用量/邮箱等）
+export async function getCredentialAccountInfo(
+  id: number
+): Promise<CredentialAccountInfoResponse> {
+  const { data } = await api.get<CredentialAccountInfoResponse>(`/credentials/${id}/account`)
+  return data
+}
+
 // 添加新凭据
 export async function addCredential(
   req: AddCredentialRequest
@@ -79,9 +108,46 @@ export async function addCredential(
   return data
 }
 
-// 删除凭据
-export async function deleteCredential(id: number): Promise<SuccessResponse> {
-  const { data } = await api.delete<SuccessResponse>(`/credentials/${id}`)
+// 获取指定凭据统计
+export async function getCredentialStats(id: number): Promise<CredentialStatsResponse> {
+  const { data } = await api.get<CredentialStatsResponse>(`/credentials/${id}/stats`)
+  return data
+}
+
+// 清空指定凭据统计
+export async function resetCredentialStats(id: number): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/stats/reset`)
+  return data
+}
+
+// 清空全部统计
+export async function resetAllStats(): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/stats/reset')
+  return data
+}
+
+// ===== 摘要模型设置 =====
+
+export interface SummaryModelResponse {
+  currentModel: string
+  availableModels: string[]
+}
+
+export interface SetSummaryModelRequest {
+  model: string
+}
+
+// 获取摘要模型设置
+export async function getSummaryModel(): Promise<SummaryModelResponse> {
+  const { data } = await api.get<SummaryModelResponse>('/settings/summary-model')
+  return data
+}
+
+// 设置摘要模型
+export async function setSummaryModel(model: string): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/settings/summary-model', {
+    model,
+  } as SetSummaryModelRequest)
   return data
 }
 

@@ -24,7 +24,7 @@ use super::base::EventPayload;
 /// use kiro_rs::kiro::model::events::AssistantResponseEvent;
 ///
 /// let json = r#"{"content":"Hello, world!"}"#;
-/// let event: AssistantResponseEvent = serde_json::from_str(json).unwrap();
+/// let event: AssistantResponseEvent = serde_json::from_str(json).expect("deserialize event");
 /// assert_eq!(event.content, "Hello, world!");
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,7 +69,10 @@ mod tests {
     #[test]
     fn test_deserialize_simple() {
         let json = r#"{"content":"Hello, world!"}"#;
-        let event: AssistantResponseEvent = serde_json::from_str(json).unwrap();
+        let event: AssistantResponseEvent = match serde_json::from_str(json) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert_eq!(event.content, "Hello, world!");
     }
 
@@ -86,7 +89,10 @@ mod tests {
                 "userIntent": "EXPLAIN_CODE_SELECTION"
             }
         }"#;
-        let event: AssistantResponseEvent = serde_json::from_str(json).unwrap();
+        let event: AssistantResponseEvent = match serde_json::from_str(json) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert_eq!(event.content, "Done");
     }
 
@@ -98,7 +104,10 @@ mod tests {
             ..event
         };
 
-        let json = serde_json::to_string(&event).unwrap();
+        let json = match serde_json::to_string(&event) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert!(json.contains("\"content\":\"Test\""));
         // extra 字段不应该被序列化
         assert!(!json.contains("extra"));

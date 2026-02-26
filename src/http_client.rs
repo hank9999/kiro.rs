@@ -49,7 +49,10 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    let mut builder = Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .connect_timeout(Duration::from_secs(30))
+        .tcp_keepalive(Some(Duration::from_secs(60)));
 
     if tls_backend == TlsBackend::Rustls {
         builder = builder.use_rustls_tls();
@@ -59,6 +62,31 @@ pub fn build_client(
         let mut proxy = Proxy::all(&proxy_config.url)?;
 
         // 设置代理认证
+        if let (Some(username), Some(password)) = (&proxy_config.username, &proxy_config.password) {
+            proxy = proxy.basic_auth(username, password);
+        }
+
+        builder = builder.proxy(proxy);
+        tracing::debug!("HTTP Client 使用代理: {}", proxy_config.url);
+    }
+
+    Ok(builder.build()?)
+}
+
+/// 构建用于长连接/流式传输的 HTTP Client
+///
+/// - 关闭总超时（避免流式响应因为整体耗时过长被 reqwest 中断）
+/// - 仍保留 connect_timeout，避免连接阶段无限卡住
+/// - 开启 TCP keepalive，降低中间网络设备断开长连接的概率
+pub fn build_stream_client(proxy: Option<&ProxyConfig>) -> anyhow::Result<Client> {
+    // reqwest 默认不设置总超时；这里不要调用 .timeout(...)，以避免长流式响应被整体 deadline 中断。
+    let mut builder = Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .tcp_keepalive(Some(Duration::from_secs(60)));
+
+    if let Some(proxy_config) = proxy {
+        let mut proxy = Proxy::all(&proxy_config.url)?;
+
         if let (Some(username), Some(password)) = (&proxy_config.username, &proxy_config.password) {
             proxy = proxy.basic_auth(username, password);
         }

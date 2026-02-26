@@ -113,7 +113,11 @@ mod tests {
 
         let result = generate_from_credentials(&credentials, &config);
         assert!(result.is_some());
-        assert_eq!(result.as_ref().unwrap().len(), 64);
+        let len = match result.as_ref() {
+            Some(v) => v.len(),
+            None => 0,
+        };
+        assert_eq!(len, 64);
     }
 
     #[test]

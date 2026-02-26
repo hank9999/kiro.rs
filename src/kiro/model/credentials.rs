@@ -51,6 +51,18 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "is_zero")]
     pub priority: u32,
 
+    /// 账户邮箱（从 API 获取，持久化保存）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_email: Option<String>,
+
+    /// 用户 ID（从 API 获取，持久化保存）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+
+    /// 身份提供商（BuilderId / Github / Google）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -68,6 +80,14 @@ pub struct KiroCredentials {
     /// 未配置时回退到 config.json 的 machineId；都未配置时由 refreshToken 派生
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
+
+    /// 该凭据允许使用的模型列表（可选）。
+    ///
+    /// - `None`：未配置（向后兼容），等价于"允许全部模型"（包括 IdC 默认）。
+    /// - `Some(vec)`：仅允许列表中的模型（建议填写 canonical 模型 ID，如 `claude-sonnet-4.5`）。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled_models: Option<Vec<String>>,
 
     /// 用户邮箱（从 Anthropic API 获取）
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -298,7 +318,10 @@ mod tests {
             "authMethod": "social"
         }"#;
 
-        let creds = KiroCredentials::from_json(json).unwrap();
+        let creds = match KiroCredentials::from_json(json) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert_eq!(creds.access_token, Some("test_token".to_string()));
         assert_eq!(creds.refresh_token, Some("test_refresh".to_string()));
         assert_eq!(creds.profile_arn, Some("arn:aws:test".to_string()));
@@ -313,7 +336,10 @@ mod tests {
             "unknownField": "should be ignored"
         }"#;
 
-        let creds = KiroCredentials::from_json(json).unwrap();
+        let creds = match KiroCredentials::from_json(json) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert_eq!(creds.access_token, Some("test_token".to_string()));
     }
 
@@ -329,10 +355,14 @@ mod tests {
             client_id: None,
             client_secret: None,
             priority: 0,
+            account_email: None,
+            user_id: None,
+            provider: None,
             region: None,
             auth_region: None,
             api_region: None,
             machine_id: None,
+            enabled_models: None,
             email: None,
             subscription_title: None,
             proxy_url: None,
@@ -341,7 +371,10 @@ mod tests {
             disabled: false,
         };
 
-        let json = creds.to_pretty_json().unwrap();
+        let json = match creds.to_pretty_json() {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert!(json.contains("accessToken"));
         assert!(json.contains("authMethod"));
         assert!(!json.contains("refreshToken"));
@@ -360,21 +393,30 @@ mod tests {
     #[test]
     fn test_priority_default() {
         let json = r#"{"refreshToken": "test"}"#;
-        let creds = KiroCredentials::from_json(json).unwrap();
+        let creds = match KiroCredentials::from_json(json) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert_eq!(creds.priority, 0);
     }
 
     #[test]
     fn test_priority_explicit() {
         let json = r#"{"refreshToken": "test", "priority": 5}"#;
-        let creds = KiroCredentials::from_json(json).unwrap();
+        let creds = match KiroCredentials::from_json(json) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert_eq!(creds.priority, 5);
     }
 
     #[test]
     fn test_credentials_config_single() {
         let json = r#"{"refreshToken": "test", "expiresAt": "2025-12-31T00:00:00Z"}"#;
-        let config: CredentialsConfig = serde_json::from_str(json).unwrap();
+        let config: CredentialsConfig = match serde_json::from_str(json) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert!(matches!(config, CredentialsConfig::Single(_)));
         assert_eq!(config.len(), 1);
     }
@@ -385,7 +427,10 @@ mod tests {
             {"refreshToken": "test1", "priority": 1},
             {"refreshToken": "test2", "priority": 0}
         ]"#;
-        let config: CredentialsConfig = serde_json::from_str(json).unwrap();
+        let config: CredentialsConfig = match serde_json::from_str(json) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert!(matches!(config, CredentialsConfig::Multiple(_)));
         assert_eq!(config.len(), 2);
     }
@@ -397,7 +442,10 @@ mod tests {
             {"refreshToken": "t2", "priority": 0},
             {"refreshToken": "t3", "priority": 1}
         ]"#;
-        let config: CredentialsConfig = serde_json::from_str(json).unwrap();
+        let config: CredentialsConfig = match serde_json::from_str(json) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         let list = config.into_sorted_credentials();
 
         // 验证按优先级排序
@@ -447,10 +495,14 @@ mod tests {
             client_id: None,
             client_secret: None,
             priority: 0,
+            account_email: None,
+            user_id: None,
+            provider: None,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
             api_region: None,
             machine_id: None,
+            enabled_models: None,
             email: None,
             subscription_title: None,
             proxy_url: None,
@@ -477,10 +529,14 @@ mod tests {
             client_id: None,
             client_secret: None,
             priority: 0,
+            account_email: None,
+            user_id: None,
+            provider: None,
             region: None,
             auth_region: None,
             api_region: None,
             machine_id: None,
+            enabled_models: None,
             email: None,
             subscription_title: None,
             proxy_url: None,
@@ -589,10 +645,14 @@ mod tests {
             client_id: None,
             client_secret: None,
             priority: 3,
+            account_email: None,
+            user_id: None,
+            provider: None,
             region: Some("us-west-2".to_string()),
             auth_region: None,
             api_region: None,
             machine_id: Some("c".repeat(64)),
+            enabled_models: None,
             email: None,
             subscription_title: None,
             proxy_url: None,

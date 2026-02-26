@@ -25,7 +25,10 @@ use super::conversation::ConversationState;
 ///     ));
 ///
 /// let request = KiroRequest::new(state);
-/// let json = request.to_json().unwrap();
+/// let json = match request.to_json() {
+///     Ok(v) => v,
+///     Err(e) => panic!("{:?}", e),
+/// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,7 +57,10 @@ mod tests {
             }
         }"#;
 
-        let request: KiroRequest = serde_json::from_str(json).unwrap();
+        let request: KiroRequest = match serde_json::from_str(json) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert_eq!(request.conversation_state.conversation_id, "conv-456");
         assert_eq!(
             request

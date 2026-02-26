@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, BarChart3, Trash2, Trash, Loader2 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -17,11 +17,17 @@ import {
 } from '@/components/ui/dialog'
 import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
 import {
+  useDeleteCredential,
   useSetDisabled,
   useSetPriority,
+  useSetEnabledModels,
   useResetFailure,
-  useDeleteCredential,
+  useResetCredentialStats,
+  useCredentialBalance,
 } from '@/hooks/use-credentials'
+import { StatsDialog } from '@/components/stats-dialog'
+import { formatTokensPair } from '@/lib/format'
+import { ALL_MODEL_IDS, MODEL_OPTIONS, normalizeEnabledModels, type SupportedModelId } from '@/lib/models'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
@@ -30,22 +36,6 @@ interface CredentialCardProps {
   onToggleSelect: () => void
   balance: BalanceResponse | null
   loadingBalance: boolean
-}
-
-function formatLastUsed(lastUsedAt: string | null): string {
-  if (!lastUsedAt) return '从未使用'
-  const date = new Date(lastUsedAt)
-  const now = new Date()
-  const diff = now.getTime() - date.getTime()
-  if (diff < 0) return '刚刚'
-  const seconds = Math.floor(diff / 1000)
-  if (seconds < 60) return `${seconds} 秒前`
-  const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes} 分钟前`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours} 小时前`
-  const days = Math.floor(hours / 24)
-  return `${days} 天前`
 }
 
 export function CredentialCard({
@@ -58,12 +48,35 @@ export function CredentialCard({
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
+  const [statsDialogOpen, setStatsDialogOpen] = useState(false)
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [enabledModelsDraft, setEnabledModelsDraft] = useState<SupportedModelId[]>(
+    normalizeEnabledModels(credential.enabledModels)
+  )
 
+  const deleteCredential = useDeleteCredential()
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
+  const setEnabledModels = useSetEnabledModels()
   const resetFailure = useResetFailure()
-  const deleteCredential = useDeleteCredential()
+  const resetStats = useResetCredentialStats()
+  const balanceQuery = useCredentialBalance(credential.id, {
+    refetchInterval: 10 * 60 * 1000, // 每 10 分钟刷新一次
+  })
+
+  useEffect(() => {
+    setEnabledModelsDraft(normalizeEnabledModels(credential.enabledModels))
+  }, [credential.id, credential.enabledModels])
+
+  const saveEnabledModels = () => {
+    setEnabledModels.mutate(
+      { id: credential.id, enabledModels: enabledModelsDraft },
+      {
+        onSuccess: (res) => toast.success(res.message),
+        onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+      }
+    )
+  }
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -128,6 +141,18 @@ export function CredentialCard({
     })
   }
 
+  const formatMoney = (num: number | null | undefined) => {
+    if (num === null || num === undefined) return '-'
+    if (!Number.isFinite(num)) return String(num)
+    return num.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  }
+
+  const formatTime = (t: string | null) => {
+    if (!t) return '从未'
+    const d = new Date(t)
+    if (isNaN(d.getTime())) return t
+    return d.toLocaleString()
+  }
   return (
     <>
       <Card className={credential.isCurrent ? 'ring-2 ring-primary' : ''}>
@@ -157,6 +182,17 @@ export function CredentialCard({
               />
             </div>
           </div>
+          {/* 账户信息：邮箱和用户ID */}
+          {(credential.accountEmail || credential.userId) && (
+            <div className="text-sm text-muted-foreground mt-1">
+              {credential.accountEmail && (
+                <span className="mr-3">{credential.accountEmail}</span>
+              )}
+              {credential.userId && (
+                <span className="text-xs opacity-70">ID: {credential.userId}</span>
+              )}
+            </div>
+          )}
         </CardHeader>
         <CardContent className="space-y-4">
           {/* 信息网格 */}
@@ -222,30 +258,100 @@ export function CredentialCard({
               <span className="font-medium">{credential.successCount}</span>
             </div>
             <div className="col-span-2">
-              <span className="text-muted-foreground">最后调用：</span>
-              <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
+              <span className="text-muted-foreground">模型开关：</span>
+              <div className="mt-2 flex flex-wrap items-center gap-4">
+                {MODEL_OPTIONS.map((m) => {
+                  const checked = enabledModelsDraft.includes(m.id)
+                  return (
+                    <div key={m.id} className="flex items-center gap-2">
+                      <Switch
+                        checked={checked}
+                        onCheckedChange={(v) => {
+                          setEnabledModelsDraft((prev) => {
+                            if (v) return Array.from(new Set([...prev, m.id]))
+                            return prev.filter((x) => x !== m.id)
+                          })
+                        }}
+                        disabled={setEnabledModels.isPending}
+                      />
+                      <span className="text-sm">{m.label}</span>
+                    </div>
+                  )
+                })}
+
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setEnabledModelsDraft([...ALL_MODEL_IDS])}
+                  disabled={setEnabledModels.isPending}
+                >
+                  全选
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setEnabledModelsDraft([])}
+                  disabled={setEnabledModels.isPending}
+                >
+                  全不选
+                </Button>
+                <Button
+                  size="sm"
+                  variant="default"
+                  onClick={saveEnabledModels}
+                  disabled={setEnabledModels.isPending}
+                >
+                  保存
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground mt-1">
+                未配置时默认全开；保存会写回 credentials.json（多凭据数组格式才会回写）。
+              </p>
             </div>
             <div className="col-span-2">
-              <span className="text-muted-foreground">剩余用量：</span>
-              {loadingBalance ? (
-                <span className="text-sm ml-1">
-                  <Loader2 className="inline w-3 h-3 animate-spin" /> 加载中...
-                </span>
-              ) : balance ? (
-                <span className="font-medium ml-1">
-                  {balance.remaining.toFixed(2)} / {balance.usageLimit.toFixed(2)}
-                  <span className="text-xs text-muted-foreground ml-1">
-                    ({(100 - balance.usagePercentage).toFixed(1)}% 剩余)
+              <span className="text-muted-foreground">调用次数：</span>
+              <span className="font-medium ml-1">总 {credential.callsTotal}</span>
+              <span className="text-green-600 font-medium ml-3">成功 {credential.callsOk}</span>
+              <span className={credential.callsErr > 0 ? 'text-red-500 font-medium ml-3' : 'font-medium ml-3'}>
+                失败 {credential.callsErr}
+              </span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">累计 Tokens：</span>
+              <span className="font-medium">
+                {formatTokensPair(credential.inputTokensTotal, credential.outputTokensTotal)}
+              </span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">用量：</span>
+              {balanceQuery.isLoading ? (
+                <span className="text-muted-foreground">加载中...</span>
+              ) : balanceQuery.error ? (
+                <span className="text-red-500 font-medium">获取失败</span>
+              ) : balanceQuery.data ? (
+                <span className="font-medium">
+                  ${formatMoney(balanceQuery.data.currentUsage)} / ${formatMoney(balanceQuery.data.usageLimit)}
+                  <span className="text-xs text-muted-foreground ml-2">
+                    ({balanceQuery.data.usagePercentage.toFixed(1)}%)
                   </span>
                 </span>
               ) : (
-                <span className="text-sm text-muted-foreground ml-1">未知</span>
+                <span className="text-muted-foreground">-</span>
               )}
             </div>
-            {credential.hasProxy && (
+            <div className="col-span-2">
+              <span className="text-muted-foreground">最后调用：</span>
+              <span className="font-medium">{formatTime(credential.lastCallAt)}</span>
+            </div>
+            {credential.lastError && (
               <div className="col-span-2">
-                <span className="text-muted-foreground">代理：</span>
-                <span className="font-medium">{credential.proxyUrl}</span>
+                <span className="text-muted-foreground">最后错误：</span>
+                <span className="text-red-500 font-medium">
+                  {credential.lastErrorAt ? `${formatTime(credential.lastErrorAt)} - ` : ''}
+                  {credential.lastError.length > 160
+                    ? credential.lastError.slice(0, 160) + '...'
+                    : credential.lastError}
+                </span>
               </div>
             )}
             {credential.hasProfileArn && (
@@ -256,71 +362,116 @@ export function CredentialCard({
           </div>
 
           {/* 操作按钮 */}
-          <div className="flex flex-wrap gap-2 pt-2 border-t">
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={handleReset}
-              disabled={resetFailure.isPending || credential.failureCount === 0}
-            >
-              <RefreshCw className="h-4 w-4 mr-1" />
-              重置失败
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => {
-                const newPriority = Math.max(0, credential.priority - 1)
-                setPriority.mutate(
-                  { id: credential.id, priority: newPriority },
-                  {
+          <div className="pt-3 border-t space-y-2">
+            {/* 第一行：常规操作 */}
+            <div className="grid grid-cols-4 gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                className="w-full"
+                onClick={handleReset}
+                disabled={resetFailure.isPending || credential.failureCount === 0}
+              >
+                <RefreshCw className="h-4 w-4 mr-1" />
+                重置失败
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="w-full"
+                onClick={() => {
+                  const newPriority = Math.max(0, credential.priority - 1)
+                  setPriority.mutate(
+                    { id: credential.id, priority: newPriority },
+                    {
+                      onSuccess: (res) => toast.success(res.message),
+                      onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+                    }
+                  )
+                }}
+                disabled={setPriority.isPending || credential.priority === 0}
+              >
+                <ChevronUp className="h-4 w-4 mr-1" />
+                提高优先级
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="w-full"
+                onClick={() => {
+                  const newPriority = credential.priority + 1
+                  setPriority.mutate(
+                    { id: credential.id, priority: newPriority },
+                    {
+                      onSuccess: (res) => toast.success(res.message),
+                      onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+                    }
+                  )
+                }}
+                disabled={setPriority.isPending}
+              >
+                <ChevronDown className="h-4 w-4 mr-1" />
+                降低优先级
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="w-full"
+                onClick={() => setStatsDialogOpen(true)}
+              >
+                <BarChart3 className="h-4 w-4 mr-1" />
+                统计详情
+              </Button>
+            </div>
+            {/* 第二行：危险操作 + 查看余额 */}
+            <div className="grid grid-cols-3 gap-2">
+              <Button
+                size="sm"
+                variant="destructive"
+                className="w-full"
+                onClick={() => setShowDeleteDialog(true)}
+                disabled={deleteCredential.isPending}
+              >
+                <Trash className="h-4 w-4 mr-1" />
+                删除凭据
+              </Button>
+              <Button
+                size="sm"
+                variant="destructive"
+                className="w-full"
+                onClick={() => {
+                  const ok = window.confirm(`确定清空凭据 #${credential.id} 的统计吗？此操作不可恢复。`)
+                  if (!ok) return
+                  resetStats.mutate(credential.id, {
                     onSuccess: (res) => toast.success(res.message),
                     onError: (err) => toast.error('操作失败: ' + (err as Error).message),
-                  }
-                )
-              }}
-              disabled={setPriority.isPending || credential.priority === 0}
-            >
-              <ChevronUp className="h-4 w-4 mr-1" />
-              提高优先级
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => {
-                const newPriority = credential.priority + 1
-                setPriority.mutate(
-                  { id: credential.id, priority: newPriority },
-                  {
-                    onSuccess: (res) => toast.success(res.message),
-                    onError: (err) => toast.error('操作失败: ' + (err as Error).message),
-                  }
-                )
-              }}
-              disabled={setPriority.isPending}
-            >
-              <ChevronDown className="h-4 w-4 mr-1" />
-              降低优先级
-            </Button>
-            <Button
-              size="sm"
-              variant="default"
-              onClick={() => onViewBalance(credential.id)}
-            >
-              <Wallet className="h-4 w-4 mr-1" />
-              查看余额
-            </Button>
-            <Button
-              size="sm"
-              variant="destructive"
-              onClick={() => setShowDeleteDialog(true)}
-              disabled={!credential.disabled}
-              title={!credential.disabled ? '需要先禁用凭据才能删除' : undefined}
-            >
-              <Trash2 className="h-4 w-4 mr-1" />
-              删除
-            </Button>
+                  })
+                }}
+                disabled={resetStats.isPending}
+              >
+                <Trash2 className="h-4 w-4 mr-1" />
+                清空统计
+              </Button>
+              <Button
+                size="sm"
+                variant="default"
+                className="w-full"
+                onClick={() => {
+                  void balanceQuery.refetch()
+                  onViewBalance(credential.id)
+                }}
+              >
+                <Wallet className="h-4 w-4 mr-1" />
+                查看余额
+              </Button>
+            </div>
           </div>
+
+          <StatsDialog
+            credentialId={credential.id}
+            open={statsDialogOpen}
+            onOpenChange={setStatsDialogOpen}
+          />
         </CardContent>
       </Card>
 
@@ -330,7 +481,12 @@ export function CredentialCard({
           <DialogHeader>
             <DialogTitle>确认删除凭据</DialogTitle>
             <DialogDescription>
-              您确定要删除凭据 #{credential.id} 吗？此操作无法撤销。
+              您确定要删除凭据 #{credential.id} 吗？此操作无法撤销，且会从凭据文件中移除。
+              {credential.isCurrent && (
+                <span className="block mt-2 text-yellow-600">
+                  注意：这是当前凭据，删除后会自动切换到其他可用凭据；如果没有可用凭据，将变为无凭据状态。
+                </span>
+              )}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
