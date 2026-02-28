@@ -1342,6 +1342,48 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 强制刷新指定凭据的 Token（Admin API）
+    ///
+    /// 无论 token 是否即将过期，都强制执行一次刷新。
+    /// 用于 feeder keepalive 场景，确保 refreshToken 不会因过期而失效。
+    pub async fn force_refresh_token(&self, id: u64) -> anyhow::Result<bool> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        let _guard = self.refresh_lock.lock().await;
+        let current_creds = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        let old_refresh_token = current_creds.refresh_token.clone();
+        let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+        let new_creds =
+            refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+
+        let got_new_refresh_token = new_creds.refresh_token != old_refresh_token;
+
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.credentials = new_creds;
+            }
+        }
+        self.persist_credentials()?;
+
+        Ok(got_new_refresh_token)
+    }
+
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
         let credentials = {

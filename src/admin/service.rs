@@ -231,6 +231,13 @@ impl AdminService {
     }
 
     /// 删除凭据
+    pub async fn force_refresh_token(&self, id: u64) -> Result<bool, AdminServiceError> {
+        self.token_manager
+            .force_refresh_token(id)
+            .await
+            .map_err(|e| self.classify_error(e, id))
+    }
+
     pub fn delete_credential(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
             .delete_credential(id)
