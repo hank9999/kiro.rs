@@ -7,8 +7,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "127.0.0.1:8990:8990"
+      - "8990:8990"
     volumes:
-      - ./config.json:/app/config/config.json
-      - ./credentials.json:/app/config/credentials.json
+      - ./config/:/app/config/
     restart: unless-stopped

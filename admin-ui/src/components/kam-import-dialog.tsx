@@ -11,7 +11,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
 import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
-import { extractErrorMessage } from '@/lib/utils'
+import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 
 interface KamImportDialogProps {
   open: boolean
@@ -46,12 +46,7 @@ interface VerificationResult {
   rollbackError?: string
 }
 
-async function sha256Hex(value: string): Promise<string> {
-  const encoded = new TextEncoder().encode(value)
-  const digest = await crypto.subtle.digest('SHA-256', encoded)
-  const bytes = new Uint8Array(digest)
-  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('')
-}
+
 
 // 校验元素是否为有效的 KAM 账号结构
 function isValidKamAccount(item: unknown): item is KamAccount {
@@ -132,6 +127,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   }
 
   const handleImport = async () => {
+    // 先单独解析 JSON，给出精准的错误提示
+    let validAccounts: KamAccount[]
     try {
       const accounts = parseKamJson(jsonInput)
 
@@ -140,12 +137,17 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         return
       }
 
-      // 过滤无效账号
-      const validAccounts = accounts.filter(a => a.credentials?.refreshToken)
+      validAccounts = accounts.filter(a => a.credentials?.refreshToken)
       if (validAccounts.length === 0) {
         toast.error('没有包含有效 refreshToken 的账号')
         return
       }
+    } catch (error) {
+      toast.error('JSON 格式错误: ' + extractErrorMessage(error))
+      return
+    }
+
+    try {
 
       setImporting(true)
       setProgress({ current: 0, total: validAccounts.length })
@@ -297,7 +299,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         toast.info(`导入完成：${parts.join('，')}`)
       }
     } catch (error) {
-      toast.error('JSON 格式错误: ' + extractErrorMessage(error))
+      toast.error('导入失败: ' + extractErrorMessage(error))
     } finally {
       setImporting(false)
     }
