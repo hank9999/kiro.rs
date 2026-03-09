@@ -176,8 +176,6 @@ async fn refresh_social_token(
 
     let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
     let refresh_domain = format!("prod.{}.auth.desktop.kiro.dev", region);
-    let machine_id = machine_id::generate_from_credentials(credentials, config)
-        .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
     let kiro_version = &config.kiro_version;
 
     let client = build_client(proxy, 60, config.tls_backend)?;
@@ -191,7 +189,7 @@ async fn refresh_social_token(
         .header("Content-Type", "application/json")
         .header(
             "User-Agent",
-            format!("KiroIDE-{}-{}", kiro_version, machine_id),
+            format!("Kiro-CLI/{}", kiro_version),
         )
         .header("Accept-Encoding", "gzip, compress, deflate, br")
         .header("host", &refresh_domain)
@@ -235,7 +233,7 @@ async fn refresh_social_token(
 }
 
 /// IdC Token 刷新所需的 x-amz-user-agent header
-const IDC_AMZ_USER_AGENT: &str = "aws-sdk-js/3.738.0 ua/2.1 os/other lang/js md/browser#unknown_unknown api/sso-oidc#3.738.0 m/E KiroIDE";
+const IDC_AMZ_USER_AGENT: &str = "aws-sdk-rust/1.92.0 ua/2.1 os/other lang/rust#1.92.0 api/sso-oidc#1.50.0 m/E app/Kiro-CLI";
 
 /// 刷新 IdC Token (AWS SSO OIDC)
 async fn refresh_idc_token(
@@ -313,7 +311,7 @@ async fn refresh_idc_token(
 }
 
 /// getUsageLimits API 所需的 x-amz-user-agent header 前缀
-const USAGE_LIMITS_AMZ_USER_AGENT_PREFIX: &str = "aws-sdk-js/1.0.0";
+const USAGE_LIMITS_AMZ_USER_AGENT_PREFIX: &str = "aws-sdk-rust/1.92.0";
 
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
@@ -327,8 +325,6 @@ pub(crate) async fn get_usage_limits(
     // 优先级：凭据.api_region > config.api_region > config.region
     let region = credentials.effective_api_region(config);
     let host = format!("q.{}.amazonaws.com", region);
-    let machine_id = machine_id::generate_from_credentials(credentials, config)
-        .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
     let kiro_version = &config.kiro_version;
 
     // 构建 URL
@@ -344,13 +340,13 @@ pub(crate) async fn get_usage_limits(
 
     // 构建 User-Agent headers
     let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/darwin#24.6.0 lang/js md/nodejs#22.21.1 \
-         api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        kiro_version, machine_id
+        "aws-sdk-rust/1.92.0 ua/2.1 os/macos#24.6.0 lang/rust#1.92.0 \
+         api/codewhispererruntime#1.50.0 m/N,E app/Kiro-CLI#{}",
+        kiro_version
     );
     let amz_user_agent = format!(
-        "{} KiroIDE-{}-{}",
-        USAGE_LIMITS_AMZ_USER_AGENT_PREFIX, kiro_version, machine_id
+        "{} app/Kiro-CLI#{}",
+        USAGE_LIMITS_AMZ_USER_AGENT_PREFIX, kiro_version
     );
 
     let client = build_client(proxy, 60, config.tls_backend)?;

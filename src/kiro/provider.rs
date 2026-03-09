@@ -13,7 +13,7 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::http_client::{ProxyConfig, build_client};
-use crate::kiro::machine_id;
+
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{CallContext, MultiTokenManager};
 use crate::model::config::TlsBackend;
@@ -149,18 +149,17 @@ impl KiroProvider {
     fn build_headers(&self, ctx: &CallContext) -> anyhow::Result<HeaderMap> {
         let config = self.token_manager.config();
 
-        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config)
-            .ok_or_else(|| anyhow::anyhow!("无法生成 machine_id，请检查凭证配置"))?;
-
         let kiro_version = &config.kiro_version;
         let os_name = &config.system_version;
-        let node_version = &config.node_version;
 
-        let x_amz_user_agent = format!("aws-sdk-js/1.0.27 KiroIDE-{}-{}", kiro_version, machine_id);
+        let x_amz_user_agent = format!(
+            "aws-sdk-rust/1.92.0 ua/2.1 os/{} lang/rust#1.92.0 api/codewhispererstreaming#1.50.0 m/E app/Kiro-CLI#{}",
+            os_name, kiro_version
+        );
 
         let user_agent = format!(
-            "aws-sdk-js/1.0.27 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.27 m/E KiroIDE-{}-{}",
-            os_name, node_version, kiro_version, machine_id
+            "aws-sdk-rust/1.92.0 ua/2.1 os/{} lang/rust#1.92.0 md/http#reqwest api/codewhispererstreaming#1.50.0 m/E app/Kiro-CLI#{}",
+            os_name, kiro_version
         );
 
         let mut headers = HeaderMap::new();
@@ -201,18 +200,17 @@ impl KiroProvider {
     fn build_mcp_headers(&self, ctx: &CallContext) -> anyhow::Result<HeaderMap> {
         let config = self.token_manager.config();
 
-        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config)
-            .ok_or_else(|| anyhow::anyhow!("无法生成 machine_id，请检查凭证配置"))?;
-
         let kiro_version = &config.kiro_version;
         let os_name = &config.system_version;
-        let node_version = &config.node_version;
 
-        let x_amz_user_agent = format!("aws-sdk-js/1.0.27 KiroIDE-{}-{}", kiro_version, machine_id);
+        let x_amz_user_agent = format!(
+            "aws-sdk-rust/1.92.0 ua/2.1 os/{} lang/rust#1.92.0 api/codewhispererstreaming#1.50.0 m/E app/Kiro-CLI#{}",
+            os_name, kiro_version
+        );
 
         let user_agent = format!(
-            "aws-sdk-js/1.0.27 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.27 m/E KiroIDE-{}-{}",
-            os_name, node_version, kiro_version, machine_id
+            "aws-sdk-rust/1.92.0 ua/2.1 os/{} lang/rust#1.92.0 md/http#reqwest api/codewhispererstreaming#1.50.0 m/E app/Kiro-CLI#{}",
+            os_name, kiro_version
         );
 
         let mut headers = HeaderMap::new();
