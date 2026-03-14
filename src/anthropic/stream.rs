@@ -224,13 +224,13 @@ impl BlockState {
 #[derive(Debug)]
 pub struct SseStateManager {
     /// message_start 是否已发送
-    message_started: bool,
+    pub message_started: bool,
     /// message_delta 是否已发送
-    message_delta_sent: bool,
+    pub message_delta_sent: bool,
     /// 活跃的内容块状态
     active_blocks: HashMap<i32, BlockState>,
     /// 消息是否已结束
-    message_ended: bool,
+    pub message_ended: bool,
     /// 下一个块索引
     next_block_index: i32,
     /// 当前 stop_reason
@@ -288,7 +288,6 @@ impl SseStateManager {
             .values()
             .any(|b| b.block_type != "thinking")
     }
-
     /// 获取最终的 stop_reason
     pub fn get_stop_reason(&self) -> String {
         if let Some(ref reason) = self.stop_reason {
@@ -399,6 +398,32 @@ impl SseStateManager {
         None
     }
 
+    /// 生成中间状态的 message_delta (仅包含 usage)
+    /// 用于在流过程中实时反馈 token 使用情况
+    pub fn handle_message_delta_usage(
+        &mut self,
+        input_tokens: i32,
+        output_tokens: i32,
+    ) -> Option<SseEvent> {
+        // 注意：这里不设置 self.message_delta_sent = true
+        // 因为这是一个中间状态的 delta，最终的 delta (带 stop_reason) 还在 generate_final_events 中发送
+        
+        Some(SseEvent::new(
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": null,
+                    "stop_sequence": null
+                },
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens
+                }
+            }),
+        ))
+    }
+
     /// 生成最终事件序列
     pub fn generate_final_events(
         &mut self,
@@ -453,8 +478,11 @@ impl SseStateManager {
     }
 }
 
-/// 上下文窗口大小（200k tokens）
+/// Claude Code 上下文窗口大小（200k tokens）
 const CONTEXT_WINDOW_SIZE: i32 = 200_000;
+
+/// 输出警告的上下文使用率阈值（百分比）
+const CONTEXT_WARNING_THRESHOLD: f64 = 80.0;
 
 /// 流处理上下文
 pub struct StreamContext {
@@ -468,10 +496,16 @@ pub struct StreamContext {
     pub input_tokens: i32,
     /// 从 contextUsageEvent 计算的实际输入 tokens
     pub context_input_tokens: Option<i32>,
+    /// 上下文使用百分比（从 contextUsageEvent 获取）
+    pub context_usage_percentage: Option<f64>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
+    /// 工具名称缓存 (tool_use_id -> tool_name)，用于处理分片事件缺失 name 的情况
+    pub tool_names: HashMap<String, String>,
+    /// 工具是否收到过 input (tool_use_id -> has_input)
+    pub tool_has_input: HashMap<String, bool>,
     /// thinking 是否启用
     pub thinking_enabled: bool,
     /// thinking 内容缓冲区
@@ -484,6 +518,10 @@ pub struct StreamContext {
     pub thinking_block_index: Option<i32>,
     /// 文本块索引（thinking 启用时动态分配）
     pub text_block_index: Option<i32>,
+    /// 是否收到上游错误事件（用于触发重试）
+    pub received_upstream_error: bool,
+    /// 上游错误消息
+    pub upstream_error_message: Option<String>,
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
@@ -502,14 +540,19 @@ impl StreamContext {
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_tokens,
             context_input_tokens: None,
+            context_usage_percentage: None,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
+            tool_names: HashMap::new(),
+            tool_has_input: HashMap::new(),
             thinking_enabled,
             thinking_buffer: String::new(),
             in_thinking_block: false,
             thinking_extracted: false,
             thinking_block_index: None,
             text_block_index: None,
+            received_upstream_error: false,
+            upstream_error_message: None,
             strip_thinking_leading_newline: false,
         }
     }
@@ -579,22 +622,59 @@ impl StreamContext {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(context_usage) => {
-                // 从上下文使用百分比计算实际的 input_tokens
-                // 公式: percentage * 200000 / 100 = percentage * 2000
-                let actual_input_tokens = (context_usage.context_usage_percentage
+                // 保存上下文使用百分比
+                self.context_usage_percentage = Some(context_usage.context_usage_percentage);
+                
+                // 用 200K 窗口计算实际使用的 tokens
+                // 公式: percentage * 200000 / 100
+                let actual_tokens = (context_usage.context_usage_percentage
                     * (CONTEXT_WINDOW_SIZE as f64)
                     / 100.0) as i32;
-                self.context_input_tokens = Some(actual_input_tokens);
+
+                self.context_input_tokens = Some(actual_tokens);
+
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                 if context_usage.context_usage_percentage >= 100.0 {
                     self.state_manager
                         .set_stop_reason("model_context_window_exceeded");
                 }
                 tracing::debug!(
-                    "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
+                    "contextUsageEvent: {:.1}% -> {} tokens",
                     context_usage.context_usage_percentage,
-                    actual_input_tokens
+                    actual_tokens
                 );
+
+                // 立即发送 message_delta 更新 usage
+                // 这对于让 Claude Code 实时感知上下文变化至关重要（例如触发 /compact）
+                // 只有当消息已经开始且未结束时发送
+                if self.state_manager.message_started && !self.state_manager.message_ended {
+                    let usage_delta_event = self.state_manager.handle_message_delta_usage(
+                        actual_tokens,
+                        self.output_tokens // 使用当前的 output_tokens
+                    );
+                    if let Some(event) = usage_delta_event {
+                         return vec![event];
+                    }
+                }
+                
+                // 当上下文使用率 >= 80% 时，插入一条警告消息给 Claude Code 显示
+                if context_usage.context_usage_percentage >= CONTEXT_WARNING_THRESHOLD {
+                    tracing::warn!(
+                        "上下文使用率 {:.1}% 超过阈值，插入警告消息",
+                        context_usage.context_usage_percentage
+                    );
+                    
+                    // 创建警告文本
+                    let warning_text = format!(
+                        "\n\n⚠️ **上下文告急**: 当前使用率 {:.1}% ({} / 200K tokens)，建议使用 `/compact` 压缩对话历史。\n\n",
+                        context_usage.context_usage_percentage,
+                        actual_tokens
+                    );
+                    
+                    // 返回一个 text_delta 事件
+                    return self.create_text_delta_events(&warning_text);
+                }
+                
                 Vec::new()
             }
             Event::Error {
@@ -602,17 +682,19 @@ impl StreamContext {
                 error_message,
             } => {
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                // 标记收到上游错误，用于触发重试
+                self.received_upstream_error = true;
+                self.upstream_error_message = Some(format!("{}: {}", error_code, error_message));
                 Vec::new()
             }
             Event::Exception {
                 exception_type,
                 message,
             } => {
-                // 处理 ContentLengthExceededException
-                if exception_type == "ContentLengthExceededException" {
-                    self.state_manager.set_stop_reason("max_tokens");
-                }
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                // 标记收到上游错误，用于触发重试
+                self.received_upstream_error = true;
+                self.upstream_error_message = Some(format!("{}: {}", exception_type, message));
                 Vec::new()
             }
             _ => Vec::new(),
@@ -930,6 +1012,25 @@ impl StreamContext {
             idx
         };
 
+        // 更新/获取工具名称缓存：Kiro 的 toolUseEvent 可能在后续分片缺失 name
+        if !tool_use.name.is_empty() {
+            self.tool_names
+                .insert(tool_use.tool_use_id.clone(), tool_use.name.clone());
+        }
+
+        let tool_name = if !tool_use.name.is_empty() {
+            tool_use.name.clone()
+        } else if let Some(name) = self.tool_names.get(&tool_use.tool_use_id) {
+            name.clone()
+        } else {
+            tracing::warn!(
+                message_id = %self.message_id,
+                tool_use_id = %tool_use.tool_use_id,
+                "toolUseEvent 缺少 name，且未找到缓存"
+            );
+            String::new()
+        };
+
         // 发送 content_block_start
         let start_events = self.state_manager.handle_content_block_start(
             block_index,
@@ -940,7 +1041,7 @@ impl StreamContext {
                 "content_block": {
                     "type": "tool_use",
                     "id": tool_use.tool_use_id,
-                    "name": tool_use.name,
+                    "name": tool_name,
                     "input": {}
                 }
             }),
@@ -949,6 +1050,7 @@ impl StreamContext {
 
         // 发送参数增量 (ToolUseEvent.input 是 String 类型)
         if !tool_use.input.is_empty() {
+            self.tool_has_input.insert(tool_use.tool_use_id.clone(), true);
             self.output_tokens += (tool_use.input.len() as i32 + 3) / 4; // 估算 token
 
             if let Some(delta_event) = self.state_manager.handle_content_block_delta(
@@ -968,6 +1070,17 @@ impl StreamContext {
 
         // 如果是完整的工具调用（stop=true），发送 content_block_stop
         if tool_use.stop {
+            // 检查是否收到过任何 input
+            let has_input = self.tool_has_input.get(&tool_use.tool_use_id).copied().unwrap_or(false);
+            if !has_input {
+                tracing::error!(
+                    message_id = %self.message_id,
+                    tool_use_id = %tool_use.tool_use_id,
+                    tool_name = %tool_name,
+                    "工具调用完成但未收到任何 input，客户端将收到空 input"
+                );
+            }
+
             if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
                 events.push(stop_event);
             }
@@ -1055,11 +1168,24 @@ impl StreamContext {
 
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        let final_output_tokens = self.output_tokens;
+        
+        // 记录最终的 token 统计
+        tracing::info!(
+            message_id = %self.message_id,
+            context_usage_percentage = ?self.context_usage_percentage,
+            estimated_input_tokens = self.input_tokens,
+            context_input_tokens = ?self.context_input_tokens,
+            final_input_tokens = final_input_tokens,
+            final_output_tokens = final_output_tokens,
+            received_upstream_error = self.received_upstream_error,
+            "流结束，返回给 Claude Code 的 usage"
+        );
 
         // 生成最终事件
         events.extend(
             self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens),
+                .generate_final_events(final_input_tokens, final_output_tokens),
         );
         events
     }
@@ -1126,6 +1252,14 @@ impl BufferedStreamContext {
     /// 2. 用正确的 input_tokens 更正 message_start 事件
     /// 3. 返回所有缓冲的事件
     pub fn finish_and_get_all_events(&mut self) -> Vec<SseEvent> {
+        let (events, _, _) = self.finish_and_get_all_events_with_tokens();
+        events
+    }
+
+    /// 完成流处理并返回所有事件及 token 统计
+    ///
+    /// 返回值：(事件列表, input_tokens, output_tokens)
+    pub fn finish_and_get_all_events_with_tokens(&mut self) -> (Vec<SseEvent>, i32, i32) {
         // 如果从未处理过事件，也要生成初始事件
         if !self.initial_events_generated {
             let initial_events = self.inner.generate_initial_events();
@@ -1143,6 +1277,8 @@ impl BufferedStreamContext {
             .context_input_tokens
             .unwrap_or(self.estimated_input_tokens);
 
+        let output_tokens = self.inner.output_tokens;
+
         // 更正 message_start 事件中的 input_tokens
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
@@ -1154,7 +1290,17 @@ impl BufferedStreamContext {
             }
         }
 
-        std::mem::take(&mut self.event_buffer)
+        (std::mem::take(&mut self.event_buffer), final_input_tokens, output_tokens)
+    }
+
+    /// 检查是否收到上游错误
+    pub fn has_upstream_error(&self) -> bool {
+        self.inner.received_upstream_error
+    }
+
+    /// 获取上游错误消息
+    pub fn get_upstream_error_message(&self) -> Option<String> {
+        self.inner.upstream_error_message.clone()
     }
 }
 
@@ -1239,9 +1385,10 @@ mod tests {
                     && e.data["content_block"]["type"] == "text")
         );
 
-        let initial_text_index = ctx
-            .text_block_index
-            .expect("initial text block index should exist");
+        let initial_text_index = match ctx.text_block_index {
+            Some(v) => v,
+            None => panic!("initial text block index should exist"),
+        };
 
         // tool_use 开始会自动关闭现有 text block
         let tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
@@ -1267,12 +1414,13 @@ mod tests {
                 None
             }
         });
-        assert!(
-            new_text_start_index.is_some(),
-            "should start a new text block"
-        );
+        assert!(new_text_start_index.is_some(), "should start a new text block");
+        let new_text_start_index = match new_text_start_index {
+            Some(v) => v,
+            None => panic!("should start a new text block"),
+        };
         assert_ne!(
-            new_text_start_index.unwrap(),
+            new_text_start_index,
             initial_text_index as i64,
             "new text block index should differ from the stopped one"
         );
@@ -1346,9 +1494,18 @@ mod tests {
         );
         assert!(pos_tool_start.is_some(), "should start tool_use block");
 
-        let pos_text_delta = pos_text_delta.unwrap();
-        let pos_text_stop = pos_text_stop.unwrap();
-        let pos_tool_start = pos_tool_start.unwrap();
+        let pos_text_delta = match pos_text_delta {
+            Some(v) => v,
+            None => panic!("should flush buffered text as text_delta"),
+        };
+        let pos_text_stop = match pos_text_stop {
+            Some(v) => v,
+            None => panic!("should stop text block before tool_use block starts"),
+        };
+        let pos_tool_start = match pos_tool_start {
+            Some(v) => v,
+            None => panic!("should start tool_use block"),
+        };
 
         assert!(
             pos_text_delta < pos_text_stop && pos_text_stop < pos_tool_start,

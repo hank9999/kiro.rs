@@ -41,10 +41,10 @@
 - **WebSearch**: 内置 WebSearch 工具转换逻辑
 - **多模型支持**: 支持 Sonnet、Opus、Haiku 系列模型
 - **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询等
+- **Admin UI**: 内置管理面板，支持凭据管理和账号信息查询
+- **账号信息**: 通过 Kiro Web Portal API 获取套餐、用量等详细信息
 - **多级 Region 配置**: 支持全局和凭据级别的 Auth Region / API Region 配置
 - **凭据级代理**: 支持为每个凭据单独配置 HTTP/SOCKS5 代理，优先级：凭据代理 > 全局代理 > 无代理
-
----
 
 - [开始](#开始)
   - [1. 编译](#1-编译)
@@ -72,7 +72,11 @@
 - [License](#license)
 - [致谢](#致谢)
 
+---
+
 ## 开始
+
+## 快速开始
 
 ### 1. 编译
 
@@ -385,6 +389,144 @@ RUST_LOG=debug ./target/release/kiro-rs
 > - `/v1/messages`：实时流式返回，`message_start` 中的 `input_tokens` 是估算值
 > - `/cc/v1/messages`：缓冲模式，等待上游流完成后，用从 `contextUsageEvent` 计算的准确 `input_tokens` 更正 `message_start`，然后一次性返回所有事件
 > - 等待期间会每 25 秒发送 `ping` 事件保活
+
+### config.json
+
+| 字段 | 类型 | 默认值 | 描述                      |
+|------|------|--------|-------------------------|
+| `host` | string | `127.0.0.1` | 服务监听地址                  |
+| `port` | number | `8080` | 服务监听端口                  |
+| `apiKey` | string | - | 自定义 API Key（用于客户端认证，必配） |
+| `region` | string | `us-east-1` | AWS 区域                  |
+| `kiroVersion` | string | `0.8.0` | Kiro 版本号                |
+| `machineId` | string | - | 自定义机器码（64位十六进制）不定义则自动生成 |
+| `systemVersion` | string | 随机 | 系统版本标识                  |
+| `nodeVersion` | string | `22.21.1` | Node.js 版本标识            |
+| `tlsBackend` | string | `rustls` | TLS 后端：`rustls` 或 `native-tls` |
+| `countTokensApiUrl` | string | - | 外部 count_tokens API 地址（可选） |
+| `countTokensApiKey` | string | - | 外部 count_tokens API 密钥（可选） |
+| `countTokensAuthType` | string | `x-api-key` | 外部 API 认证类型：`x-api-key` 或 `bearer` |
+| `proxyUrl` | string | - | HTTP/SOCKS5 代理地址（可选） |
+| `proxyUsername` | string | - | 代理用户名（可选） |
+| `proxyPassword` | string | - | 代理密码（可选） |
+| `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API, 填写后才会启用web管理（可选） |
+
+### credentials.json
+
+支持单对象格式（向后兼容）或数组格式（多凭据）。
+
+| 字段 | 类型 | 描述                      |
+|------|------|-------------------------|
+| `id` | number | 凭据唯一 ID（可选，仅用于 Admin API 管理；手写文件可不填） |
+| `accessToken` | string | OAuth 访问令牌（可选，可自动刷新）    |
+| `refreshToken` | string | OAuth 刷新令牌              |
+| `profileArn` | string | AWS Profile ARN（可选，登录时返回） |
+| `expiresAt` | string | Token 过期时间 (RFC3339)    |
+| `authMethod` | string | 认证方式（`social` / `idc`） |
+| `clientId` | string | IdC 登录的客户端 ID（可选）      |
+| `clientSecret` | string | IdC 登录的客户端密钥（可选）      |
+| `priority` | number | 凭据优先级，数字越小越优先，默认为 0（多凭据格式时有效）|
+| `region` | string | 凭据级 region（可选），用于 OIDC token 刷新时指定 endpoint 的区域。未配置时回退到 config.json 的 region。注意：API 调用始终使用 config.json 的 region |
+| `machineId` | string | 凭据级机器码（可选，64位十六进制）。未配置时回退到 config.json 的 machineId；都未配置时由 refreshToken 派生 |
+
+说明：
+- IdC / Builder-ID / IAM 在本项目里属于同一种登录方式，配置时统一使用 `authMethod: "idc"`
+- 为兼容旧配置，`builder-id` / `iam` 仍可被识别，但会按 `idc` 处理
+
+## 模型映射
+
+| Anthropic 模型 | Kiro 模型 |
+|----------------|-----------|
+| `*sonnet*` | `claude-sonnet-4.5` |
+| `*opus*` | `claude-opus-4.5` |
+| `*haiku*` | `claude-haiku-4.5` |
+
+## 项目结构
+
+```
+kiro-rs/
+├── src/
+│   ├── main.rs                 # 程序入口
+│   ├── model/                  # 配置和参数模型
+│   │   ├── config.rs           # 应用配置
+│   │   └── arg.rs              # 命令行参数
+│   ├── anthropic/              # Anthropic API 兼容层
+│   │   ├── router.rs           # 路由配置
+│   │   ├── handlers.rs         # 请求处理器
+│   │   ├── middleware.rs       # 认证中间件
+│   │   ├── types.rs            # 类型定义
+│   │   ├── converter.rs        # 协议转换器
+│   │   ├── stream.rs           # 流式响应处理
+│   │   └── token.rs            # Token 估算
+│   ├── admin/                  # Admin API 模块
+│   │   ├── router.rs           # 路由配置
+│   │   ├── handlers.rs         # 请求处理器
+│   │   ├── middleware.rs       # 认证中间件
+│   │   ├── service.rs          # 业务逻辑
+│   │   ├── types.rs            # 类型定义
+│   │   └── error.rs            # 错误处理
+│   └── kiro/                   # Kiro API 客户端
+│       ├── provider.rs         # API 提供者
+│       ├── token_manager.rs    # Token 管理（单/多凭据）
+│       ├── web_portal.rs       # Kiro Web Portal API（账号信息）
+│       ├── machine_id.rs       # 设备指纹生成
+│       ├── model/              # 数据模型
+│       │   ├── credentials.rs  # OAuth 凭证
+│       │   ├── events/         # 响应事件类型
+│       │   ├── requests/       # 请求类型
+│       │   └── common/         # 共享类型
+│       └── parser/             # AWS Event Stream 解析器
+│           ├── decoder.rs      # 流式解码器
+│           ├── frame.rs        # 帧解析
+│           ├── header.rs       # 头部解析
+│           └── crc.rs          # CRC 校验
+├── Cargo.toml                  # 项目配置
+├── admin-ui/                   # 管理面板前端（Vue 3 + Vite）
+├── config.example.json         # 配置示例
+├── admin-ui/                   # Admin UI 前端工程（构建产物会嵌入二进制）
+├── tools/                      # 辅助工具
+└── Dockerfile                  # Docker 构建文件
+```
+
+## 技术栈
+
+- **Web 框架**: [Axum](https://github.com/tokio-rs/axum) 0.8
+- **异步运行时**: [Tokio](https://tokio.rs/)
+- **HTTP 客户端**: [Reqwest](https://github.com/seanmonstar/reqwest)
+- **序列化**: [Serde](https://serde.rs/)
+- **日志**: [tracing](https://github.com/tokio-rs/tracing)
+- **命令行**: [Clap](https://github.com/clap-rs/clap)
+
+## 高级功能
+
+### Admin UI（管理面板）
+
+配置 `adminApiKey` 后，访问 `http://127.0.0.1:8990/` 即可打开管理面板。
+
+功能包括：
+- 查看所有凭据状态（优先级、禁用状态、失败次数、过期时间）
+- 添加/删除凭据
+- 设置凭据优先级和禁用状态
+- 查看账号详细信息（邮箱、套餐类型、用量明细）
+- 查看凭据余额和统计信息
+- 重置失败计数
+
+### 账号信息查询
+
+通过 Kiro Web Portal API（app.kiro.dev）获取账号详细信息：
+
+```bash
+# 获取指定凭据的账号信息
+curl http://127.0.0.1:8990/api/admin/credentials/1/account \
+  -H "x-api-key: sk-admin-your-secret-key"
+```
+
+返回信息包括：
+- 账户邮箱和用户 ID
+- 订阅类型（Free/Pro/Enterprise/Teams）
+- Credits 用量明细（基础额度、免费试用、奖励额度）
+- 下次重置时间
+- 超额配置状态
 
 ### Thinking 模式
 

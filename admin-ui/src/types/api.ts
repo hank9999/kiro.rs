@@ -16,12 +16,28 @@ export interface CredentialStatusItem {
   expiresAt: string | null
   authMethod: string | null
   hasProfileArn: boolean
-  email?: string
-  refreshTokenHash?: string
+
+  refreshTokenHash?: string | null
+  email?: string | null
+  accountEmail?: string | null
+  userId?: string | null
+  enabledModels?: string[] | null
+
   successCount: number
   lastUsedAt: string | null
   hasProxy: boolean
-  proxyUrl?: string
+  proxyUrl?: string | null
+
+  // ===== 统计（可持久化） =====
+  callsTotal: number
+  callsOk: number
+  callsErr: number
+  inputTokensTotal: number
+  outputTokensTotal: number
+  lastCallAt: string | null
+  lastSuccessAt: string | null
+  lastErrorAt: string | null
+  lastError: string | null
 }
 
 // 余额响应
@@ -32,13 +48,44 @@ export interface BalanceResponse {
   usageLimit: number
   remaining: number
   usagePercentage: number
-  nextResetAt: number | null
+  nextResetAt: string | null
 }
 
 // 成功响应
 export interface SuccessResponse {
   success: boolean
   message: string
+}
+
+// ===== 统计（可持久化） =====
+
+export interface StatsBucket {
+  // 按日：YYYY-MM-DD；按模型：model id
+  key: string
+  callsTotal: number
+  callsOk: number
+  callsErr: number
+  inputTokensTotal: number
+  outputTokensTotal: number
+  lastCallAt: string | null
+  lastSuccessAt: string | null
+  lastErrorAt: string | null
+  lastError: string | null
+}
+
+export interface CredentialStatsResponse {
+  id: number
+  callsTotal: number
+  callsOk: number
+  callsErr: number
+  inputTokensTotal: number
+  outputTokensTotal: number
+  lastCallAt: string | null
+  lastSuccessAt: string | null
+  lastErrorAt: string | null
+  lastError: string | null
+  byDay: StatsBucket[]
+  byModel: StatsBucket[]
 }
 
 // 错误响应
@@ -58,6 +105,10 @@ export interface SetPriorityRequest {
   priority: number
 }
 
+export interface SetEnabledModelsRequest {
+  enabledModels: string[]
+}
+
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken: string
@@ -65,9 +116,13 @@ export interface AddCredentialRequest {
   clientId?: string
   clientSecret?: string
   priority?: number
+  region?: string
+  enabledModels?: string[]
+  provider?: string
   authRegion?: string
   apiRegion?: string
   machineId?: string
+  email?: string
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
@@ -79,4 +134,125 @@ export interface AddCredentialResponse {
   message: string
   credentialId: number
   email?: string
+}
+
+// ===== 账号信息（套餐/用量/邮箱等） =====
+
+export interface CreditBonus {
+  code: string
+  name: string
+  current: number
+  limit: number
+  expiresAt: string | null
+}
+
+export interface CreditsResourceDetail {
+  displayName: string | null
+  displayNamePlural: string | null
+  resourceType: string | null
+  currency: string | null
+  unit: string | null
+  overageRate: number | null
+  overageCap: number | null
+}
+
+export interface CreditsUsageSummary {
+  current: number
+  limit: number
+  baseCurrent: number
+  baseLimit: number
+  freeTrialCurrent: number
+  freeTrialLimit: number
+  freeTrialExpiry: string | null
+  bonuses: CreditBonus[]
+  nextResetDate: string | null
+  overageEnabled: boolean | null
+  resourceDetail: CreditsResourceDetail | null
+}
+
+export interface AccountSubscriptionDetails {
+  rawType: string | null
+  managementTarget: string | null
+  upgradeCapability: string | null
+  overageCapability: string | null
+}
+
+export interface ResourceUsageSummary {
+  resourceType: string | null
+  displayName: string | null
+  unit: string | null
+  currency: string | null
+  current: number
+  limit: number
+}
+
+export interface UsageAndLimitsResponse {
+  userInfo: { email: string | null; userId: string | null } | null
+  subscriptionInfo:
+    | {
+        type: string | null
+        subscriptionTitle: string | null
+        upgradeCapability: string | null
+        overageCapability: string | null
+        subscriptionManagementTarget: string | null
+      }
+    | null
+  usageBreakdownList:
+    | Array<{
+        resourceType: string | null
+        currentUsage: number | null
+        currentUsageWithPrecision: number | null
+        usageLimit: number | null
+        usageLimitWithPrecision: number | null
+        displayName: string | null
+        displayNamePlural: string | null
+        currency: string | null
+        unit: string | null
+        overageRate: number | null
+        overageCap: number | null
+        freeTrialInfo:
+          | {
+              usageLimit: number | null
+              usageLimitWithPrecision: number | null
+              currentUsage: number | null
+              currentUsageWithPrecision: number | null
+              freeTrialExpiry: string | null
+              freeTrialStatus: string | null
+            }
+          | null
+        bonuses:
+          | Array<{
+              bonusCode: string | null
+              displayName: string | null
+              usageLimit: number | null
+              usageLimitWithPrecision: number | null
+              currentUsage: number | null
+              currentUsageWithPrecision: number | null
+              status: string | null
+              expiresAt: string | null
+            }>
+          | null
+      }>
+    | null
+  nextDateReset: string | null
+  overageConfiguration: { overageEnabled: boolean | null } | null
+}
+
+export interface AccountAggregateInfo {
+  email: string | null
+  userId: string | null
+  idp: string | null
+  status: string | null
+  featureFlags: string[] | null
+  subscriptionTitle: string | null
+  subscriptionType: string
+  subscription: AccountSubscriptionDetails
+  usage: CreditsUsageSummary
+  resources: ResourceUsageSummary[]
+  rawUsage: UsageAndLimitsResponse
+}
+
+export interface CredentialAccountInfoResponse {
+  id: number
+  account: AccountAggregateInfo
 }
