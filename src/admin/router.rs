@@ -2,7 +2,7 @@
 
 use axum::{
     Router, middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 
 use super::{
@@ -10,6 +10,10 @@ use super::{
         add_credential, delete_credential, get_all_credentials, get_credential_balance,
         get_load_balancing_mode, reset_failure_count, set_credential_disabled,
         set_credential_priority, set_load_balancing_mode,
+    },
+    proxy_pool_handlers::{
+        add_proxy, batch_add_proxies, delete_proxy, list_proxies, set_proxy_disabled,
+        test_proxy, update_proxy,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -46,6 +50,15 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
         )
+        // 代理池路由
+        .route(
+            "/proxy-pool",
+            get(list_proxies).post(add_proxy),
+        )
+        .route("/proxy-pool/batch", post(batch_add_proxies))
+        .route("/proxy-pool/{id}", put(update_proxy).delete(delete_proxy))
+        .route("/proxy-pool/{id}/disabled", post(set_proxy_disabled))
+        .route("/proxy-pool/{id}/test", post(test_proxy))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

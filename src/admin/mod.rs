@@ -19,10 +19,13 @@
 mod error;
 mod handlers;
 mod middleware;
+pub mod proxy_pool;
+mod proxy_pool_handlers;
 mod router;
 mod service;
 pub mod types;
 
 pub use middleware::AdminState;
+pub use proxy_pool::ProxyPool;
 pub use router::create_admin_router;
 pub use service::AdminService;

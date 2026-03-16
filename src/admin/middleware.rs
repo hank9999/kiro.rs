@@ -10,6 +10,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 
+use super::proxy_pool::ProxyPool;
 use super::service::AdminService;
 use super::types::AdminErrorResponse;
 use crate::common::auth;
@@ -21,14 +22,22 @@ pub struct AdminState {
     pub admin_api_key: String,
     /// Admin 服务
     pub service: Arc<AdminService>,
+    /// 代理池
+    proxy_pool: Arc<ProxyPool>,
 }
 
 impl AdminState {
-    pub fn new(admin_api_key: impl Into<String>, service: AdminService) -> Self {
+    pub fn new(admin_api_key: impl Into<String>, service: AdminService, proxy_pool: ProxyPool) -> Self {
         Self {
             admin_api_key: admin_api_key.into(),
             service: Arc::new(service),
+            proxy_pool: Arc::new(proxy_pool),
         }
+    }
+
+    /// 获取代理池引用
+    pub fn proxy_pool(&self) -> &ProxyPool {
+        &self.proxy_pool
     }
 }
 
