@@ -199,64 +199,6 @@ impl SuccessResponse {
     }
 }
 
-// ============ 代理池 ============
-
-/// 代理池列表响应
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProxyPoolListResponse {
-    /// 代理总数
-    pub total: usize,
-    /// 空闲代理数量
-    pub available: usize,
-    /// 代理列表
-    pub proxies: Vec<super::proxy_pool::ProxyEntry>,
-}
-
-/// 添加代理请求
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AddProxyRequest {
-    /// 代理 URL
-    pub url: String,
-    /// 认证用户名
-    pub username: Option<String>,
-    /// 认证密码
-    pub password: Option<String>,
-    /// 备注标签
-    #[serde(default)]
-    pub label: String,
-}
-
-/// 批量添加代理请求
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BatchAddProxyRequest {
-    /// 每行一个代理，格式：url [username password [label]]
-    pub lines: Vec<String>,
-}
-
-/// 编辑代理请求
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateProxyRequest {
-    pub url: Option<String>,
-    pub username: Option<Option<String>>,
-    pub password: Option<Option<String>>,
-    pub label: Option<String>,
-    pub disabled: Option<bool>,
-}
-
-/// 代理连通性测试响应
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProxyTestResponse {
-    pub success: bool,
-    pub message: String,
-    /// 响应时间（毫秒）
-    pub latency_ms: Option<u64>,
-}
-
 /// 错误响应
 #[derive(Debug, Serialize)]
 pub struct AdminErrorResponse {

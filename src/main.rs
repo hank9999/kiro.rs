@@ -122,8 +122,7 @@ async fn main() {
             anthropic_app
         } else {
             let admin_service = admin::AdminService::new(token_manager.clone());
-            let proxy_pool = admin::ProxyPool::new(token_manager.cache_dir());
-            let admin_state = admin::AdminState::new(admin_key, admin_service, proxy_pool);
+            let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由
@@ -154,9 +153,6 @@ async fn main() {
         tracing::info!("  POST /api/admin/credentials/:index/priority");
         tracing::info!("  POST /api/admin/credentials/:index/reset");
         tracing::info!("  GET  /api/admin/credentials/:index/balance");
-        tracing::info!("  代理池 API:");
-        tracing::info!("  GET  /api/admin/proxy-pool");
-        tracing::info!("  POST /api/admin/proxy-pool");
         tracing::info!("Admin UI:");
         tracing::info!("  GET  /admin");
     }

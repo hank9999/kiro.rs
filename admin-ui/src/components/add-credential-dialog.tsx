@@ -10,7 +10,6 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { useAddCredential } from '@/hooks/use-credentials'
-import { useProxyPool } from '@/hooks/use-proxy-pool'
 import { extractErrorMessage } from '@/lib/utils'
 
 interface AddCredentialDialogProps {
@@ -19,7 +18,6 @@ interface AddCredentialDialogProps {
 }
 
 type AuthMethod = 'social' | 'idc'
-type ProxyMode = 'auto' | 'manual' | 'pool' | 'none'
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
@@ -33,11 +31,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
-  const [proxyMode, setProxyMode] = useState<ProxyMode>('auto')
-  const [selectedProxyId, setSelectedProxyId] = useState<string>('')
 
   const { mutate, isPending } = useAddCredential()
-  const { data: proxyPoolData } = useProxyPool()
 
   const resetForm = () => {
     setRefreshToken('')
@@ -51,8 +46,6 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setProxyUrl('')
     setProxyUsername('')
     setProxyPassword('')
-    setProxyMode('auto')
-    setSelectedProxyId('')
   }
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -70,35 +63,6 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       return
     }
 
-    // 根据代理模式构建代理参数
-    let finalProxyUrl: string | undefined
-    let finalProxyUsername: string | undefined
-    let finalProxyPassword: string | undefined
-
-    if (proxyMode === 'none') {
-      finalProxyUrl = 'direct'
-    } else if (proxyMode === 'manual') {
-      finalProxyUrl = proxyUrl.trim() || undefined
-      finalProxyUsername = proxyUsername.trim() || undefined
-      finalProxyPassword = proxyPassword.trim() || undefined
-    } else if (proxyMode === 'pool' && selectedProxyId) {
-      const proxy = proxyPoolData?.proxies.find(p => p.id === Number(selectedProxyId))
-      if (proxy) {
-        finalProxyUrl = proxy.url
-        finalProxyUsername = proxy.username || undefined
-        finalProxyPassword = proxy.password || undefined
-      }
-    } else if (proxyMode === 'auto') {
-      // 自动分配：从池中找空闲代理
-      const freeProxy = proxyPoolData?.proxies.find(p => !p.disabled && !p.assignedTo)
-      if (freeProxy) {
-        finalProxyUrl = freeProxy.url
-        finalProxyUsername = freeProxy.username || undefined
-        finalProxyPassword = freeProxy.password || undefined
-      }
-      // 如果没有空闲代理，不设置代理（走全局配置）
-    }
-
     mutate(
       {
         refreshToken: refreshToken.trim(),
@@ -109,9 +73,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         clientSecret: clientSecret.trim() || undefined,
         priority: parseInt(priority) || 0,
         machineId: machineId.trim() || undefined,
-        proxyUrl: finalProxyUrl,
-        proxyUsername: finalProxyUsername,
-        proxyPassword: finalProxyPassword,
+        proxyUrl: proxyUrl.trim() || undefined,
+        proxyUsername: proxyUsername.trim() || undefined,
+        proxyPassword: proxyPassword.trim() || undefined,
       },
       {
         onSuccess: (data) => {
@@ -265,77 +229,33 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             {/* 代理配置 */}
             <div className="space-y-2">
               <label className="text-sm font-medium">代理配置</label>
-              <select
-                value={proxyMode}
-                onChange={(e) => setProxyMode(e.target.value as ProxyMode)}
+              <Input
+                id="proxyUrl"
+                placeholder='代理 URL（留空使用全局配置，"direct" 不使用代理）'
+                value={proxyUrl}
+                onChange={(e) => setProxyUrl(e.target.value)}
                 disabled={isPending}
-                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <option value="auto">自动分配（从代理池选空闲 IP）</option>
-                <option value="pool">从代理池选择</option>
-                <option value="manual">手动输入</option>
-                <option value="none">不使用代理</option>
-              </select>
-
-              {proxyMode === 'auto' && (
-                <p className="text-xs text-muted-foreground">
-                  将自动从代理池中分配一个空闲代理
-                  {proxyPoolData ? ` (当前空闲: ${proxyPoolData.available} 个)` : ''}
-                </p>
-              )}
-
-              {proxyMode === 'pool' && (
-                <select
-                  value={selectedProxyId}
-                  onChange={(e) => setSelectedProxyId(e.target.value)}
+              />
+              <div className="grid grid-cols-2 gap-2">
+                <Input
+                  id="proxyUsername"
+                  placeholder="代理用户名"
+                  value={proxyUsername}
+                  onChange={(e) => setProxyUsername(e.target.value)}
                   disabled={isPending}
-                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <option value="">请选择代理</option>
-                  {proxyPoolData?.proxies
-                    .filter(p => !p.disabled && !p.assignedTo)
-                    .map(p => (
-                      <option key={p.id} value={p.id}>
-                        #{p.id} {p.label || p.url}
-                      </option>
-                    ))}
-                </select>
-              )}
-
-              {proxyMode === 'manual' && (
-                <>
-                  <Input
-                    id="proxyUrl"
-                    placeholder='代理 URL（留空使用全局配置）'
-                    value={proxyUrl}
-                    onChange={(e) => setProxyUrl(e.target.value)}
-                    disabled={isPending}
-                  />
-                  <div className="grid grid-cols-2 gap-2">
-                    <Input
-                      id="proxyUsername"
-                      placeholder="代理用户名"
-                      value={proxyUsername}
-                      onChange={(e) => setProxyUsername(e.target.value)}
-                      disabled={isPending}
-                    />
-                    <Input
-                      id="proxyPassword"
-                      type="password"
-                      placeholder="代理密码"
-                      value={proxyPassword}
-                      onChange={(e) => setProxyPassword(e.target.value)}
-                      disabled={isPending}
-                    />
-                  </div>
-                </>
-              )}
-
-              {proxyMode === 'none' && (
-                <p className="text-xs text-muted-foreground">
-                  此凭据将不使用任何代理，直接连接
-                </p>
-              )}
+                />
+                <Input
+                  id="proxyPassword"
+                  type="password"
+                  placeholder="代理密码"
+                  value={proxyPassword}
+                  onChange={(e) => setProxyPassword(e.target.value)}
+                  disabled={isPending}
+                />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                留空使用全局代理。输入 "direct" 可显式不使用代理
+              </p>
             </div>
           </div>
 
