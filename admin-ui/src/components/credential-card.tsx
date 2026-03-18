@@ -146,6 +146,9 @@ export function CredentialCard({
                 {credential.disabled && (
                   <Badge variant="destructive">已禁用</Badge>
                 )}
+                {credential.disabled && credential.disabledReason && (
+                  <Badge variant="outline">{credential.disabledReason}</Badge>
+                )}
               </CardTitle>
             </div>
             <div className="flex items-center gap-2">
@@ -210,6 +213,12 @@ export function CredentialCard({
               </span>
             </div>
             <div>
+              <span className="text-muted-foreground">刷新失败：</span>
+              <span className={credential.refreshFailureCount > 0 ? 'text-red-500 font-medium' : ''}>
+                {credential.refreshFailureCount}
+              </span>
+            </div>
+            <div>
               <span className="text-muted-foreground">订阅等级：</span>
               <span className="font-medium">
                 {loadingBalance ? (
@@ -261,7 +270,7 @@ export function CredentialCard({
               size="sm"
               variant="outline"
               onClick={handleReset}
-              disabled={resetFailure.isPending || credential.failureCount === 0}
+              disabled={resetFailure.isPending || (credential.failureCount === 0 && credential.refreshFailureCount === 0)}
             >
               <RefreshCw className="h-4 w-4 mr-1" />
               重置失败

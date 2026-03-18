@@ -463,6 +463,11 @@ pub struct CredentialEntrySnapshot {
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// Token 刷新连续失败次数
+    pub refresh_failure_count: u32,
+    /// 禁用原因
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -1253,8 +1258,6 @@ impl MultiTokenManager {
 
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
-            // 设为阈值，便于在管理面板中直观看到该凭据已不可用
-            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
 
             tracing::error!(
                 "凭据 #{} Token 已连续刷新失败 {} 次，已被禁用",
@@ -1355,6 +1358,13 @@ impl MultiTokenManager {
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
+                    refresh_failure_count: e.refresh_failure_count,
+                    disabled_reason: e.disabled_reason.map(|r| match r {
+                        DisabledReason::Manual => "Manual",
+                        DisabledReason::TooManyFailures => "TooManyFailures",
+                        DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
+                        DisabledReason::QuotaExceeded => "QuotaExceeded",
+                    }.to_string()),
                 })
                 .collect(),
             current_id,

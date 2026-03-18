@@ -22,6 +22,8 @@ export interface CredentialStatusItem {
   lastUsedAt: string | null
   hasProxy: boolean
   proxyUrl?: string
+  refreshFailureCount: number
+  disabledReason?: string
 }
 
 // 余额响应

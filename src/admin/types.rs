@@ -51,6 +51,11 @@ pub struct CredentialStatusItem {
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// Token 刷新连续失败次数
+    pub refresh_failure_count: u32,
+    /// 禁用原因
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
 }
 
 // ============ 操作请求 ============
