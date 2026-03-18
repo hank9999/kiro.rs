@@ -16,6 +16,39 @@ impl Default for TlsBackend {
     }
 }
 
+/// 邮件通知配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmailConfig {
+    /// 是否启用邮件通知
+    #[serde(default)]
+    pub enabled: bool,
+    /// SMTP 服务器地址
+    pub smtp_host: String,
+    /// SMTP 端口
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+    /// SMTP 用户名
+    pub smtp_username: String,
+    /// SMTP 密码（注意：以明文存储在 config.json 中，请确保文件权限安全）
+    pub smtp_password: String,
+    /// 是否使用 STARTTLS
+    #[serde(default = "default_smtp_tls")]
+    pub smtp_tls: bool,
+    /// 发件人地址
+    pub from_address: String,
+    /// 收件人地址列表
+    pub to_addresses: Vec<String>,
+}
+
+fn default_smtp_port() -> u16 {
+    587
+}
+
+fn default_smtp_tls() -> bool {
+    true
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,6 +123,24 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// 邮件通知配置（可选）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<EmailConfig>,
+
+    /// Webhook 通知 URL（可选，凭据被禁用时发送 HTTP POST 通知）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+
+    /// Webhook 通知 JSON 模板（可选，支持变量占位符）
+    /// 可用变量: {{credential_id}}, {{email}}, {{reason}}, {{reason_zh}},
+    ///          {{available}}, {{total}}, {{timestamp}}
+    /// 未配置时使用内置默认格式
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webhook_body: Option<String>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -154,6 +205,9 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            email: None,
+            webhook_url: None,
+            webhook_body: None,
             config_path: None,
         }
     }
@@ -206,7 +260,8 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content).with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        fs::write(path, content)
+            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
     }
 }
