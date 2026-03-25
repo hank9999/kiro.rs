@@ -428,8 +428,19 @@ fn create_sse_stream(
     initial_stream.chain(processing_stream)
 }
 
-/// 上下文窗口大小（200k tokens）
-const CONTEXT_WINDOW_SIZE: i32 = 200_000;
+/// 根据模型名称返回对应的上下文窗口大小
+/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文
+fn get_context_window_size(model: &str) -> i32 {
+    let m = model.to_lowercase();
+    if m.contains("opus-4-6") || m.contains("opus-4.6")
+        || m.contains("sonnet-4-6") || m.contains("sonnet-4.6")
+        || m.contains("claude-opus-4-6") || m.contains("claude-sonnet-4-6")
+    {
+        1_000_000
+    } else {
+        200_000
+    }
+}
 
 /// 处理非流式请求
 async fn handle_non_stream_request(
@@ -519,9 +530,9 @@ async fn handle_non_stream_request(
                         }
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
-                            // 公式: percentage * 200000 / 100 = percentage * 2000
+                            let window_size = get_context_window_size(model);
                             let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (CONTEXT_WINDOW_SIZE as f64)
+                                * (window_size as f64)
                                 / 100.0)
                                 as i32;
                             context_input_tokens = Some(actual_input_tokens);
