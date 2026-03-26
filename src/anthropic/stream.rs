@@ -453,19 +453,7 @@ impl SseStateManager {
     }
 }
 
-/// 根据模型名称返回对应的上下文窗口大小
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文
-fn get_context_window_size(model: &str) -> i32 {
-    let m = model.to_lowercase();
-    if m.contains("opus-4-6") || m.contains("opus-4.6")
-        || m.contains("sonnet-4-6") || m.contains("sonnet-4.6")
-        || m.contains("claude-opus-4-6") || m.contains("claude-sonnet-4-6")
-    {
-        1_000_000
-    } else {
-        200_000
-    }
-}
+use super::converter::get_context_window_size;
 
 /// 流处理上下文
 pub struct StreamContext {
