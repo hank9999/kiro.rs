@@ -48,6 +48,31 @@ interface VerificationResult {
 
 
 
+// 兼容 KAM 1.8.3 新版平铺格式，统一转换为旧格式（credentials 嵌套结构）
+function normalizeKamAccount(item: unknown): unknown {
+  if (typeof item !== 'object' || item === null) return item
+  const obj = item as Record<string, unknown>
+  // 新格式：refreshToken 直接在账号对象上，无 credentials 嵌套
+  if (typeof obj.refreshToken === 'string' && typeof obj.credentials === 'undefined') {
+    return {
+      email: obj.email,
+      userId: obj.userId,
+      nickname: obj.label,
+      status: obj.status,
+      machineId: obj.machineId,
+      credentials: {
+        refreshToken: obj.refreshToken,
+        clientId: obj.clientId,
+        clientSecret: obj.clientSecret,
+        region: obj.region,
+        authMethod: obj.authMethod,
+        startUrl: obj.startUrl,
+      },
+    }
+  }
+  return item
+}
+
 // 校验元素是否为有效的 KAM 账号结构
 function isValidKamAccount(item: unknown): item is KamAccount {
   if (typeof item !== 'object' || item === null) return false
@@ -67,19 +92,25 @@ function parseKamJson(raw: string): KamAccount[] {
   if (parsed.accounts && Array.isArray(parsed.accounts)) {
     rawItems = parsed.accounts
   }
-  // 兜底：如果直接是账号数组
+  // 直接数组（含 KAM 1.8.3 新版平铺格式）
   else if (Array.isArray(parsed)) {
     rawItems = parsed
   }
-  // 单个账号对象（有 credentials 字段）
+  // 单个账号对象（旧格式，有 credentials 字段）
   else if (parsed.credentials && typeof parsed.credentials === 'object') {
+    rawItems = [parsed]
+  }
+  // 单个账号对象（新格式，refreshToken 平铺）
+  else if (typeof parsed.refreshToken === 'string') {
     rawItems = [parsed]
   }
   else {
     throw new Error('无法识别的 KAM JSON 格式')
   }
 
-  const validAccounts = rawItems.filter(isValidKamAccount)
+  // 兼容新格式：将平铺账号统一转换为 credentials 嵌套结构
+  const normalizedItems = rawItems.map(normalizeKamAccount)
+  const validAccounts = normalizedItems.filter(isValidKamAccount)
 
   if (rawItems.length > 0 && validAccounts.length === 0) {
     throw new Error(`共 ${rawItems.length} 条记录，但均缺少有效的 credentials.refreshToken`)
@@ -368,7 +399,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           <div className="space-y-2">
             <label className="text-sm font-medium">KAM 导出 JSON</label>
             <textarea
-              placeholder={'粘贴 Kiro Account Manager 导出的 JSON，格式如下：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
+              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1",\n    "authMethod": "IdC"\n  }\n]\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
