@@ -234,9 +234,6 @@ async fn refresh_social_token(
     Ok(new_credentials)
 }
 
-/// IdC Token 刷新所需的 x-amz-user-agent header
-const IDC_AMZ_USER_AGENT: &str = "aws-sdk-js/3.738.0 ua/2.1 os/other lang/js md/browser#unknown_unknown api/sso-oidc#3.738.0 m/E KiroIDE";
-
 /// 刷新 IdC Token (AWS SSO OIDC)
 async fn refresh_idc_token(
     credentials: &KiroCredentials,
@@ -258,6 +255,14 @@ async fn refresh_idc_token(
     // 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
     let region = credentials.effective_auth_region(config);
     let refresh_url = format!("https://oidc.{}.amazonaws.com/token", region);
+    let os_name = &config.system_version;
+    let node_version = &config.node_version;
+
+    let x_amz_user_agent = "aws-sdk-js/3.980.0 KiroIDE";
+    let user_agent = format!(
+        "aws-sdk-js/3.980.0 ua/2.1 os/{} lang/js md/nodejs#{} api/sso-oidc#3.980.0 m/E KiroIDE",
+        os_name, node_version
+    );
 
     let client = build_client(proxy, 60, config.tls_backend)?;
     let body = IdcRefreshRequest {
@@ -269,15 +274,13 @@ async fn refresh_idc_token(
 
     let response = client
         .post(&refresh_url)
-        .header("Content-Type", "application/json")
-        .header("Host", format!("oidc.{}.amazonaws.com", region))
-        .header("Connection", "keep-alive")
-        .header("x-amz-user-agent", IDC_AMZ_USER_AGENT)
-        .header("Accept", "*/*")
-        .header("Accept-Language", "*")
-        .header("sec-fetch-mode", "cors")
-        .header("User-Agent", "node")
-        .header("Accept-Encoding", "br, gzip, deflate")
+        .header("content-type", "application/json")
+        .header("x-amz-user-agent", x_amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", format!("oidc.{}.amazonaws.com", region))
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=4")
+        .header("Connection", "close")
         .json(&body)
         .send()
         .await?;
@@ -312,9 +315,6 @@ async fn refresh_idc_token(
     Ok(new_credentials)
 }
 
-/// getUsageLimits API 所需的 x-amz-user-agent header 前缀
-const USAGE_LIMITS_AMZ_USER_AGENT_PREFIX: &str = "aws-sdk-js/1.0.0";
-
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -330,6 +330,8 @@ pub(crate) async fn get_usage_limits(
     let machine_id = machine_id::generate_from_credentials(credentials, config)
         .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
     let kiro_version = &config.kiro_version;
+    let os_name = &config.system_version;
+    let node_version = &config.node_version;
 
     // 构建 URL
     let mut url = format!(
@@ -344,13 +346,12 @@ pub(crate) async fn get_usage_limits(
 
     // 构建 User-Agent headers
     let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/darwin#24.6.0 lang/js md/nodejs#22.21.1 \
-         api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        kiro_version, machine_id
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        os_name, node_version, kiro_version, machine_id
     );
     let amz_user_agent = format!(
-        "{} KiroIDE-{}-{}",
-        USAGE_LIMITS_AMZ_USER_AGENT_PREFIX, kiro_version, machine_id
+        "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
+        kiro_version, machine_id
     );
 
     let client = build_client(proxy, 60, config.tls_backend)?;
@@ -358,7 +359,7 @@ pub(crate) async fn get_usage_limits(
     let response = client
         .get(&url)
         .header("x-amz-user-agent", &amz_user_agent)
-        .header("User-Agent", &user_agent)
+        .header("user-agent", &user_agent)
         .header("host", &host)
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
         .header("amz-sdk-request", "attempt=1; max=1")
