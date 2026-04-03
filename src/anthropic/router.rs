@@ -8,6 +8,7 @@ use axum::{
 };
 
 use crate::kiro::provider::KiroProvider;
+use crate::openai::{post_chat_completions, post_responses};
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
@@ -51,6 +52,8 @@ pub fn create_router_with_provider(
     let v1_routes = Router::new()
         .route("/models", get(get_models))
         .route("/messages", post(post_messages))
+        .route("/chat/completions", post(post_chat_completions))
+        .route("/responses", post(post_responses))
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
             state.clone(),

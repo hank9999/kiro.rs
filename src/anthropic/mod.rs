@@ -22,11 +22,11 @@
 //! axum::serve(listener, app).await?;
 //! ```
 
-mod converter;
+pub(crate) mod converter;
 mod handlers;
-mod middleware;
+pub(crate) mod middleware;
 mod router;
-mod stream;
+pub(crate) mod stream;
 pub mod types;
 mod websearch;
 
