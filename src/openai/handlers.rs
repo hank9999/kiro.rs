@@ -6,7 +6,7 @@ use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
-    extract::State,
+    extract::{Extension, State},
     http::{StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::{
     anthropic::{
         converter::{ConversionError as AnthropicConversionError, convert_request},
-        middleware::AppState,
+        middleware::{AppState, RequestContext},
         stream::{SseEvent, StreamContext},
         types::{MessagesRequest, OutputConfig, Thinking},
     },
@@ -44,9 +44,12 @@ use super::{
 /// POST /v1/chat/completions
 pub async fn post_chat_completions(
     State(state): State<AppState>,
+    Extension(request_context): Extension<RequestContext>,
     JsonExtractor(payload): JsonExtractor<ChatCompletionsRequest>,
 ) -> Response {
     tracing::info!(
+        request_id = %request_context.request_id,
+        internal_request_id = request_context.internal_id,
         model = %payload.model,
         stream = %payload.stream,
         message_count = %payload.messages.len(),
@@ -156,9 +159,12 @@ pub async fn post_chat_completions(
 /// POST /v1/responses
 pub async fn post_responses(
     State(state): State<AppState>,
+    Extension(request_context): Extension<RequestContext>,
     JsonExtractor(payload): JsonExtractor<ResponsesRequest>,
 ) -> Response {
     tracing::info!(
+        request_id = %request_context.request_id,
+        internal_request_id = request_context.internal_id,
         model = %payload.model,
         stream = %payload.stream,
         "Received POST /v1/responses request"
@@ -619,14 +625,10 @@ fn apply_thinking_defaults_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 =
-        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let is_opus_4_6 = model_lower.contains("opus")
+        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
 
-    let thinking_type = if is_opus_4_6 {
-        "adaptive"
-    } else {
-        "enabled"
-    };
+    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
 
     payload.thinking = Some(Thinking {
         thinking_type: thinking_type.to_string(),
@@ -715,10 +717,13 @@ impl ResponsesState {
     fn finalize_stream(&mut self, final_events: Vec<SseEvent>) -> Vec<Bytes> {
         let mut bytes = self.consume_events(final_events);
         bytes.extend(self.finish_output_items());
-        bytes.push(self.sse_event("response.completed", json!({
-            "type": "response.completed",
-            "response": self.build_response_json()
-        })));
+        bytes.push(self.sse_event(
+            "response.completed",
+            json!({
+                "type": "response.completed",
+                "response": self.build_response_json()
+            }),
+        ));
         bytes
     }
 
@@ -750,17 +755,20 @@ impl ResponsesState {
     }
 
     fn handle_message_start(&mut self) -> Vec<Bytes> {
-        vec![self.sse_event("response.created", json!({
-            "type": "response.created",
-            "response": {
-                "id": self.response_id,
-                "object": "response",
-                "created_at": self.created_at,
-                "status": "in_progress",
-                "model": self.model,
-                "output": []
-            }
-        }))]
+        vec![self.sse_event(
+            "response.created",
+            json!({
+                "type": "response.created",
+                "response": {
+                    "id": self.response_id,
+                    "object": "response",
+                    "created_at": self.created_at,
+                    "status": "in_progress",
+                    "model": self.model,
+                    "output": []
+                }
+            }),
+        )]
     }
 
     fn handle_block_start(&mut self, data: serde_json::Value) -> Vec<Bytes> {
@@ -772,7 +780,8 @@ impl ResponsesState {
         let block_index = data["index"].as_i64().unwrap_or_default() as i32;
         let output_index = self.output_order.len();
         let fc_index = self.function_calls.len();
-        self.output_order.push(ResponseOutputRef::FunctionCall(fc_index));
+        self.output_order
+            .push(ResponseOutputRef::FunctionCall(fc_index));
         self.block_to_tool_index.insert(block_index, fc_index);
         self.function_calls.push(ResponseFunctionCallItem {
             item_id: format!("fc_{}", Uuid::new_v4().simple()),
@@ -789,12 +798,15 @@ impl ResponsesState {
             done: false,
         });
 
-        vec![self.sse_event("response.output_item.added", json!({
-            "type": "response.output_item.added",
-            "response_id": self.response_id,
-            "output_index": output_index,
-            "item": self.build_function_call_item_json(fc_index, "in_progress")
-        }))]
+        vec![self.sse_event(
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "response_id": self.response_id,
+                "output_index": output_index,
+                "item": self.build_function_call_item_json(fc_index, "in_progress")
+            }),
+        )]
     }
 
     fn handle_block_delta(&mut self, data: serde_json::Value) -> Vec<Bytes> {
@@ -812,30 +824,34 @@ impl ResponsesState {
                     self.message_output_index = Some(output_index);
                     self.output_order.push(ResponseOutputRef::Message);
                     self.message_started = true;
-                    bytes.push(self.sse_event("response.output_item.added", json!({
-                        "type": "response.output_item.added",
-                        "response_id": self.response_id,
-                        "output_index": output_index,
-                        "item": self.build_message_item_json("in_progress")
-                    })));
+                    bytes.push(self.sse_event(
+                        "response.output_item.added",
+                        json!({
+                            "type": "response.output_item.added",
+                            "response_id": self.response_id,
+                            "output_index": output_index,
+                            "item": self.build_message_item_json("in_progress")
+                        }),
+                    ));
                 }
 
                 self.text_content.push_str(text);
-                bytes.push(self.sse_event("response.output_text.delta", json!({
-                    "type": "response.output_text.delta",
-                    "response_id": self.response_id,
-                    "item_id": self.message_item_id,
-                    "output_index": self.message_output_index.unwrap_or_default(),
-                    "content_index": 0,
-                    "delta": text
-                })));
+                bytes.push(self.sse_event(
+                    "response.output_text.delta",
+                    json!({
+                        "type": "response.output_text.delta",
+                        "response_id": self.response_id,
+                        "item_id": self.message_item_id,
+                        "output_index": self.message_output_index.unwrap_or_default(),
+                        "content_index": 0,
+                        "delta": text
+                    }),
+                ));
                 bytes
             }
             "input_json_delta" => {
                 let block_index = data["index"].as_i64().unwrap_or_default() as i32;
-                let partial_json = data["delta"]["partial_json"]
-                    .as_str()
-                    .unwrap_or_default();
+                let partial_json = data["delta"]["partial_json"].as_str().unwrap_or_default();
                 if partial_json.is_empty() {
                     return Vec::new();
                 }
@@ -849,13 +865,16 @@ impl ResponsesState {
                     (item.item_id.clone(), item.output_index)
                 };
 
-                vec![self.sse_event("response.function_call_arguments.delta", json!({
-                    "type": "response.function_call_arguments.delta",
-                    "response_id": self.response_id,
-                    "item_id": item_id,
-                    "output_index": output_index,
-                    "delta": partial_json
-                }))]
+                vec![self.sse_event(
+                    "response.function_call_arguments.delta",
+                    json!({
+                        "type": "response.function_call_arguments.delta",
+                        "response_id": self.response_id,
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "delta": partial_json
+                    }),
+                )]
             }
             _ => Vec::new(),
         }
@@ -871,12 +890,8 @@ impl ResponsesState {
     }
 
     fn handle_message_delta(&mut self, data: serde_json::Value) {
-        let prompt_tokens = data["usage"]["input_tokens"]
-            .as_i64()
-            .unwrap_or_default() as i32;
-        let completion_tokens = data["usage"]["output_tokens"]
-            .as_i64()
-            .unwrap_or_default() as i32;
+        let prompt_tokens = data["usage"]["input_tokens"].as_i64().unwrap_or_default() as i32;
+        let completion_tokens = data["usage"]["output_tokens"].as_i64().unwrap_or_default() as i32;
         self.usage = Some(Usage {
             prompt_tokens,
             completion_tokens,
@@ -888,20 +903,26 @@ impl ResponsesState {
         let mut bytes = Vec::new();
 
         if self.message_started {
-            bytes.push(self.sse_event("response.output_text.done", json!({
-                "type": "response.output_text.done",
-                "response_id": self.response_id,
-                "item_id": self.message_item_id,
-                "output_index": self.message_output_index.unwrap_or_default(),
-                "content_index": 0,
-                "text": self.text_content
-            })));
-            bytes.push(self.sse_event("response.output_item.done", json!({
-                "type": "response.output_item.done",
-                "response_id": self.response_id,
-                "output_index": self.message_output_index.unwrap_or_default(),
-                "item": self.build_message_item_json("completed")
-            })));
+            bytes.push(self.sse_event(
+                "response.output_text.done",
+                json!({
+                    "type": "response.output_text.done",
+                    "response_id": self.response_id,
+                    "item_id": self.message_item_id,
+                    "output_index": self.message_output_index.unwrap_or_default(),
+                    "content_index": 0,
+                    "text": self.text_content
+                }),
+            ));
+            bytes.push(self.sse_event(
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "response_id": self.response_id,
+                    "output_index": self.message_output_index.unwrap_or_default(),
+                    "item": self.build_message_item_json("completed")
+                }),
+            ));
         }
 
         for index in 0..self.function_calls.len() {
@@ -910,15 +931,18 @@ impl ResponsesState {
 
         if self.include_usage {
             if let Some(usage) = &self.usage {
-                bytes.push(self.sse_event("response.usage", json!({
-                    "type": "response.usage",
-                    "response_id": self.response_id,
-                    "usage": {
-                        "input_tokens": usage.prompt_tokens,
-                        "output_tokens": usage.completion_tokens,
-                        "total_tokens": usage.total_tokens
-                    }
-                })));
+                bytes.push(self.sse_event(
+                    "response.usage",
+                    json!({
+                        "type": "response.usage",
+                        "response_id": self.response_id,
+                        "usage": {
+                            "input_tokens": usage.prompt_tokens,
+                            "output_tokens": usage.completion_tokens,
+                            "total_tokens": usage.total_tokens
+                        }
+                    }),
+                ));
             }
         }
 
@@ -946,19 +970,25 @@ impl ResponsesState {
         });
 
         vec![
-            self.sse_event("response.function_call_arguments.done", json!({
-                "type": "response.function_call_arguments.done",
-                "response_id": self.response_id,
-                "item_id": item_id,
-                "output_index": output_index,
-                "arguments": arguments
-            })),
-            self.sse_event("response.output_item.done", json!({
-                "type": "response.output_item.done",
-                "response_id": self.response_id,
-                "output_index": output_index,
-                "item": item_json
-            })),
+            self.sse_event(
+                "response.function_call_arguments.done",
+                json!({
+                    "type": "response.function_call_arguments.done",
+                    "response_id": self.response_id,
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "arguments": arguments
+                }),
+            ),
+            self.sse_event(
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "response_id": self.response_id,
+                    "output_index": output_index,
+                    "item": item_json
+                }),
+            ),
         ]
     }
 
@@ -1170,9 +1200,7 @@ impl OpenAiResponseState {
             }
             "input_json_delta" => {
                 let block_index = data["index"].as_i64().unwrap_or_default() as i32;
-                let partial_json = data["delta"]["partial_json"]
-                    .as_str()
-                    .unwrap_or_default();
+                let partial_json = data["delta"]["partial_json"].as_str().unwrap_or_default();
                 if partial_json.is_empty() {
                     return Vec::new();
                 }
@@ -1214,12 +1242,8 @@ impl OpenAiResponseState {
     }
 
     fn handle_message_delta(&mut self, data: serde_json::Value) -> Vec<Bytes> {
-        let prompt_tokens = data["usage"]["input_tokens"]
-            .as_i64()
-            .unwrap_or_default() as i32;
-        let completion_tokens = data["usage"]["output_tokens"]
-            .as_i64()
-            .unwrap_or_default() as i32;
+        let prompt_tokens = data["usage"]["input_tokens"].as_i64().unwrap_or_default() as i32;
+        let completion_tokens = data["usage"]["output_tokens"].as_i64().unwrap_or_default() as i32;
 
         self.usage = Some(Usage {
             prompt_tokens,
