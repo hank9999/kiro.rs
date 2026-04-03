@@ -173,7 +173,13 @@ curl http://127.0.0.1:8990/v1/chat/completions \
   }'
 ```
 
-> OpenAI 兼容层当前重点支持 `chat/completions`、`stream`、`tools/tool_calls`、`tool` 角色和 data URL 图片输入；暂不提供 `responses` API。
+> OpenAI 兼容层当前重点支持 `chat/completions`、`responses`、`stream`、`tools/tool_calls`、`tool` 角色和 data URL 图片输入。
+
+## 本地运维与同步
+
+如果你正在维护这个仓库的本地定制版本，包含 OpenAI 兼容层、`systemd` 保活和上游同步约定，请先阅读：
+
+- [docs/MAINTENANCE.md](docs/MAINTENANCE.md)
 
 ### Docker
 
