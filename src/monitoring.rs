@@ -199,6 +199,39 @@ impl RequestMetadata {
 }
 
 #[derive(Debug, Clone)]
+pub struct RequestMetadataHandle {
+    inner: Arc<Mutex<RequestMetadata>>,
+}
+
+impl RequestMetadataHandle {
+    fn new(metadata: RequestMetadata) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(metadata)),
+        }
+    }
+
+    pub fn snapshot(&self) -> RequestMetadata {
+        self.inner.lock().clone()
+    }
+
+    pub fn annotate_request(
+        &self,
+        model: impl Into<String>,
+        message_count: Option<usize>,
+        stream: Option<bool>,
+    ) {
+        let mut metadata = self.inner.lock();
+        metadata.model = Some(model.into());
+        if let Some(message_count) = message_count {
+            metadata.message_count = Some(message_count);
+        }
+        if let Some(stream) = stream {
+            metadata.stream = stream;
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct RequestMonitor {
     inner: Arc<Mutex<RequestMonitorState>>,
 }
@@ -249,7 +282,7 @@ impl RequestMonitor {
 
         let tracker = RequestTracker {
             monitor: self.clone(),
-            metadata,
+            metadata: RequestMetadataHandle::new(metadata),
             id,
             request_id: format!("req-{id:06}"),
             started_at,
@@ -362,7 +395,7 @@ impl RequestMonitor {
 
 pub struct RequestTracker {
     monitor: RequestMonitor,
-    metadata: RequestMetadata,
+    metadata: RequestMetadataHandle,
     id: u64,
     request_id: String,
     started_at: String,
@@ -379,19 +412,24 @@ impl RequestTracker {
         &self.request_id
     }
 
+    pub fn metadata_handle(&self) -> RequestMetadataHandle {
+        self.metadata.clone()
+    }
+
     fn log_started(&self) {
+        let metadata = self.metadata.snapshot();
         tracing::info!(
             request_id = %self.request_id,
-            method = %self.metadata.method,
-            path = %self.metadata.path,
-            endpoint = %self.metadata.endpoint,
-            client_ip = %self.metadata.client_ip.as_deref().unwrap_or("-"),
-            forwarded_for = %self.metadata.forwarded_for.as_deref().unwrap_or("-"),
-            real_ip = %self.metadata.real_ip.as_deref().unwrap_or("-"),
-            client_request_id = %self.metadata.client_request_id.as_deref().unwrap_or("-"),
-            user_agent = %self.metadata.user_agent.as_deref().unwrap_or("-"),
-            content_length = ?self.metadata.content_length,
-            stream = self.metadata.stream,
+            method = %metadata.method,
+            path = %metadata.path,
+            endpoint = %metadata.endpoint,
+            client_ip = %metadata.client_ip.as_deref().unwrap_or("-"),
+            forwarded_for = %metadata.forwarded_for.as_deref().unwrap_or("-"),
+            real_ip = %metadata.real_ip.as_deref().unwrap_or("-"),
+            client_request_id = %metadata.client_request_id.as_deref().unwrap_or("-"),
+            user_agent = %metadata.user_agent.as_deref().unwrap_or("-"),
+            content_length = ?metadata.content_length,
+            stream = metadata.stream,
             "API request started"
         );
     }
@@ -405,7 +443,7 @@ impl RequestTracker {
         self.monitor.finish_request(
             self.id,
             self.request_id.clone(),
-            self.metadata.clone(),
+            self.metadata.snapshot(),
             self.started_at.clone(),
             self.started.elapsed().as_millis() as u64,
             status_code,
@@ -424,7 +462,7 @@ impl Drop for RequestTracker {
         self.monitor.finish_request(
             self.id,
             self.request_id.clone(),
-            self.metadata.clone(),
+            self.metadata.snapshot(),
             self.started_at.clone(),
             self.started.elapsed().as_millis() as u64,
             499,
@@ -471,6 +509,7 @@ fn log_request_completion(record: &RequestRecord) {
     let client_request_id = record.client_request_id.as_deref().unwrap_or("-");
     let user_agent = record.user_agent.as_deref().unwrap_or("-");
     let error = record.error.as_deref().unwrap_or("-");
+    let model = record.model.as_deref().unwrap_or("-");
 
     if record.status_code == 499 {
         tracing::warn!(
@@ -478,6 +517,7 @@ fn log_request_completion(record: &RequestRecord) {
             method = %record.method,
             path = %record.path,
             endpoint = %record.endpoint,
+            model = %model,
             status_code = record.status_code,
             duration_ms = record.duration_ms,
             client_ip = %client_ip,
@@ -496,6 +536,7 @@ fn log_request_completion(record: &RequestRecord) {
             method = %record.method,
             path = %record.path,
             endpoint = %record.endpoint,
+            model = %model,
             status_code = record.status_code,
             duration_ms = record.duration_ms,
             client_ip = %client_ip,
@@ -514,6 +555,7 @@ fn log_request_completion(record: &RequestRecord) {
             method = %record.method,
             path = %record.path,
             endpoint = %record.endpoint,
+            model = %model,
             status_code = record.status_code,
             duration_ms = record.duration_ms,
             client_ip = %client_ip,
@@ -528,6 +570,7 @@ fn log_request_completion(record: &RequestRecord) {
         method = %record.method,
         path = %record.path,
         endpoint = %record.endpoint,
+        model = %model,
         status_code = record.status_code,
         duration_ms = record.duration_ms,
         "API request completed"

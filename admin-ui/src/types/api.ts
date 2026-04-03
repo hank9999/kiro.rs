@@ -125,6 +125,21 @@ export interface RequestActivityResponse {
   records: RequestActivityRecord[];
 }
 
+export interface AvailableModel {
+  id: string;
+  object: string;
+  created: number;
+  ownedBy: string;
+  displayName: string;
+  type: string;
+  maxTokens: number;
+}
+
+export interface AvailableModelsResponse {
+  object: string;
+  data: AvailableModel[];
+}
+
 // 日志响应
 export interface LogsResponse {
   path: string;

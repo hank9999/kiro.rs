@@ -10,6 +10,7 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::anthropic::{available_models, types::ModelsResponse};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::monitoring::{RequestActivitySnapshot, RequestMonitor};
@@ -267,6 +268,14 @@ impl AdminService {
         }
     }
 
+    /// 获取当前服务暴露的模型列表
+    pub fn get_available_models(&self) -> ModelsResponse {
+        ModelsResponse {
+            object: "list".to_string(),
+            data: available_models(),
+        }
+    }
+
     /// 获取最近请求活动
     pub fn get_request_activity(&self, limit: usize) -> RequestActivitySnapshot {
         self.request_monitor.snapshot(limit)
@@ -456,7 +465,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)

@@ -21,6 +21,12 @@ pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoRe
     Json(response)
 }
 
+/// GET /api/admin/models
+/// 获取当前服务暴露的模型列表
+pub async fn get_available_models(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_available_models())
+}
+
 /// GET /api/admin/activity
 /// 获取最近请求活动
 pub async fn get_request_activity(

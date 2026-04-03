@@ -37,7 +37,7 @@ use super::{
     types::{
         AssistantMessage, ChatCompletionChunk, ChatCompletionResponse, ChatCompletionsRequest,
         Choice, ChunkChoice, DeltaMessage, DeltaToolCall, DeltaToolCallFunction, ErrorResponse,
-        ResponsesRequest, ToolCall, ToolCallFunction, Usage,
+        ResponseInput, ResponsesRequest, ToolCall, ToolCallFunction, Usage,
     },
 };
 
@@ -47,6 +47,11 @@ pub async fn post_chat_completions(
     Extension(request_context): Extension<RequestContext>,
     JsonExtractor(payload): JsonExtractor<ChatCompletionsRequest>,
 ) -> Response {
+    request_context.annotate_request(
+        payload.model.clone(),
+        Some(payload.messages.len()),
+        Some(payload.stream),
+    );
     tracing::info!(
         request_id = %request_context.request_id,
         internal_request_id = request_context.internal_id,
@@ -162,6 +167,11 @@ pub async fn post_responses(
     Extension(request_context): Extension<RequestContext>,
     JsonExtractor(payload): JsonExtractor<ResponsesRequest>,
 ) -> Response {
+    request_context.annotate_request(
+        payload.model.clone(),
+        Some(count_response_input_items(payload.input.as_ref())),
+        Some(payload.stream),
+    );
     tracing::info!(
         request_id = %request_context.request_id,
         internal_request_id = request_context.internal_id,
@@ -639,6 +649,14 @@ fn apply_thinking_defaults_from_model_name(payload: &mut MessagesRequest) {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
         });
+    }
+}
+
+fn count_response_input_items(input: Option<&ResponseInput>) -> usize {
+    match input {
+        Some(ResponseInput::Text(_)) => 1,
+        Some(ResponseInput::Items(items)) => items.len(),
+        None => 0,
     }
 }
 

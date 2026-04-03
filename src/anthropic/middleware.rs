@@ -16,7 +16,7 @@ use tracing::Instrument;
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
-use crate::monitoring::{RequestMetadata, RequestMonitor};
+use crate::monitoring::{RequestMetadata, RequestMetadataHandle, RequestMonitor};
 
 use super::types::ErrorResponse;
 
@@ -62,14 +62,34 @@ impl AppState {
 pub struct RequestContext {
     pub request_id: String,
     pub internal_id: u64,
+    metadata: RequestMetadataHandle,
 }
 
 impl RequestContext {
-    fn new(internal_id: u64, request_id: String) -> Self {
+    fn new(internal_id: u64, request_id: String, metadata: RequestMetadataHandle) -> Self {
         Self {
             request_id,
             internal_id,
+            metadata,
         }
+    }
+
+    pub fn annotate_request(
+        &self,
+        model: impl Into<String>,
+        message_count: Option<usize>,
+        stream: Option<bool>,
+    ) {
+        let model = model.into();
+        tracing::debug!(
+            request_id = %self.request_id,
+            internal_request_id = self.internal_id,
+            model = %model,
+            message_count = ?message_count,
+            stream = ?stream,
+            "Updated request activity metadata"
+        );
+        self.metadata.annotate_request(model, message_count, stream);
     }
 }
 
@@ -91,9 +111,9 @@ pub async fn auth_and_monitor_middleware(
         client_ip = %metadata.client_ip().unwrap_or("-"),
         client_request_id = %metadata.client_request_id().unwrap_or("-"),
     );
-    request
-        .extensions_mut()
-        .insert(RequestContext::new(tracker.id(), request_id.clone()));
+    let request_context =
+        RequestContext::new(tracker.id(), request_id.clone(), tracker.metadata_handle());
+    request.extensions_mut().insert(request_context);
 
     match auth::extract_api_key(&request) {
         Some(key) if auth::constant_time_eq(&key, &state.api_key) => {
