@@ -274,6 +274,14 @@ impl AdminService {
         Ok(LoadBalancingModeResponse { mode: req.mode })
     }
 
+    /// 强制刷新指定凭据的 Token
+    pub async fn force_refresh_token(&self, id: u64) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .force_refresh_token_for(id)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))
+    }
+
     // ============ 余额缓存持久化 ============
 
     fn load_balance_cache_from(cache_path: &Option<PathBuf>) -> HashMap<u64, CachedBalance> {

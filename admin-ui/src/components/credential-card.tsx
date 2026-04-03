@@ -21,6 +21,7 @@ import {
   useSetPriority,
   useResetFailure,
   useDeleteCredential,
+  useForceRefreshToken,
 } from '@/hooks/use-credentials'
 
 interface CredentialCardProps {
@@ -64,6 +65,7 @@ export function CredentialCard({
   const setPriority = useSetPriority()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
+  const forceRefresh = useForceRefreshToken()
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -106,6 +108,17 @@ export function CredentialCard({
       },
       onError: (err) => {
         toast.error('操作失败: ' + (err as Error).message)
+      },
+    })
+  }
+
+  const handleForceRefresh = () => {
+    forceRefresh.mutate(credential.id, {
+      onSuccess: (res) => {
+        toast.success(res.message)
+      },
+      onError: (err) => {
+        toast.error('刷新失败: ' + (err as Error).message)
       },
     })
   }
@@ -274,6 +287,16 @@ export function CredentialCard({
             >
               <RefreshCw className="h-4 w-4 mr-1" />
               重置失败
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleForceRefresh}
+              disabled={forceRefresh.isPending || credential.disabled}
+              title={credential.disabled ? '已禁用的凭据无法刷新 Token' : '强制刷新 Token'}
+            >
+              <RefreshCw className={`h-4 w-4 mr-1 ${forceRefresh.isPending ? 'animate-spin' : ''}`} />
+              刷新 Token
             </Button>
             <Button
               size="sm"

@@ -5,7 +5,6 @@
 //! 支持多凭据故障转移和重试
 
 use reqwest::Client;
-use reqwest::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, HeaderMap, HeaderValue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +14,7 @@ use uuid::Uuid;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::{CallContext, MultiTokenManager};
+use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -142,106 +141,6 @@ impl KiroProvider {
             .map(|s| s.to_string())
     }
 
-    /// 构建请求头
-    ///
-    /// # Arguments
-    /// * `ctx` - API 调用上下文，包含凭据和 token
-    fn build_headers(&self, ctx: &CallContext) -> anyhow::Result<HeaderMap> {
-        let config = self.token_manager.config();
-
-        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config)
-            .ok_or_else(|| anyhow::anyhow!("无法生成 machine_id，请检查凭证配置"))?;
-
-        let kiro_version = &config.kiro_version;
-        let os_name = &config.system_version;
-        let node_version = &config.node_version;
-
-        let x_amz_user_agent = format!("aws-sdk-js/1.0.27 KiroIDE-{}-{}", kiro_version, machine_id);
-
-        let user_agent = format!(
-            "aws-sdk-js/1.0.27 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.27 m/E KiroIDE-{}-{}",
-            os_name, node_version, kiro_version, machine_id
-        );
-
-        let mut headers = HeaderMap::new();
-
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            "x-amzn-codewhisperer-optout",
-            HeaderValue::from_static("true"),
-        );
-        headers.insert("x-amzn-kiro-agent-mode", HeaderValue::from_static("vibe"));
-        headers.insert(
-            "x-amz-user-agent",
-            HeaderValue::from_str(&x_amz_user_agent).unwrap(),
-        );
-        headers.insert(
-            reqwest::header::USER_AGENT,
-            HeaderValue::from_str(&user_agent).unwrap(),
-        );
-        headers.insert(HOST, HeaderValue::from_str(&self.base_domain_for(&ctx.credentials)).unwrap());
-        headers.insert(
-            "amz-sdk-invocation-id",
-            HeaderValue::from_str(&Uuid::new_v4().to_string()).unwrap(),
-        );
-        headers.insert(
-            "amz-sdk-request",
-            HeaderValue::from_static("attempt=1; max=3"),
-        );
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", ctx.token)).unwrap(),
-        );
-        headers.insert(CONNECTION, HeaderValue::from_static("close"));
-
-        Ok(headers)
-    }
-
-    /// 构建 MCP 请求头
-    fn build_mcp_headers(&self, ctx: &CallContext) -> anyhow::Result<HeaderMap> {
-        let config = self.token_manager.config();
-
-        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config)
-            .ok_or_else(|| anyhow::anyhow!("无法生成 machine_id，请检查凭证配置"))?;
-
-        let kiro_version = &config.kiro_version;
-        let os_name = &config.system_version;
-        let node_version = &config.node_version;
-
-        let x_amz_user_agent = format!("aws-sdk-js/1.0.27 KiroIDE-{}-{}", kiro_version, machine_id);
-
-        let user_agent = format!(
-            "aws-sdk-js/1.0.27 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.27 m/E KiroIDE-{}-{}",
-            os_name, node_version, kiro_version, machine_id
-        );
-
-        let mut headers = HeaderMap::new();
-
-        // 按照严格顺序添加请求头
-        headers.insert("content-type", HeaderValue::from_static("application/json"));
-        headers.insert(
-            "x-amz-user-agent",
-            HeaderValue::from_str(&x_amz_user_agent).unwrap(),
-        );
-        headers.insert("user-agent", HeaderValue::from_str(&user_agent).unwrap());
-        headers.insert("host", HeaderValue::from_str(&self.base_domain_for(&ctx.credentials)).unwrap());
-        headers.insert(
-            "amz-sdk-invocation-id",
-            HeaderValue::from_str(&Uuid::new_v4().to_string()).unwrap(),
-        );
-        headers.insert(
-            "amz-sdk-request",
-            HeaderValue::from_static("attempt=1; max=3"),
-        );
-        headers.insert(
-            "Authorization",
-            HeaderValue::from_str(&format!("Bearer {}", ctx.token)).unwrap(),
-        );
-        headers.insert("Connection", HeaderValue::from_static("close"));
-
-        Ok(headers)
-    }
-
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移：
@@ -306,21 +205,42 @@ impl KiroProvider {
                 }
             };
 
-            let url = self.mcp_url_for(&ctx.credentials);
-            let headers = match self.build_mcp_headers(&ctx) {
-                Ok(h) => h,
-                Err(e) => {
-                    last_error = Some(e);
+            let config = self.token_manager.config();
+            let machine_id = match machine_id::generate_from_credentials(&ctx.credentials, config) {
+                Some(id) => id,
+                None => {
+                    last_error = Some(anyhow::anyhow!("无法生成 machine_id，请检查凭证配置"));
                     continue;
                 }
             };
 
+            let url = self.mcp_url_for(&ctx.credentials);
+            let x_amz_user_agent = format!("aws-sdk-js/1.0.34 KiroIDE-{}-{}", config.kiro_version, machine_id);
+            let user_agent = format!(
+                "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
+                config.system_version, config.node_version, config.kiro_version, machine_id
+            );
+
             // 发送请求
-            let response = match self
+            let mut request = self
                 .client_for(&ctx.credentials)?
                 .post(&url)
-                .headers(headers)
                 .body(request_body.to_string())
+                .header("content-type", "application/json");
+
+            // MCP 请求需要携带 profile ARN（如果凭据中存在）
+            if let Some(ref arn) = ctx.credentials.profile_arn {
+                request = request.header("x-amzn-kiro-profile-arn", arn);
+            }
+
+            let response = match request
+                .header("x-amz-user-agent", &x_amz_user_agent)
+                .header("user-agent", &user_agent)
+                .header("host", &self.base_domain_for(&ctx.credentials))
+                .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
+                .header("amz-sdk-request", "attempt=1; max=3")
+                .header("Authorization", format!("Bearer {}", ctx.token))
+                .header("Connection", "close")
                 .send()
                 .await
             {
@@ -438,21 +358,37 @@ impl KiroProvider {
                 }
             };
 
-            let url = self.base_url_for(&ctx.credentials);
-            let headers = match self.build_headers(&ctx) {
-                Ok(h) => h,
-                Err(e) => {
-                    last_error = Some(e);
+            let config = self.token_manager.config();
+            let machine_id = match machine_id::generate_from_credentials(&ctx.credentials, config) {
+                Some(id) => id,
+                None => {
+                    last_error = Some(anyhow::anyhow!("无法生成 machine_id，请检查凭证配置"));
                     continue;
                 }
             };
+
+            let url = self.base_url_for(&ctx.credentials);
+            let x_amz_user_agent = format!("aws-sdk-js/1.0.34 KiroIDE-{}-{}", config.kiro_version, machine_id);
+            let user_agent = format!(
+                "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
+                config.system_version, config.node_version, config.kiro_version, machine_id
+            );
 
             // 发送请求
             let response = match self
                 .client_for(&ctx.credentials)?
                 .post(&url)
-                .headers(headers)
                 .body(request_body.to_string())
+                .header("content-type", "application/json")
+                .header("x-amzn-codewhisperer-optout", "true")
+                .header("x-amzn-kiro-agent-mode", "vibe")
+                .header("x-amz-user-agent", &x_amz_user_agent)
+                .header("user-agent", &user_agent)
+                .header("host", &self.base_domain_for(&ctx.credentials))
+                .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
+                .header("amz-sdk-request", "attempt=1; max=3")
+                .header("Authorization", format!("Bearer {}", ctx.token))
+                .header("Connection", "close")
                 .send()
                 .await
             {
@@ -642,7 +578,6 @@ impl KiroProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kiro::token_manager::CallContext;
     use crate::model::config::Config;
 
     fn create_test_provider(config: Config, credentials: KiroCredentials) -> KiroProvider {
@@ -666,38 +601,6 @@ mod tests {
         let credentials = KiroCredentials::default();
         let provider = create_test_provider(config, credentials);
         assert_eq!(provider.base_domain(), "q.us-east-1.amazonaws.com");
-    }
-
-    #[test]
-    fn test_build_headers() {
-        let mut config = Config::default();
-        config.region = "us-east-1".to_string();
-        config.kiro_version = "0.8.0".to_string();
-
-        let mut credentials = KiroCredentials::default();
-        credentials.profile_arn = Some("arn:aws:sso::123456789:profile/test".to_string());
-        credentials.refresh_token = Some("a".repeat(150));
-
-        let provider = create_test_provider(config, credentials.clone());
-        let ctx = CallContext {
-            id: 1,
-            credentials,
-            token: "test_token".to_string(),
-        };
-        let headers = provider.build_headers(&ctx).unwrap();
-
-        assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "application/json");
-        assert_eq!(headers.get("x-amzn-codewhisperer-optout").unwrap(), "true");
-        assert_eq!(headers.get("x-amzn-kiro-agent-mode").unwrap(), "vibe");
-        assert!(
-            headers
-                .get(AUTHORIZATION)
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .starts_with("Bearer ")
-        );
-        assert_eq!(headers.get(CONNECTION).unwrap(), "close");
     }
 
     #[test]

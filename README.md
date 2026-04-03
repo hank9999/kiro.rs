@@ -15,6 +15,8 @@
 
 ---
 
+#### [LINUX DO 讨论帖](https://linux.do/t/topic/1571986)
+
 ## 免责声明
 
 本项目仅供研究使用, Use at your own risk, 使用本项目所导致的任何后果由使用人承担, 与本项目无关。

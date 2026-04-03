@@ -75,94 +75,94 @@ pub async fn get_models() -> impl IntoResponse {
 
     let models = vec![
         Model {
-            id: "claude-sonnet-4-5-20250929".to_string(),
-            object: "model".to_string(),
-            created: 1727568000,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1727568000,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101".to_string(),
-            object: "model".to_string(),
-            created: 1730419200,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1730419200,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
-            id: "claude-sonnet-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1770314400,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
-            id: "claude-sonnet-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1770314400,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
             id: "claude-opus-4-6".to_string(),
             object: "model".to_string(),
-            created: 1770314400,
+            created: 1770163200, // Feb 4, 2026
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.6".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 64000,
         },
         Model {
             id: "claude-opus-4-6-thinking".to_string(),
             object: "model".to_string(),
-            created: 1770314400,
+            created: 1770163200, // Feb 4, 2026
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.6 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-4-6".to_string(),
+            object: "model".to_string(),
+            created: 1771286400, // Feb 17, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.6".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-4-6-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1771286400, // Feb 17, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-5-20251101".to_string(),
+            object: "model".to_string(),
+            created: 1763942400, // Nov 24, 2025
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-5-20251101-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1763942400, // Nov 24, 2025
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-4-5-20250929".to_string(),
+            object: "model".to_string(),
+            created: 1759104000, // Sep 29, 2025
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1759104000, // Sep 29, 2025
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
         },
         Model {
             id: "claude-haiku-4-5-20251001".to_string(),
             object: "model".to_string(),
-            created: 1727740800,
+            created: 1760486400, // Oct 15, 2025
             owned_by: "anthropic".to_string(),
             display_name: "Claude Haiku 4.5".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 64000,
         },
         Model {
             id: "claude-haiku-4-5-20251001-thinking".to_string(),
             object: "model".to_string(),
-            created: 1727740800,
+            created: 1760486400, // Oct 15, 2025
             owned_by: "anthropic".to_string(),
             display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 64000,
         },
     ];
 
@@ -279,6 +279,8 @@ pub async fn post_messages(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
 
+    let tool_name_map = conversion_result.tool_name_map;
+
     if payload.stream {
         // 流式响应
         handle_stream_request(
@@ -287,11 +289,12 @@ pub async fn post_messages(
             &payload.model,
             input_tokens,
             thinking_enabled,
+            tool_name_map,
         )
         .await
     } else {
         // 非流式响应
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, tool_name_map).await
     }
 }
 
@@ -302,6 +305,7 @@ async fn handle_stream_request(
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -310,7 +314,7 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled);
+    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -428,8 +432,7 @@ fn create_sse_stream(
     initial_stream.chain(processing_stream)
 }
 
-/// 上下文窗口大小（200k tokens）
-const CONTEXT_WINDOW_SIZE: i32 = 200_000;
+use super::converter::get_context_window_size;
 
 /// 处理非流式请求
 async fn handle_non_stream_request(
@@ -437,6 +440,7 @@ async fn handle_non_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api(request_body).await {
@@ -509,19 +513,24 @@ async fn handle_non_stream_request(
                                         })
                                 };
 
+                                let original_name = tool_name_map
+                                    .get(&tool_use.name)
+                                    .cloned()
+                                    .unwrap_or_else(|| tool_use.name.clone());
+
                                 tool_uses.push(json!({
                                     "type": "tool_use",
                                     "id": tool_use.tool_use_id,
-                                    "name": tool_use.name,
+                                    "name": original_name,
                                     "input": input
                                 }));
                             }
                         }
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
-                            // 公式: percentage * 200000 / 100 = percentage * 2000
+                            let window_size = get_context_window_size(model);
                             let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (CONTEXT_WINDOW_SIZE as f64)
+                                * (window_size as f64)
                                 / 100.0)
                                 as i32;
                             context_input_tokens = Some(actual_input_tokens);
@@ -763,6 +772,8 @@ pub async fn post_messages_cc(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
 
+    let tool_name_map = conversion_result.tool_name_map;
+
     if payload.stream {
         // 流式响应（缓冲模式）
         handle_stream_request_buffered(
@@ -771,11 +782,12 @@ pub async fn post_messages_cc(
             &payload.model,
             input_tokens,
             thinking_enabled,
+            tool_name_map,
         )
         .await
     } else {
         // 非流式响应（复用现有逻辑，已经使用正确的 input_tokens）
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, tool_name_map).await
     }
 }
 
@@ -789,6 +801,7 @@ async fn handle_stream_request_buffered(
     model: &str,
     estimated_input_tokens: i32,
     thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -797,7 +810,7 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled);
+    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);
