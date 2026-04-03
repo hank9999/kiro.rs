@@ -12,8 +12,9 @@ use crate::openai::{post_chat_completions, post_responses};
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
-    middleware::{AppState, auth_middleware, cors_layer},
+    middleware::{AppState, auth_and_monitor_middleware, cors_layer},
 };
+use crate::monitoring::RequestMonitor;
 
 /// 请求体最大大小限制 (50MB)
 const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
@@ -39,8 +40,9 @@ pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
     profile_arn: Option<String>,
+    request_monitor: RequestMonitor,
 ) -> Router {
-    let mut state = AppState::new(api_key);
+    let mut state = AppState::new(api_key, request_monitor);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
@@ -57,7 +59,7 @@ pub fn create_router_with_provider(
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            auth_middleware,
+            auth_and_monitor_middleware,
         ));
 
     // 需要认证的 /cc/v1 路由（Claude Code 兼容端点）
@@ -67,7 +69,7 @@ pub fn create_router_with_provider(
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            auth_middleware,
+            auth_and_monitor_middleware,
         ));
 
     Router::new()

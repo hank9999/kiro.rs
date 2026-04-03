@@ -5,6 +5,7 @@ mod common;
 mod http_client;
 mod kiro;
 mod model;
+mod monitoring;
 mod openai;
 pub mod token;
 
@@ -92,6 +93,10 @@ async fn main() {
     });
     let token_manager = Arc::new(token_manager);
     let kiro_provider = KiroProvider::with_proxy(token_manager.clone(), proxy_config.clone());
+    let request_monitor = monitoring::RequestMonitor::new(500);
+    let log_path = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("kiro.log");
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
@@ -107,6 +112,7 @@ async fn main() {
         &api_key,
         Some(kiro_provider),
         first_credentials.profile_arn.clone(),
+        request_monitor.clone(),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -122,7 +128,8 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
-            let admin_service = admin::AdminService::new(token_manager.clone());
+            let admin_service =
+                admin::AdminService::new(token_manager.clone(), request_monitor.clone(), log_path);
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 

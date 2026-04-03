@@ -177,9 +177,15 @@ curl http://127.0.0.1:8990/v1/chat/completions \
 
 ## 本地运维与同步
 
-如果你正在维护这个仓库的本地定制版本，包含 OpenAI 兼容层、`systemd` 保活和上游同步约定，请先阅读：
+如果你正在维护这个仓库的本地定制版本，包含 OpenAI 兼容层、Admin 监控页面、`systemd` 保活和上游同步约定，请先阅读：
 
 - [docs/MAINTENANCE.md](docs/MAINTENANCE.md)
+
+当前本地定制还额外包含：
+
+- Admin 页面实时调用记录
+- Admin 页面成功/失败统计
+- Admin 页面日志 tail 展示
 
 ### Docker
 

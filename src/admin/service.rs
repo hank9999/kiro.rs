@@ -1,7 +1,9 @@
 //! Admin API 业务逻辑服务
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -10,11 +12,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::monitoring::{RequestActivitySnapshot, RequestMonitor};
 
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    CredentialsStatusResponse, LoadBalancingModeResponse, LogsResponse,
+    SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -34,12 +38,18 @@ struct CachedBalance {
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
+    request_monitor: RequestMonitor,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     cache_path: Option<PathBuf>,
+    log_path: PathBuf,
 }
 
 impl AdminService {
-    pub fn new(token_manager: Arc<MultiTokenManager>) -> Self {
+    pub fn new(
+        token_manager: Arc<MultiTokenManager>,
+        request_monitor: RequestMonitor,
+        log_path: PathBuf,
+    ) -> Self {
         let cache_path = token_manager
             .cache_dir()
             .map(|d| d.join("kiro_balance_cache.json"));
@@ -48,8 +58,10 @@ impl AdminService {
 
         Self {
             token_manager,
+            request_monitor,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
+            log_path,
         }
     }
 
@@ -255,6 +267,35 @@ impl AdminService {
         }
     }
 
+    /// 获取最近请求活动
+    pub fn get_request_activity(&self, limit: usize) -> RequestActivitySnapshot {
+        self.request_monitor.snapshot(limit)
+    }
+
+    /// 获取最近日志
+    pub fn get_recent_logs(&self, lines: usize) -> LogsResponse {
+        let lines = lines.clamp(1, 500);
+
+        match read_tail_lines(&self.log_path, lines) {
+            Ok((lines, truncated)) => LogsResponse {
+                path: self.log_path.display().to_string(),
+                available: true,
+                fetched_at: Utc::now().to_rfc3339(),
+                truncated,
+                lines,
+                error: None,
+            },
+            Err(error) => LogsResponse {
+                path: self.log_path.display().to_string(),
+                available: false,
+                fetched_at: Utc::now().to_rfc3339(),
+                truncated: false,
+                lines: Vec::new(),
+                error: Some(error),
+            },
+        }
+    }
+
     /// 设置负载均衡模式
     pub fn set_load_balancing_mode(
         &self,
@@ -421,4 +462,58 @@ impl AdminService {
             AdminServiceError::InternalError(msg)
         }
     }
+}
+
+const LOG_TAIL_BYTES: u64 = 128 * 1024;
+
+fn read_tail_lines(path: &Path, max_lines: usize) -> Result<(Vec<String>, bool), String> {
+    let mut file = File::open(path).map_err(|e| format!("打开日志文件失败: {}", e))?;
+    let file_size = file
+        .metadata()
+        .map_err(|e| format!("读取日志文件信息失败: {}", e))?
+        .len();
+
+    let start_offset = file_size.saturating_sub(LOG_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start_offset))
+        .map_err(|e| format!("定位日志文件失败: {}", e))?;
+
+    let mut buffer = String::new();
+    file.read_to_string(&mut buffer)
+        .map_err(|e| format!("读取日志文件失败: {}", e))?;
+
+    let mut lines: Vec<String> = buffer.lines().map(strip_ansi_codes).collect();
+
+    if start_offset > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+
+    let truncated = lines.len() > max_lines;
+    if truncated {
+        lines = lines[lines.len() - max_lines..].to_vec();
+    }
+
+    Ok((lines, truncated))
+}
+
+fn strip_ansi_codes(line: &str) -> String {
+    let mut result = String::with_capacity(line.len());
+    let mut in_escape = false;
+
+    for ch in line.chars() {
+        if in_escape {
+            if matches!(ch, 'm' | 'K') {
+                in_escape = false;
+            }
+            continue;
+        }
+
+        if ch == '\u{1b}' {
+            in_escape = true;
+            continue;
+        }
+
+        result.push(ch);
+    }
+
+    result
 }

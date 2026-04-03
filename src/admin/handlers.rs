@@ -2,15 +2,15 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
 };
 
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        ActivityQuery, AddCredentialRequest, LogsQuery, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
     },
 };
 
@@ -19,6 +19,26 @@ use super::{
 pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
     let response = state.service.get_all_credentials();
     Json(response)
+}
+
+/// GET /api/admin/activity
+/// 获取最近请求活动
+pub async fn get_request_activity(
+    State(state): State<AdminState>,
+    Query(query): Query<ActivityQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    Json(state.service.get_request_activity(limit))
+}
+
+/// GET /api/admin/logs
+/// 获取最近日志
+pub async fn get_recent_logs(
+    State(state): State<AdminState>,
+    Query(query): Query<LogsQuery>,
+) -> impl IntoResponse {
+    let lines = query.lines.unwrap_or(120).clamp(1, 500);
+    Json(state.service.get_recent_logs(lines))
 }
 
 /// POST /api/admin/credentials/:id/disabled

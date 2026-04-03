@@ -82,3 +82,41 @@ export interface AddCredentialResponse {
   credentialId: number
   email?: string
 }
+
+// 请求活动统计
+export interface RequestActivitySummary {
+  totalRequests: number
+  successRequests: number
+  failedRequests: number
+  inFlight: number
+  successRate: number
+  lastUpdatedAt: string | null
+}
+
+export interface RequestActivityRecord {
+  id: number
+  method: string
+  path: string
+  endpoint: string
+  statusCode: number
+  success: boolean
+  durationMs: number
+  startedAt: string
+  finishedAt: string
+  message?: string
+}
+
+export interface RequestActivityResponse {
+  summary: RequestActivitySummary
+  records: RequestActivityRecord[]
+}
+
+// 日志响应
+export interface LogsResponse {
+  path: string
+  available: boolean
+  fetchedAt: string
+  truncated: boolean
+  lines: string[]
+  error?: string
+}

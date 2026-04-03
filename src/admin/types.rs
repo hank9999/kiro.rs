@@ -181,6 +181,37 @@ pub struct SetLoadBalancingModeRequest {
     pub mode: String,
 }
 
+// ============ 查询参数 / 日志 ============
+
+/// 请求活动查询参数
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityQuery {
+    /// 返回的记录条数，默认 50，最大 200
+    pub limit: Option<usize>,
+}
+
+/// 日志查询参数
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogsQuery {
+    /// 返回的日志行数，默认 120，最大 500
+    pub lines: Option<usize>,
+}
+
+/// 最近日志响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogsResponse {
+    pub path: String,
+    pub available: bool,
+    pub fetched_at: String,
+    pub truncated: bool,
+    pub lines: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 // ============ 通用响应 ============
 
 /// 操作成功响应

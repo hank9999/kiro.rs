@@ -9,6 +9,8 @@ import {
   addCredential,
   deleteCredential,
   getLoadBalancingMode,
+  getRecentLogs,
+  getRequestActivity,
   setLoadBalancingMode,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
@@ -116,5 +118,23 @@ export function useSetLoadBalancingMode() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
     },
+  })
+}
+
+// 获取最近请求活动
+export function useRequestActivity(limit = 50) {
+  return useQuery({
+    queryKey: ['requestActivity', limit],
+    queryFn: () => getRequestActivity(limit),
+    refetchInterval: 3000,
+  })
+}
+
+// 获取最近日志
+export function useRecentLogs(lines = 120) {
+  return useQuery({
+    queryKey: ['recentLogs', lines],
+    queryFn: () => getRecentLogs(lines),
+    refetchInterval: 5000,
   })
 }

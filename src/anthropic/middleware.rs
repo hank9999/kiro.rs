@@ -12,6 +12,7 @@ use axum::{
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
+use crate::monitoring::{RequestMetadata, RequestMonitor};
 
 use super::types::ErrorResponse;
 
@@ -25,15 +26,18 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// Profile ARN（可选，用于请求）
     pub profile_arn: Option<String>,
+    /// 请求监控器
+    pub request_monitor: RequestMonitor,
 }
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>) -> Self {
+    pub fn new(api_key: impl Into<String>, request_monitor: RequestMonitor) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
             profile_arn: None,
+            request_monitor,
         }
     }
 
@@ -50,17 +54,31 @@ impl AppState {
     }
 }
 
-/// API Key 认证中间件
-pub async fn auth_middleware(
+/// API Key 认证 + 请求记录中间件
+pub async fn auth_and_monitor_middleware(
     State(state): State<AppState>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    let tracker = state.request_monitor.start(RequestMetadata::new(
+        request.method().to_string(),
+        request.uri().path().to_string(),
+    ));
+
     match auth::extract_api_key(&request) {
-        Some(key) if auth::constant_time_eq(&key, &state.api_key) => next.run(request).await,
+        Some(key) if auth::constant_time_eq(&key, &state.api_key) => {
+            let response = next.run(request).await;
+            tracker.finish(response.status().as_u16(), None);
+            response
+        }
         _ => {
             let error = ErrorResponse::authentication_error();
-            (StatusCode::UNAUTHORIZED, Json(error)).into_response()
+            let response = (StatusCode::UNAUTHORIZED, Json(error)).into_response();
+            tracker.finish(
+                StatusCode::UNAUTHORIZED.as_u16(),
+                Some("Authentication failed".to_string()),
+            );
+            response
         }
     }
 }

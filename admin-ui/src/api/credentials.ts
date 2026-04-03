@@ -8,6 +8,8 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  LogsResponse,
+  RequestActivityResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -102,5 +104,21 @@ export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'bala
 // 设置负载均衡模式
 export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
   const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
+  return data
+}
+
+// 获取最近请求活动
+export async function getRequestActivity(limit = 50): Promise<RequestActivityResponse> {
+  const { data } = await api.get<RequestActivityResponse>('/activity', {
+    params: { limit },
+  })
+  return data
+}
+
+// 获取最近日志
+export async function getRecentLogs(lines = 120): Promise<LogsResponse> {
+  const { data } = await api.get<LogsResponse>('/logs', {
+    params: { lines },
+  })
   return data
 }
