@@ -375,13 +375,20 @@ impl KiroProvider {
             );
 
             // 发送请求
-            let response = match self
+            let mut request = self
                 .client_for(&ctx.credentials)?
                 .post(&url)
                 .body(request_body.to_string())
                 .header("content-type", "application/json")
                 .header("x-amzn-codewhisperer-optout", "true")
-                .header("x-amzn-kiro-agent-mode", "vibe")
+                .header("x-amzn-kiro-agent-mode", "vibe");
+
+            // 对话请求需要携带 profile ARN（如果凭据中存在）
+            if let Some(ref arn) = ctx.credentials.profile_arn {
+                request = request.header("x-amzn-kiro-profile-arn", arn);
+            }
+
+            let response = match request
                 .header("x-amz-user-agent", &x_amz_user_agent)
                 .header("user-agent", &user_agent)
                 .header("host", &self.base_domain_for(&ctx.credentials))
