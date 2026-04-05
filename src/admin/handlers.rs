@@ -9,8 +9,9 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        ActivityQuery, AddCredentialRequest, LogsQuery, SetDisabledRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
+        ActivityQuery, AddApiKeyRequest, AddCredentialRequest, GenerateApiKeyRequest, LogsQuery,
+        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
+        UpdateApiKeyRequest,
     },
 };
 
@@ -163,6 +164,90 @@ pub async fn set_load_balancing_mode(
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
         Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+// ============ API Key 管理处理器 ============
+
+/// GET /api/admin/api-keys
+/// 获取所有 API Keys
+pub async fn get_api_keys(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_api_keys() {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/api-keys
+/// 添加新的 API Key
+pub async fn add_api_key(
+    State(state): State<AdminState>,
+    Json(payload): Json<AddApiKeyRequest>,
+) -> impl IntoResponse {
+    match state.service.add_api_key(payload) {
+        Ok(key_info) => {
+            // 重新加载 AppState 的 Keys
+            if let Err(e) = state.app_state.reload_keys() {
+                tracing::error!("重新加载 API Keys 失败: {}", e);
+            }
+            Json(key_info).into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/api-keys/generate
+/// 生成随机 API Key
+pub async fn generate_api_key(
+    State(state): State<AdminState>,
+    Json(payload): Json<GenerateApiKeyRequest>,
+) -> impl IntoResponse {
+    match state.service.generate_api_key(payload) {
+        Ok(response) => {
+            // 重新加载 AppState 的 Keys
+            if let Err(e) = state.app_state.reload_keys() {
+                tracing::error!("重新加载 API Keys 失败: {}", e);
+            }
+            Json(response).into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/api-keys/:id
+/// 更新 API Key
+pub async fn update_api_key(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateApiKeyRequest>,
+) -> impl IntoResponse {
+    match state.service.update_api_key(&id, payload) {
+        Ok(_) => {
+            // 重新加载 AppState 的 Keys
+            if let Err(e) = state.app_state.reload_keys() {
+                tracing::error!("重新加载 API Keys 失败: {}", e);
+            }
+            Json(SuccessResponse::new(format!("API Key {} 已更新", id))).into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// DELETE /api/admin/api-keys/:id
+/// 删除 API Key
+pub async fn delete_api_key(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.service.delete_api_key(&id) {
+        Ok(_) => {
+            // 重新加载 AppState 的 Keys
+            if let Err(e) = state.app_state.reload_keys() {
+                tracing::error!("重新加载 API Keys 失败: {}", e);
+            }
+            Json(SuccessResponse::new(format!("API Key {} 已删除", id))).into_response()
+        }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

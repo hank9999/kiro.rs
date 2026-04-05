@@ -16,6 +16,19 @@ impl Default for TlsBackend {
     }
 }
 
+/// API Key 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyConfig {
+    pub id: String,
+    pub key: String,
+    pub name: String,
+    pub enabled: bool,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,6 +60,10 @@ pub struct Config {
 
     #[serde(default)]
     pub api_key: Option<String>,
+
+    /// API Keys 列表（新增，可选）
+    #[serde(default)]
+    pub api_keys: Vec<ApiKeyConfig>,
 
     #[serde(default = "default_system_version")]
     pub system_version: String,
@@ -143,6 +160,7 @@ impl Default for Config {
             kiro_version: default_kiro_version(),
             machine_id: None,
             api_key: None,
+            api_keys: Vec::new(),
             system_version: default_system_version(),
             node_version: default_node_version(),
             tls_backend: default_tls_backend(),
@@ -209,5 +227,26 @@ impl Config {
         fs::write(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+
+    /// 收集所有有效的 API Keys（主Key + 启用的新Keys）
+    pub fn collect_valid_keys(&self) -> Vec<String> {
+        let mut keys = Vec::new();
+
+        // 1. 添加主Key（如果存在且非空）
+        if let Some(key) = &self.api_key {
+            if !key.trim().is_empty() {
+                keys.push(key.clone());
+            }
+        }
+
+        // 2. 添加所有启用的新Keys
+        for api_key_config in &self.api_keys {
+            if api_key_config.enabled && !api_key_config.key.trim().is_empty() {
+                keys.push(api_key_config.key.clone());
+            }
+        }
+
+        keys
     }
 }

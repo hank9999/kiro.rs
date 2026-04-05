@@ -2,15 +2,16 @@
 
 use axum::{
     Router, middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 
 use super::{
     handlers::{
-        add_credential, delete_credential, force_refresh_token, get_all_credentials,
-        get_available_models, get_credential_balance, get_load_balancing_mode, get_recent_logs,
-        get_request_activity, reset_failure_count, set_credential_disabled,
-        set_credential_priority, set_load_balancing_mode,
+        add_api_key, add_credential, delete_api_key, delete_credential, force_refresh_token,
+        generate_api_key, get_all_credentials, get_api_keys, get_available_models,
+        get_credential_balance, get_load_balancing_mode, get_recent_logs, get_request_activity,
+        reset_failure_count, set_credential_disabled, set_credential_priority,
+        set_load_balancing_mode, update_api_key,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -28,6 +29,11 @@ use super::{
 /// - `GET /credentials/:id/balance` - 获取凭据余额
 /// - `GET /config/load-balancing` - 获取负载均衡模式
 /// - `PUT /config/load-balancing` - 设置负载均衡模式
+/// - `GET /api-keys` - 获取所有 API Keys
+/// - `POST /api-keys` - 添加新 API Key
+/// - `POST /api-keys/generate` - 生成随机 API Key
+/// - `PUT /api-keys/:id` - 更新 API Key
+/// - `DELETE /api-keys/:id` - 删除 API Key
 ///
 /// # 认证
 /// 需要 Admin API Key 认证，支持：
@@ -52,6 +58,9 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
         )
+        .route("/api-keys", get(get_api_keys).post(add_api_key))
+        .route("/api-keys/generate", post(generate_api_key))
+        .route("/api-keys/{id}", put(update_api_key).delete(delete_api_key))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

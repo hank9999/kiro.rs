@@ -12,6 +12,9 @@ pub enum AdminServiceError {
     /// 凭据不存在
     NotFound { id: u64 },
 
+    /// 资源不存在（通用）
+    NotFoundGeneric(String),
+
     /// 上游服务调用失败（网络、API 错误等）
     UpstreamError(String),
 
@@ -20,6 +23,9 @@ pub enum AdminServiceError {
 
     /// 凭据无效（验证失败）
     InvalidCredential(String),
+
+    /// 无效请求
+    InvalidRequest(String),
 }
 
 impl fmt::Display for AdminServiceError {
@@ -28,9 +34,11 @@ impl fmt::Display for AdminServiceError {
             AdminServiceError::NotFound { id } => {
                 write!(f, "凭据不存在: {}", id)
             }
+            AdminServiceError::NotFoundGeneric(msg) => write!(f, "{}", msg),
             AdminServiceError::UpstreamError(msg) => write!(f, "上游服务错误: {}", msg),
             AdminServiceError::InternalError(msg) => write!(f, "内部错误: {}", msg),
             AdminServiceError::InvalidCredential(msg) => write!(f, "凭据无效: {}", msg),
+            AdminServiceError::InvalidRequest(msg) => write!(f, "无效请求: {}", msg),
         }
     }
 }
@@ -42,9 +50,11 @@ impl AdminServiceError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             AdminServiceError::NotFound { .. } => StatusCode::NOT_FOUND,
+            AdminServiceError::NotFoundGeneric(_) => StatusCode::NOT_FOUND,
             AdminServiceError::UpstreamError(_) => StatusCode::BAD_GATEWAY,
             AdminServiceError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AdminServiceError::InvalidCredential(_) => StatusCode::BAD_REQUEST,
+            AdminServiceError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -52,11 +62,15 @@ impl AdminServiceError {
     pub fn into_response(self) -> AdminErrorResponse {
         match &self {
             AdminServiceError::NotFound { .. } => AdminErrorResponse::not_found(self.to_string()),
+            AdminServiceError::NotFoundGeneric(_) => AdminErrorResponse::not_found(self.to_string()),
             AdminServiceError::UpstreamError(_) => AdminErrorResponse::api_error(self.to_string()),
             AdminServiceError::InternalError(_) => {
                 AdminErrorResponse::internal_error(self.to_string())
             }
             AdminServiceError::InvalidCredential(_) => {
+                AdminErrorResponse::invalid_request(self.to_string())
+            }
+            AdminServiceError::InvalidRequest(_) => {
                 AdminErrorResponse::invalid_request(self.to_string())
             }
         }

@@ -124,11 +124,13 @@ async fn main() {
     let first_credentials = credentials_list.first().cloned().unwrap_or_default();
     tracing::debug!("主凭证: {:?}", first_credentials);
 
-    // 获取 API Key
-    let api_key = config.api_key.clone().unwrap_or_else(|| {
-        tracing::error!("配置文件中未设置 apiKey");
+    // 收集所有有效的 API Keys
+    let api_keys = config.collect_valid_keys();
+    if api_keys.is_empty() {
+        tracing::error!("配置文件中未设置有效的 API Key");
         std::process::exit(1);
-    });
+    }
+    tracing::info!("已加载 {} 个 API Key", api_keys.len());
 
     // 构建代理配置
     let proxy_config = config.proxy_url.as_ref().map(|url| {
@@ -168,12 +170,18 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
+    // 创建共享的 AppState
+    let app_state = anthropic::middleware::AppState::new(
+        api_keys.clone(),
+        config_path.clone().into(),
+        request_monitor.clone(),
+    );
+
     // 构建 Anthropic API 路由（从第一个凭据获取 profile_arn）
     let anthropic_app = anthropic::create_router_with_provider(
-        &api_key,
+        app_state.clone(),
         Some(kiro_provider),
         first_credentials.profile_arn.clone(),
-        request_monitor.clone(),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -189,9 +197,13 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
-            let admin_service =
-                admin::AdminService::new(token_manager.clone(), request_monitor.clone(), log_path);
-            let admin_state = admin::AdminState::new(admin_key, admin_service);
+            let admin_service = admin::AdminService::new(
+                token_manager.clone(),
+                request_monitor.clone(),
+                log_path,
+                config_path.into(),
+            );
+            let admin_state = admin::AdminState::new(admin_key, admin_service, app_state);
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由
@@ -210,7 +222,7 @@ async fn main() {
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("启动 Anthropic API 端点: {}", addr);
-    tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
+    tracing::info!("已加载 {} 个 API Key", api_keys.len());
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");

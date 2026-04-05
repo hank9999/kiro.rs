@@ -14,7 +14,6 @@ use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_and_monitor_middleware, cors_layer},
 };
-use crate::monitoring::RequestMonitor;
 
 /// 请求体最大大小限制 (50MB)
 const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
@@ -37,12 +36,10 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 
 /// 创建带有 KiroProvider 的 Anthropic API 路由
 pub fn create_router_with_provider(
-    api_key: impl Into<String>,
+    mut state: AppState,
     kiro_provider: Option<KiroProvider>,
     profile_arn: Option<String>,
-    request_monitor: RequestMonitor,
 ) -> Router {
-    let mut state = AppState::new(api_key, request_monitor);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }

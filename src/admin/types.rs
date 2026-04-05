@@ -212,6 +212,74 @@ pub struct LogsResponse {
     pub error: Option<String>,
 }
 
+// ============ API Key 管理 ============
+
+/// API Key 信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyInfo {
+    pub id: String,
+    pub key: String,
+    pub name: String,
+    pub enabled: bool,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
+    /// 是否为主Key（来自旧配置的 apiKey）
+    #[serde(default)]
+    pub is_primary: bool,
+}
+
+/// API Keys 列表响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeysListResponse {
+    pub api_keys: Vec<ApiKeyInfo>,
+    /// 主Key（如果存在）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_key: Option<ApiKeyInfo>,
+}
+
+/// 添加 API Key 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddApiKeyRequest {
+    pub key: String,
+    pub name: String,
+}
+
+/// 生成 API Key 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateApiKeyRequest {
+    pub name: String,
+    /// Key 长度（默认 32）
+    #[serde(default = "default_key_length")]
+    pub length: usize,
+}
+
+fn default_key_length() -> usize {
+    32
+}
+
+/// 生成 API Key 响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateApiKeyResponse {
+    pub key: String,
+    pub id: String,
+}
+
+/// 更新 API Key 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateApiKeyRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
 // ============ 通用响应 ============
 
 /// 操作成功响应

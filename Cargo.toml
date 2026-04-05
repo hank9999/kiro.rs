@@ -20,7 +20,8 @@ anyhow = "1.0"
 http = "1.0"
 futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.10", features = ["v1", "v4", "fast-rng"] }
+uuid = { version = "1.10", features = ["v1", "v4", "fast-rng", "serde"] }
+rand = "0.8"
 fastrand = "2"
 sha2 = "0.10"
 hex = "0.4"

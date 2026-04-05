@@ -149,3 +149,46 @@ export interface LogsResponse {
   lines: string[];
   error?: string;
 }
+
+// ============ API Key 管理类型 ============
+
+// API Key 信息
+export interface ApiKeyInfo {
+  id: string;
+  key: string;
+  name: string;
+  enabled: boolean;
+  createdAt: string;
+  lastUsedAt?: string;
+  isPrimary: boolean;
+}
+
+// API Keys 列表响应
+export interface ApiKeysListResponse {
+  apiKeys: ApiKeyInfo[];
+  primaryKey?: ApiKeyInfo;
+}
+
+// 添加 API Key 请求
+export interface AddApiKeyRequest {
+  key: string;
+  name: string;
+}
+
+// 生成 API Key 请求
+export interface GenerateApiKeyRequest {
+  name: string;
+  length?: number;
+}
+
+// 生成 API Key 响应
+export interface GenerateApiKeyResponse {
+  key: string;
+  id: string;
+}
+
+// 更新 API Key 请求
+export interface UpdateApiKeyRequest {
+  name?: string;
+  enabled?: boolean;
+}

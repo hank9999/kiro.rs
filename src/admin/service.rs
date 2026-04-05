@@ -17,10 +17,12 @@ use crate::monitoring::{RequestActivitySnapshot, RequestMonitor};
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, LogsResponse,
-    SetLoadBalancingModeRequest,
+    AddCredentialRequest, AddCredentialResponse, AddApiKeyRequest, ApiKeyInfo,
+    ApiKeysListResponse, BalanceResponse, CredentialStatusItem, CredentialsStatusResponse,
+    GenerateApiKeyRequest, GenerateApiKeyResponse, LoadBalancingModeResponse, LogsResponse,
+    SetLoadBalancingModeRequest, UpdateApiKeyRequest,
 };
+use crate::model::config::{ApiKeyConfig, Config};
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
@@ -43,6 +45,7 @@ pub struct AdminService {
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     cache_path: Option<PathBuf>,
     log_path: PathBuf,
+    config_path: PathBuf,
 }
 
 impl AdminService {
@@ -50,6 +53,7 @@ impl AdminService {
         token_manager: Arc<MultiTokenManager>,
         request_monitor: RequestMonitor,
         log_path: PathBuf,
+        config_path: PathBuf,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -63,6 +67,7 @@ impl AdminService {
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             log_path,
+            config_path,
         }
     }
 
@@ -529,6 +534,224 @@ fn strip_ansi_codes(line: &str) -> String {
     }
 
     result
+}
+
+impl AdminService {
+    // ============ API Key 管理方法 ============
+
+    /// 获取所有 API Keys
+    pub fn get_api_keys(&self) -> Result<ApiKeysListResponse, AdminServiceError> {
+        let config = Config::load(&self.config_path)
+            .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+
+        let api_keys: Vec<ApiKeyInfo> = config
+            .api_keys
+            .iter()
+            .map(|k| ApiKeyInfo {
+                id: k.id.clone(),
+                key: k.key.clone(),
+                name: k.name.clone(),
+                enabled: k.enabled,
+                created_at: k.created_at.clone(),
+                last_used_at: k.last_used_at.clone(),
+                is_primary: false,
+            })
+            .collect();
+
+        // 处理主Key（来自旧配置）
+        let primary_key = config.api_key.as_ref().and_then(|key| {
+            if key.trim().is_empty() {
+                None
+            } else {
+                Some(ApiKeyInfo {
+                    id: "primary".to_string(),
+                    key: key.clone(),
+                    name: "主Key（来自配置）".to_string(),
+                    enabled: true,
+                    created_at: "N/A".to_string(),
+                    last_used_at: None,
+                    is_primary: true,
+                })
+            }
+        });
+
+        Ok(ApiKeysListResponse {
+            api_keys,
+            primary_key,
+        })
+    }
+
+    /// 添加新的 API Key
+    pub fn add_api_key(
+        &self,
+        req: AddApiKeyRequest,
+    ) -> Result<ApiKeyInfo, AdminServiceError> {
+        let key = req.key.trim();
+        if key.is_empty() {
+            return Err(AdminServiceError::InvalidRequest("Key 不能为空".to_string()));
+        }
+
+        let mut config = Config::load(&self.config_path)
+            .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+
+        // 检查Key是否重复
+        if config.api_key.as_ref().map(|k| k == key).unwrap_or(false) {
+            return Err(AdminServiceError::InvalidRequest(
+                "Key 与主Key重复".to_string(),
+            ));
+        }
+        if config.api_keys.iter().any(|k| k.key == key) {
+            return Err(AdminServiceError::InvalidRequest("Key 已存在".to_string()));
+        }
+
+        let new_key = ApiKeyConfig {
+            id: uuid::Uuid::new_v4().to_string(),
+            key: key.to_string(),
+            name: req.name.trim().to_string(),
+            enabled: true,
+            created_at: Utc::now().to_rfc3339(),
+            last_used_at: None,
+        };
+
+        let key_info = ApiKeyInfo {
+            id: new_key.id.clone(),
+            key: new_key.key.clone(),
+            name: new_key.name.clone(),
+            enabled: new_key.enabled,
+            created_at: new_key.created_at.clone(),
+            last_used_at: None,
+            is_primary: false,
+        };
+
+        config.api_keys.push(new_key);
+        config
+            .save()
+            .map_err(|e| AdminServiceError::InternalError(format!("保存配置失败: {}", e)))?;
+
+        Ok(key_info)
+    }
+
+    /// 生成随机 API Key
+    pub fn generate_api_key(
+        &self,
+        req: GenerateApiKeyRequest,
+    ) -> Result<GenerateApiKeyResponse, AdminServiceError> {
+        use rand::{thread_rng, Rng};
+        use rand::distributions::Alphanumeric;
+
+        let length = req.length.clamp(16, 64);
+        let key: String = thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(length)
+            .map(char::from)
+            .collect();
+
+        let mut config = Config::load(&self.config_path)
+            .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+
+        let new_key = ApiKeyConfig {
+            id: uuid::Uuid::new_v4().to_string(),
+            key: key.clone(),
+            name: req.name.trim().to_string(),
+            enabled: true,
+            created_at: Utc::now().to_rfc3339(),
+            last_used_at: None,
+        };
+
+        let id = new_key.id.clone();
+        config.api_keys.push(new_key);
+        config
+            .save()
+            .map_err(|e| AdminServiceError::InternalError(format!("保存配置失败: {}", e)))?;
+
+        Ok(GenerateApiKeyResponse { key, id })
+    }
+
+    /// 更新 API Key
+    pub fn update_api_key(
+        &self,
+        id: &str,
+        req: UpdateApiKeyRequest,
+    ) -> Result<(), AdminServiceError> {
+        let mut config = Config::load(&self.config_path)
+            .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+
+        // 先找到Key的索引
+        let key_index = config
+            .api_keys
+            .iter()
+            .position(|k| k.id == id)
+            .ok_or_else(|| AdminServiceError::NotFoundGeneric(format!("Key {} 不存在", id)))?;
+
+        // 如果要禁用，检查是否至少保留一个启用的Key
+        if let Some(false) = req.enabled {
+            if config.api_keys[key_index].enabled {
+                let enabled_count = config
+                    .api_keys
+                    .iter()
+                    .filter(|k| k.enabled && k.id != id)
+                    .count();
+                let has_primary = config
+                    .api_key
+                    .as_ref()
+                    .map(|k| !k.trim().is_empty())
+                    .unwrap_or(false);
+
+                if enabled_count == 0 && !has_primary {
+                    return Err(AdminServiceError::InvalidRequest(
+                        "至少需要保留一个启用的 Key".to_string(),
+                    ));
+                }
+            }
+        }
+
+        // 更新Key
+        let key = &mut config.api_keys[key_index];
+        if let Some(name) = req.name {
+            key.name = name.trim().to_string();
+        }
+        if let Some(enabled) = req.enabled {
+            key.enabled = enabled;
+        }
+
+        config
+            .save()
+            .map_err(|e| AdminServiceError::InternalError(format!("保存配置失败: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// 删除 API Key
+    pub fn delete_api_key(&self, id: &str) -> Result<(), AdminServiceError> {
+        let mut config = Config::load(&self.config_path)
+            .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+
+        let index = config
+            .api_keys
+            .iter()
+            .position(|k| k.id == id)
+            .ok_or_else(|| AdminServiceError::NotFoundGeneric(format!("Key {} 不存在", id)))?;
+
+        // 检查是否至少保留一个启用的Key
+        let key_to_delete = &config.api_keys[index];
+        if key_to_delete.enabled {
+            let enabled_count = config.api_keys.iter().filter(|k| k.enabled && k.id != id).count();
+            let has_primary = config.api_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false);
+
+            if enabled_count == 0 && !has_primary {
+                return Err(AdminServiceError::InvalidRequest(
+                    "至少需要保留一个启用的 Key".to_string(),
+                ));
+            }
+        }
+
+        config.api_keys.remove(index);
+        config
+            .save()
+            .map_err(|e| AdminServiceError::InternalError(format!("保存配置失败: {}", e)))?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
