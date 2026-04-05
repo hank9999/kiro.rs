@@ -41,6 +41,25 @@ pub struct KiroProvider {
 }
 
 impl KiroProvider {
+    fn log_bad_request_details(
+        api_type: &str,
+        attempt: usize,
+        max_retries: usize,
+        status: reqwest::StatusCode,
+        request_body: &str,
+        response_body: &str,
+    ) {
+        tracing::error!(
+            api_type = %api_type,
+            attempt = attempt + 1,
+            max_retries = max_retries,
+            status = %status,
+            "Kiro 上游返回 400 Bad Request，完整请求/响应如下。\n==== Request Body ====\n{}\n==== Response Body ====\n{}",
+            request_body,
+            response_body
+        );
+    }
+
     /// 创建新的 KiroProvider 实例
     pub fn new(token_manager: Arc<MultiTokenManager>) -> Self {
         Self::with_proxy(token_manager, None)
@@ -253,7 +272,7 @@ impl KiroProvider {
             let mut request = self
                 .client_for(&ctx.credentials)?
                 .post(&url)
-                .body(request_body)
+                .body(request_body.clone())
                 .header("content-type", "application/json")
                 .header("accept", "application/json");
 
@@ -312,6 +331,7 @@ impl KiroProvider {
 
             // 400 Bad Request
             if status.as_u16() == 400 {
+                Self::log_bad_request_details("MCP", attempt, max_retries, status, &request_body, &body);
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
@@ -411,7 +431,7 @@ impl KiroProvider {
             let mut request = self
                 .client_for(&ctx.credentials)?
                 .post(&url)
-                .body(request_body)
+                .body(request_body.clone())
                 .header("content-type", "application/json")
                 .header("accept", "application/json")
                 .header("x-amzn-codewhisperer-optout", "true")
@@ -489,6 +509,14 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
+                Self::log_bad_request_details(
+                    api_type,
+                    attempt,
+                    max_retries,
+                    status,
+                    &request_body,
+                    &body,
+                );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 

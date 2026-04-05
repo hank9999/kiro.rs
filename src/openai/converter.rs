@@ -560,8 +560,13 @@ fn convert_tools(
 }
 
 fn schema_to_hashmap(schema: &serde_json::Value) -> HashMap<String, serde_json::Value> {
-    match schema {
-        serde_json::Value::Object(map) => map.clone().into_iter().collect(),
+    use crate::anthropic::converter::normalize_json_schema;
+
+    // 规范化 JSON Schema，修复 required: null、properties: null 等问题
+    let normalized = normalize_json_schema(schema.clone());
+
+    match normalized {
+        serde_json::Value::Object(map) => map.into_iter().collect(),
         _ => json!({
             "type": "object",
             "properties": {},

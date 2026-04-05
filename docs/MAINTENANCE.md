@@ -17,7 +17,7 @@
     - `GET /api/admin/activity`
     - `GET /api/admin/logs`
 - 运行时监听地址改为 `0.0.0.0:8990`
-- 本地部署使用 `systemd` 托管，服务名为 `kiro-rs`
+- 本地部署使用 Docker 容器，容器名为 `kiro-rs`
 - 提供一键重建并重启脚本：`scripts/rebuild-and-restart.sh`
 - 本机额外接入 `GoProxy` 免费优选代理池，Kiro 出站统一走本地稳定代理
 
@@ -131,37 +131,26 @@ INVALID_MODEL_ID
 
 ## 服务保活
 
-当前服务通过 `systemd` 保活，不要再依赖临时终端、`nohup` 或手动常驻 shell。
+当前服务通过 Docker 容器保活，不要再依赖临时终端、`nohup`、手动 `docker cp` 二进制，或旧的 `systemd` 直跑方式。
 
-服务文件：
+当前容器默认配置：
 
-- 仓库模板：`deploy/kiro-rs.service`
-- 已安装路径：`/etc/systemd/system/kiro-rs.service`
+- 镜像：`kiro-rs:local`
+- 容器名：`kiro-rs`
+- 网络：`kiro-proxy-net`
+- 端口映射：`8990:8990`
+- 配置挂载：`./config -> /app/config`
+- 重启策略：`unless-stopped`
 
 常用命令：
 
 ```bash
-sudo systemctl status kiro-rs
-sudo systemctl restart kiro-rs
-sudo systemctl stop kiro-rs
-sudo journalctl -u kiro-rs -n 100 --no-pager
-tail -f /home/ubuntu/kiro-rs/kiro.log
+docker ps --filter name=kiro-rs
+docker restart kiro-rs
+docker stop kiro-rs
+docker logs --tail 100 kiro-rs
+docker inspect kiro-rs
 ```
-
-服务启动命令使用 release 二进制：
-
-```bash
-/home/ubuntu/kiro-rs/target/release/kiro-rs \
-  --config /home/ubuntu/kiro-rs/config.json \
-  --credentials /home/ubuntu/kiro-rs/credentials.json
-```
-
-服务配置里启用了：
-
-- `Restart=always`
-- `RestartSec=3`
-
-这表示进程退出后会自动拉起。
 
 ## 重建与发布
 
@@ -173,18 +162,26 @@ tail -f /home/ubuntu/kiro-rs/kiro.log
 
 这个脚本会执行：
 
-1. `cargo build --release`
-2. `sudo systemctl restart kiro-rs`
-3. 输出 `kiro-rs` 当前状态
+1. `docker build -t kiro-rs:local .`
+2. 删除旧的 `kiro-rs` 容器
+3. 用默认的端口、挂载和网络重新启动容器
+4. 等待本地 `8990` 端口可访问
+5. 输出容器状态和最近日志
 
-如果改了 Admin 前端，还需要先重新构建前端资源：
+注意：
 
-```bash
-cd /home/ubuntu/kiro-rs/admin-ui
-corepack pnpm build
-cd /home/ubuntu/kiro-rs
-./scripts/rebuild-and-restart.sh
-```
+- 不要再执行 `cargo build --release` 然后 `docker cp` 到 Alpine 容器，这会把宿主机的 GNU/glibc 二进制塞进容器，导致启动时报 `exec ./kiro-rs: no such file or directory`
+- 如果改了 Admin 前端，不需要单独手工构建，`Dockerfile` 在镜像构建阶段会自动执行前端构建
+
+可选环境变量：
+
+- `KIRO_IMAGE`
+- `KIRO_CONTAINER`
+- `KIRO_NETWORK`
+- `KIRO_CONFIG_DIR`
+- `KIRO_HOST_PORT`
+- `KIRO_CONTAINER_PORT`
+- `KIRO_STARTUP_TIMEOUT`
 
 ## Git 分支与上游同步
 
@@ -200,13 +197,13 @@ openai-compat
 当前需要长期保留的本地定制至少包括：
 
 - OpenAI 兼容层
-- `systemd` 部署与保活
+- Docker 部署与保活
 - Admin 监控页面与相关 API
 
 ### 推荐同步流程
 
 ```bash
-cd /home/ubuntu/kiro-rs
+cd /path/to/kiro.rs
 git switch openai-compat
 git status
 git add .
@@ -256,15 +253,17 @@ git push -u myfork openai-compat
 如果你怀疑服务挂了，先按这个顺序检查：
 
 ```bash
-sudo systemctl status kiro-rs
+docker ps -a --filter name=kiro-rs
+docker logs --tail 100 kiro-rs
 ss -ltnp | rg 8990
-tail -n 100 /home/ubuntu/kiro-rs/kiro.log
+curl -i http://127.0.0.1:8990/
 ```
 
 判断方式：
 
-- 如果 `systemctl` 显示 `active (running)`，说明服务仍在
+- 如果 `docker ps` 显示 `Up`，说明容器还活着
 - 如果端口 `8990` 没有监听，说明服务没有成功启动
+- 如果日志里出现 `exec ./kiro-rs: no such file or directory`，优先怀疑是把宿主机二进制错误地拷进了 Alpine 容器
 - 如果日志中出现 `INVALID_MODEL_ID`，这是模型权限问题，不是服务崩溃
 - 如果日志中出现 `Address already in use`，说明有多个实例抢占同一端口
 

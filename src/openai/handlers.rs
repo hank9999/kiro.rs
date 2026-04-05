@@ -123,6 +123,15 @@ pub async fn post_chat_completions(
             );
         }
     };
+    let debug_ctx = UpstreamDebugContext {
+        request_id: request_context.request_id.clone(),
+        endpoint: "/v1/chat/completions",
+        model: anthropic_payload.model.clone(),
+        original_payload: format!("{:#?}", &payload),
+        anthropic_payload: format!("{:#?}", &anthropic_payload),
+        kiro_request_body: serde_json::to_string_pretty(&kiro_request)
+            .unwrap_or_else(|e| format!("<<failed to serialize Kiro request for debug: {}>>", e)),
+    };
 
     let input_tokens = token::count_all_tokens(
         anthropic_payload.model.clone(),
@@ -146,6 +155,7 @@ pub async fn post_chat_completions(
             thinking_enabled,
             conversion_result.tool_name_map,
             include_usage,
+            &debug_ctx,
         )
         .await
     } else {
@@ -156,6 +166,7 @@ pub async fn post_chat_completions(
             input_tokens,
             thinking_enabled,
             conversion_result.tool_name_map,
+            &debug_ctx,
         )
         .await
     }
@@ -242,6 +253,15 @@ pub async fn post_responses(
             );
         }
     };
+    let debug_ctx = UpstreamDebugContext {
+        request_id: request_context.request_id.clone(),
+        endpoint: "/v1/responses",
+        model: anthropic_payload.model.clone(),
+        original_payload: format!("{:#?}", &payload),
+        anthropic_payload: format!("{:#?}", &anthropic_payload),
+        kiro_request_body: serde_json::to_string_pretty(&kiro_request)
+            .unwrap_or_else(|e| format!("<<failed to serialize Kiro request for debug: {}>>", e)),
+    };
 
     let input_tokens = token::count_all_tokens(
         anthropic_payload.model.clone(),
@@ -265,6 +285,7 @@ pub async fn post_responses(
             thinking_enabled,
             conversion_result.tool_name_map,
             include_usage,
+            &debug_ctx,
         )
         .await
     } else {
@@ -275,6 +296,7 @@ pub async fn post_responses(
             input_tokens,
             thinking_enabled,
             conversion_result.tool_name_map,
+            &debug_ctx,
         )
         .await
     }
@@ -286,6 +308,37 @@ fn openai_error_response(
     message: impl Into<String>,
 ) -> Response {
     (status, Json(ErrorResponse::new(error_type, message))).into_response()
+}
+
+struct UpstreamDebugContext {
+    request_id: String,
+    endpoint: &'static str,
+    model: String,
+    original_payload: String,
+    anthropic_payload: String,
+    kiro_request_body: String,
+}
+
+fn should_log_full_upstream_request(err: &Error) -> bool {
+    let err_str = err.to_string();
+    err_str.contains("Improperly formed request") || err_str.contains("400 Bad Request")
+}
+
+fn log_full_upstream_debug_context(ctx: &UpstreamDebugContext, err: &Error) {
+    if !should_log_full_upstream_request(err) {
+        return;
+    }
+
+    tracing::error!(
+        request_id = %ctx.request_id,
+        endpoint = %ctx.endpoint,
+        model = %ctx.model,
+        upstream_error = %err,
+        "上游返回非法请求，完整调试信息如下。\n==== Original Payload ====\n{}\n==== Anthropic Payload ====\n{}\n==== Kiro Request Body ====\n{}",
+        ctx.original_payload,
+        ctx.anthropic_payload,
+        ctx.kiro_request_body
+    );
 }
 
 fn map_provider_error(err: Error) -> Response {
@@ -322,10 +375,14 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: HashMap<String, String>,
+    debug_ctx: &UpstreamDebugContext,
 ) -> Response {
     let response = match provider.call_api(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            log_full_upstream_debug_context(debug_ctx, &e);
+            return map_provider_error(e);
+        }
     };
 
     let body_bytes = match response.bytes().await {
@@ -376,10 +433,14 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: HashMap<String, String>,
     include_usage: bool,
+    debug_ctx: &UpstreamDebugContext,
 ) -> Response {
     let response = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            log_full_upstream_debug_context(debug_ctx, &e);
+            return map_provider_error(e);
+        }
     };
 
     let mut ctx =
@@ -404,10 +465,14 @@ async fn handle_responses_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: HashMap<String, String>,
+    debug_ctx: &UpstreamDebugContext,
 ) -> Response {
     let response = match provider.call_api(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            log_full_upstream_debug_context(debug_ctx, &e);
+            return map_provider_error(e);
+        }
     };
 
     let body_bytes = match response.bytes().await {
@@ -458,10 +523,14 @@ async fn handle_responses_stream_request(
     thinking_enabled: bool,
     tool_name_map: HashMap<String, String>,
     include_usage: bool,
+    debug_ctx: &UpstreamDebugContext,
 ) -> Response {
     let response = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            log_full_upstream_debug_context(debug_ctx, &e);
+            return map_provider_error(e);
+        }
     };
 
     let mut ctx =
