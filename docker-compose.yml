@@ -28,10 +28,8 @@ services:
       retries: 3
 
   kiro-rs:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: kiro-rs:local
+    image: ghcr.io/siyuan-123/kiro-rs:beta
+    pull_policy: always
     container_name: kiro-rs
     depends_on:
       goproxy:
