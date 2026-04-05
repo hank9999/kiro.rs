@@ -487,10 +487,13 @@ fn read_tail_lines(path: &Path, max_lines: usize) -> Result<(Vec<String>, bool),
     file.seek(SeekFrom::Start(start_offset))
         .map_err(|e| format!("定位日志文件失败: {}", e))?;
 
-    let mut buffer = String::new();
-    file.read_to_string(&mut buffer)
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)
         .map_err(|e| format!("读取日志文件失败: {}", e))?;
 
+    // 从任意字节偏移读取尾部时，截断点可能落在 UTF-8 多字节字符中间。
+    // 这里使用 lossy 解码，并在 start_offset > 0 时丢弃首个残缺行，避免整段读取失败。
+    let buffer = String::from_utf8_lossy(&buffer);
     let mut lines: Vec<String> = buffer.lines().map(strip_ansi_codes).collect();
 
     if start_offset > 0 && !lines.is_empty() {
@@ -526,4 +529,50 @@ fn strip_ansi_codes(line: &str) -> String {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LOG_TAIL_BYTES, read_tail_lines};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_log_path(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}.log", std::process::id()))
+    }
+
+    #[test]
+    fn read_tail_lines_handles_utf8_boundary_in_tail_window() {
+        let path = temp_log_path("kiro-admin-log-tail");
+        let tail = (0..200)
+            .map(|i| format!("2026-04-05 INFO 第{i} 行日志\n"))
+            .collect::<String>();
+
+        let mut content = "中".as_bytes().to_vec();
+        let padding_len = (LOG_TAIL_BYTES as usize + 1)
+            .checked_sub(content.len() + 1 + tail.len())
+            .expect("tail payload should fit in the fixed test window");
+
+        content.extend(std::iter::repeat_n(b'a', padding_len));
+        content.push(b'\n');
+        content.extend_from_slice(tail.as_bytes());
+
+        fs::write(&path, &content).expect("test log file should be writable");
+
+        let (lines, truncated) = read_tail_lines(&path, 10).expect("tail read should succeed");
+
+        assert!(truncated);
+        assert_eq!(lines.len(), 10);
+        assert_eq!(
+            lines.last().expect("should keep the last log line"),
+            "2026-04-05 INFO 第199 行日志"
+        );
+
+        fs::remove_file(path).expect("test log file should be removable");
+    }
 }

@@ -5,6 +5,7 @@
 //! 支持多凭据故障转移和重试
 
 use reqwest::Client;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,8 +50,8 @@ impl KiroProvider {
     pub fn with_proxy(token_manager: Arc<MultiTokenManager>, proxy: Option<ProxyConfig>) -> Self {
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client
-        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
-            .expect("创建 HTTP 客户端失败");
+        let initial_client =
+            build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
 
@@ -97,7 +98,10 @@ impl KiroProvider {
 
     /// 获取 API 基础域名（使用 config 级 api_region）
     pub fn base_domain(&self) -> String {
-        format!("q.{}.amazonaws.com", self.token_manager.config().effective_api_region())
+        format!(
+            "q.{}.amazonaws.com",
+            self.token_manager.config().effective_api_region()
+        )
     }
 
     /// 获取凭据级 API 基础 URL
@@ -128,8 +132,6 @@ impl KiroProvider {
     ///
     /// 尝试解析 JSON 请求体，提取 conversationState.currentMessage.userInputMessage.modelId
     fn extract_model_from_request(request_body: &str) -> Option<String> {
-        use serde_json::Value;
-
         let json: Value = serde_json::from_str(request_body).ok()?;
 
         // 尝试提取 conversationState.currentMessage.userInputMessage.modelId
@@ -139,6 +141,28 @@ impl KiroProvider {
             .get("modelId")?
             .as_str()
             .map(|s| s.to_string())
+    }
+
+    /// 将当前凭据的 profileArn 动态注入请求体，避免使用启动时固化的值
+    fn inject_profile_arn(request_body: &str, credentials: &KiroCredentials) -> String {
+        let Some(profile_arn) = credentials.profile_arn.as_deref() else {
+            return request_body.to_string();
+        };
+
+        let Ok(mut json) = serde_json::from_str::<Value>(request_body) else {
+            return request_body.to_string();
+        };
+
+        let Some(obj) = json.as_object_mut() else {
+            return request_body.to_string();
+        };
+
+        obj.insert(
+            "profileArn".to_string(),
+            Value::String(profile_arn.to_string()),
+        );
+
+        serde_json::to_string(&json).unwrap_or_else(|_| request_body.to_string())
     }
 
     /// 发送非流式 API 请求
@@ -215,18 +239,23 @@ impl KiroProvider {
             };
 
             let url = self.mcp_url_for(&ctx.credentials);
-            let x_amz_user_agent = format!("aws-sdk-js/1.0.34 KiroIDE-{}-{}", config.kiro_version, machine_id);
+            let x_amz_user_agent = format!(
+                "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
+                config.kiro_version, machine_id
+            );
             let user_agent = format!(
                 "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
                 config.system_version, config.node_version, config.kiro_version, machine_id
             );
+            let request_body = Self::inject_profile_arn(request_body, &ctx.credentials);
 
             // 发送请求
             let mut request = self
                 .client_for(&ctx.credentials)?
                 .post(&url)
-                .body(request_body.to_string())
-                .header("content-type", "application/json");
+                .body(request_body)
+                .header("content-type", "application/json")
+                .header("accept", "application/json");
 
             // MCP 请求需要携带 profile ARN（如果凭据中存在）
             if let Some(ref arn) = ctx.credentials.profile_arn {
@@ -368,18 +397,23 @@ impl KiroProvider {
             };
 
             let url = self.base_url_for(&ctx.credentials);
-            let x_amz_user_agent = format!("aws-sdk-js/1.0.34 KiroIDE-{}-{}", config.kiro_version, machine_id);
+            let x_amz_user_agent = format!(
+                "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
+                config.kiro_version, machine_id
+            );
             let user_agent = format!(
                 "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
                 config.system_version, config.node_version, config.kiro_version, machine_id
             );
+            let request_body = Self::inject_profile_arn(request_body, &ctx.credentials);
 
             // 发送请求
-            let response = match self
+            let mut request = self
                 .client_for(&ctx.credentials)?
                 .post(&url)
-                .body(request_body.to_string())
+                .body(request_body)
                 .header("content-type", "application/json")
+                .header("accept", "application/json")
                 .header("x-amzn-codewhisperer-optout", "true")
                 .header("x-amzn-kiro-agent-mode", "vibe")
                 .header("x-amz-user-agent", &x_amz_user_agent)
@@ -388,10 +422,13 @@ impl KiroProvider {
                 .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
                 .header("amz-sdk-request", "attempt=1; max=3")
                 .header("Authorization", format!("Bearer {}", ctx.token))
-                .header("Connection", "close")
-                .send()
-                .await
-            {
+                .header("Connection", "close");
+
+            if let Some(ref arn) = ctx.credentials.profile_arn {
+                request = request.header("x-amzn-kiro-profile-arn", arn);
+            }
+
+            let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(

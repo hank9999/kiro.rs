@@ -83,10 +83,7 @@ pub fn convert_chat_request(
 
     Ok(MessagesRequest {
         model: req.model.clone(),
-        max_tokens: req
-            .max_completion_tokens
-            .or(req.max_tokens)
-            .unwrap_or(4096),
+        max_tokens: req.max_completion_tokens.or(req.max_tokens).unwrap_or(4096),
         messages,
         stream: req.stream,
         system: (!system_messages.is_empty()).then_some(system_messages),
@@ -400,15 +397,16 @@ fn convert_response_assistant_content(
     }
 }
 
-fn convert_function_call_item(item: &ResponseInputItem) -> Result<serde_json::Value, ConversionError> {
+fn convert_function_call_item(
+    item: &ResponseInputItem,
+) -> Result<serde_json::Value, ConversionError> {
     let call_id = item
         .call_id
         .as_ref()
         .ok_or(ConversionError::MissingToolCallId)?;
-    let name = item
-        .name
-        .as_ref()
-        .ok_or_else(|| ConversionError::UnsupportedContentPart("function_call missing name".to_string()))?;
+    let name = item.name.as_ref().ok_or_else(|| {
+        ConversionError::UnsupportedContentPart("function_call missing name".to_string())
+    })?;
     let arguments = parse_tool_arguments(item.arguments.as_deref().unwrap_or(""))?;
 
     Ok(json!([
@@ -510,7 +508,9 @@ fn convert_response_output_content(
     }
 }
 
-fn convert_image_part(image_url: Option<&ImageUrlField>) -> Result<serde_json::Value, ConversionError> {
+fn convert_image_part(
+    image_url: Option<&ImageUrlField>,
+) -> Result<serde_json::Value, ConversionError> {
     let Some(image_url) = image_url else {
         return Err(ConversionError::UnsupportedImageUrl(String::new()));
     };

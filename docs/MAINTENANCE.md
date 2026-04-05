@@ -19,6 +19,7 @@
 - 运行时监听地址改为 `0.0.0.0:8990`
 - 本地部署使用 `systemd` 托管，服务名为 `kiro-rs`
 - 提供一键重建并重启脚本：`scripts/rebuild-and-restart.sh`
+- 本机额外接入 `GoProxy` 免费优选代理池，Kiro 出站统一走本地稳定代理
 
 核心代码位置：
 
@@ -33,6 +34,26 @@
 - `src/admin/router.rs`
 - `admin-ui/src/components/activity-monitor.tsx`
 - `admin-ui/src/components/dashboard.tsx`
+
+## 2026-04-05 代理接入记录
+
+当前这台机器的实际运行方式与上面的旧说明不同，现网是 Docker 容器在跑，不是 `systemd` 直接托管二进制。
+
+新增的代理链路如下：
+
+- `goproxy` 容器：`ghcr.io/isboyjc/goproxy:latest`
+- Docker 网络：`kiro-proxy-net`
+- `kiro-rs` 全局代理：`http://goproxy:7777`
+- GoProxy 管理面板：`http://127.0.0.1:7778`
+- GoProxy 本地数据目录：`goproxy-data/`
+- 一键部署脚本：`scripts/deploy-proxy-stack.sh`
+- 就绪等待脚本：`scripts/wait-for-goproxy.sh`
+
+说明：
+
+- 这里目前选的是 GoProxy 的随机 HTTP 端口 `7777`。
+- 但不是无脑随机，而是随机轮换优先，同时只在高质量代理子集里轮换，避免把长尾低质量 IP 一起抽进去。
+- `8990` 仍然是对外服务入口，客户端调用方式不变。
 
 ## 重要行为说明
 

@@ -9,7 +9,12 @@ mod monitoring;
 mod openai;
 pub mod token;
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    ffi::OsStr,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use clap::Parser;
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
@@ -18,23 +23,82 @@ use kiro::token_manager::MultiTokenManager;
 use model::arg::Args;
 use model::config::Config;
 
-#[tokio::main]
-async fn main() {
-    // 解析命令行参数
-    let args = Args::parse();
+fn absolutize_path(path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
 
-    // 初始化日志
+fn resolve_log_path(config_path: &str) -> PathBuf {
+    if let Some(path) = std::env::var_os("KIRO_LOG_PATH") {
+        let path = path.to_string_lossy().trim().to_string();
+        if !path.is_empty() {
+            return absolutize_path(&path);
+        }
+    }
+
+    let config_path = absolutize_path(config_path);
+    if let Some(config_dir) = config_path.parent() {
+        if config_dir.file_name() == Some(OsStr::new("config")) {
+            if let Some(app_dir) = config_dir.parent() {
+                return app_dir.join("kiro.log");
+            }
+        }
+
+        return config_dir.join("kiro.log");
+    }
+
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("kiro.log")
+}
+
+fn init_file_logger(log_path: &Path) -> tracing_appender::non_blocking::WorkerGuard {
+    if let Some(log_dir) = log_path.parent() {
+        if let Err(error) = std::fs::create_dir_all(log_dir) {
+            eprintln!("创建日志目录失败 ({}): {}", log_dir.display(), error);
+        }
+    }
+
+    let log_dir = log_path.parent().unwrap_or_else(|| Path::new("."));
+    let log_name = log_path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("kiro.log"));
+    let file_appender = tracing_appender::rolling::never(log_dir, log_name);
+    let (non_blocking, log_guard) = tracing_appender::non_blocking(file_appender);
+
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
+    let writer = std::io::stdout.and(non_blocking);
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_writer(writer)
         .init();
 
-    // 加载配置
+    log_guard
+}
+
+#[tokio::main]
+async fn main() {
+    // 解析命令行参数
+    let args = Args::parse();
+
     let config_path = args
         .config
+        .clone()
         .unwrap_or_else(|| Config::default_config_path().to_string());
+    let log_path = resolve_log_path(&config_path);
+    let _log_guard = init_file_logger(&log_path);
+
+    // 加载配置
     let config = Config::load(&config_path).unwrap_or_else(|e| {
         tracing::error!("加载配置失败: {}", e);
         std::process::exit(1);
@@ -94,9 +158,6 @@ async fn main() {
     let token_manager = Arc::new(token_manager);
     let kiro_provider = KiroProvider::with_proxy(token_manager.clone(), proxy_config.clone());
     let request_monitor = monitoring::RequestMonitor::new(500);
-    let log_path = std::env::current_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join("kiro.log");
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {

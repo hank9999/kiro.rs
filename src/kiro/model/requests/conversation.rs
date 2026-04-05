@@ -94,6 +94,7 @@ impl CurrentMessage {
 #[serde(rename_all = "camelCase")]
 pub struct UserInputMessage {
     /// 用户输入消息上下文
+    #[serde(default, skip_serializing_if = "is_empty_context")]
     pub user_input_message_context: UserInputMessageContext,
     /// 消息内容
     pub content: String,
@@ -150,6 +151,10 @@ pub struct UserInputMessageContext {
     /// 可用工具列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Tool>,
+}
+
+fn is_empty_context(ctx: &UserInputMessageContext) -> bool {
+    ctx.tools.is_empty() && ctx.tool_results.is_empty()
 }
 
 impl UserInputMessageContext {
@@ -272,7 +277,7 @@ pub struct UserMessage {
 }
 
 fn is_default_context(ctx: &UserInputMessageContext) -> bool {
-    ctx.tools.is_empty() && ctx.tool_results.is_empty()
+    is_empty_context(ctx)
 }
 
 impl UserMessage {
