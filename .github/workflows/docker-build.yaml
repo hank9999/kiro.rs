@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - openai-compat
     tags:
       - 'v*'
   workflow_dispatch:
