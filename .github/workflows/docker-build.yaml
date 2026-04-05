@@ -25,7 +25,6 @@ jobs:
       should_build: ${{ steps.check.outputs.should_build }}
     steps:
       - uses: actions/checkout@v4
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
         with:
           fetch-depth: 0
       - name: Check if commit has release tag
