@@ -98,7 +98,7 @@ function LogViewer({
   onScroll,
 }: {
   lines: string[];
-  containerRef: React.RefObject<HTMLDivElement | null>;
+  containerRef: React.RefObject<HTMLDivElement>;
   autoScroll: boolean;
   onScroll: () => void;
 }) {
