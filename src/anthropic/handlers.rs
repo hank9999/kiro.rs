@@ -252,10 +252,10 @@ pub async fn post_messages(
         }
     };
 
-    // 构建 Kiro 请求
+    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
-        profile_arn: state.profile_arn.clone(),
+        profile_arn: None,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -760,10 +760,10 @@ pub async fn post_messages_cc(
         }
     };
 
-    // 构建 Kiro 请求
+    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
-        profile_arn: state.profile_arn.clone(),
+        profile_arn: None,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {

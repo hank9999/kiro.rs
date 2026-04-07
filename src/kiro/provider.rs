@@ -685,4 +685,47 @@ mod tests {
         let body = r#"{"message":"nope","reason":"DAILY_REQUEST_COUNT"}"#;
         assert!(!KiroProvider::is_monthly_request_limit(body));
     }
+
+    #[test]
+    fn test_inject_profile_arn_with_some() {
+        let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
+        let mut creds = KiroCredentials::default();
+        creds.profile_arn = Some("arn:aws:codewhisperer:us-east-1:123:profile/ABC".to_string());
+        let result = KiroProvider::inject_profile_arn(body, &creds);
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            json["profileArn"],
+            "arn:aws:codewhisperer:us-east-1:123:profile/ABC"
+        );
+        assert_eq!(json["conversationState"]["conversationId"], "c1");
+    }
+
+    #[test]
+    fn test_inject_profile_arn_with_none() {
+        let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
+        let creds = KiroCredentials::default();
+        let result = KiroProvider::inject_profile_arn(body, &creds);
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(json.get("profileArn").is_none());
+        assert_eq!(json["conversationState"]["conversationId"], "c1");
+    }
+
+    #[test]
+    fn test_inject_profile_arn_overwrites_existing() {
+        let body = r#"{"conversationState":{},"profileArn":"old-arn"}"#;
+        let mut creds = KiroCredentials::default();
+        creds.profile_arn = Some("new-arn".to_string());
+        let result = KiroProvider::inject_profile_arn(body, &creds);
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["profileArn"], "new-arn");
+    }
+
+    #[test]
+    fn test_inject_profile_arn_invalid_json() {
+        let body = "not-valid-json";
+        let mut creds = KiroCredentials::default();
+        creds.profile_arn = Some("arn:test".to_string());
+        let result = KiroProvider::inject_profile_arn(body, &creds);
+        assert_eq!(result, "not-valid-json");
+    }
 }

@@ -31,8 +31,6 @@ pub struct AppState {
     /// Kiro Provider（可选，用于实际 API 调用）
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
     pub kiro_provider: Option<Arc<KiroProvider>>,
-    /// Profile ARN（可选，用于请求）
-    pub profile_arn: Option<String>,
     /// 请求监控器
     pub request_monitor: RequestMonitor,
 }
@@ -48,7 +46,6 @@ impl AppState {
             api_keys: Arc::new(RwLock::new(api_keys)),
             config_path,
             kiro_provider: None,
-            profile_arn: None,
             request_monitor,
         }
     }
@@ -56,12 +53,6 @@ impl AppState {
     /// 设置 KiroProvider
     pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
         self.kiro_provider = Some(Arc::new(provider));
-        self
-    }
-
-    /// 设置 Profile ARN
-    pub fn with_profile_arn(mut self, arn: impl Into<String>) -> Self {
-        self.profile_arn = Some(arn.into());
         self
     }
 

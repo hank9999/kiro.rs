@@ -110,7 +110,7 @@ pub async fn post_chat_completions(
 
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
-        profile_arn: state.profile_arn.clone(),
+        profile_arn: None,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -240,7 +240,7 @@ pub async fn post_responses(
 
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
-        profile_arn: state.profile_arn.clone(),
+        profile_arn: None,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {

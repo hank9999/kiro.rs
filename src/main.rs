@@ -177,11 +177,10 @@ async fn main() {
         request_monitor.clone(),
     );
 
-    // 构建 Anthropic API 路由（从第一个凭据获取 profile_arn）
+    // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
         app_state.clone(),
         Some(kiro_provider),
-        first_credentials.profile_arn.clone(),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
