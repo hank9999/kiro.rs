@@ -1,5 +1,5 @@
 import { Activity, Bot, FileText, RefreshCw, ChevronDown, ChevronUp } from "lucide-react";
-import { useState } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -91,8 +91,56 @@ function hasDiagnostics(record: RequestActivityRecord) {
   );
 }
 
+function LogViewer({
+  lines,
+  containerRef,
+  autoScroll,
+  onScroll,
+}: {
+  lines: string[];
+  containerRef: React.RefObject<HTMLDivElement | null>;
+  autoScroll: boolean;
+  onScroll: () => void;
+}) {
+  useEffect(() => {
+    if (autoScroll && containerRef.current) {
+      containerRef.current.scrollTop = containerRef.current.scrollHeight;
+    }
+  }, [lines, autoScroll, containerRef]);
+
+  return (
+    <div
+      ref={containerRef}
+      onScroll={onScroll}
+      className="h-[28rem] overflow-auto rounded-lg border bg-muted/20 p-3 font-mono text-xs leading-5"
+    >
+      {lines.length === 0 ? (
+        <div className="text-muted-foreground">暂无日志内容</div>
+      ) : (
+        lines.map((line, index) => (
+          <div
+            key={`${index}-${line.slice(0, 32)}`}
+            className={getLogLineClass(line)}
+          >
+            {line}
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
 export function ActivityMonitor() {
   const [expandedRecords, setExpandedRecords] = useState<Set<number>>(new Set());
+  const [logAutoScroll, setLogAutoScroll] = useState(true);
+  const logContainerRef = useRef<HTMLDivElement>(null);
+
+  const handleLogScroll = useCallback(() => {
+    const el = logContainerRef.current;
+    if (!el) return;
+    const isAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    setLogAutoScroll(isAtBottom);
+  }, []);
 
   const toggleRecord = (id: number) => {
     setExpandedRecords((prev) => {
@@ -406,6 +454,17 @@ export function ActivityMonitor() {
               </Badge>
               {logs?.truncated && <Badge variant="secondary">仅展示尾部</Badge>}
               <span>{logs?.path ?? "kiro.log"}</span>
+              {!logAutoScroll && (
+                <button
+                  onClick={() => {
+                    setLogAutoScroll(true);
+                    logContainerRef.current?.scrollTo({ top: logContainerRef.current.scrollHeight, behavior: "smooth" });
+                  }}
+                  className="text-xs text-blue-600 hover:text-blue-700 hover:underline"
+                >
+                  跳到底部
+                </button>
+              )}
             </div>
 
             {loadingLogs ? (
@@ -417,20 +476,12 @@ export function ActivityMonitor() {
                 {logs.error || "日志文件不可用"}
               </div>
             ) : (
-              <div className="h-[28rem] overflow-auto rounded-lg border bg-muted/20 p-3 font-mono text-xs leading-5">
-                {(logs?.lines.length ?? 0) === 0 ? (
-                  <div className="text-muted-foreground">暂无日志内容</div>
-                ) : (
-                  logs?.lines.map((line, index) => (
-                    <div
-                      key={`${index}-${line.slice(0, 32)}`}
-                      className={getLogLineClass(line)}
-                    >
-                      {line}
-                    </div>
-                  ))
-                )}
-              </div>
+              <LogViewer
+                lines={logs?.lines ?? []}
+                containerRef={logContainerRef}
+                autoScroll={logAutoScroll}
+                onScroll={handleLogScroll}
+              />
             )}
           </CardContent>
         </Card>
