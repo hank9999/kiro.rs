@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
@@ -75,6 +76,23 @@ pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::R
 
     Ok(())
 }
+
+/// Refresh Token 永久失效错误
+///
+/// 当服务端返回 400 + `invalid_grant` 时，表示 refreshToken 已被撤销或过期，
+/// 不应重试，需立即禁用对应凭据。
+#[derive(Debug)]
+pub(crate) struct RefreshTokenInvalidError {
+    pub message: String,
+}
+
+impl fmt::Display for RefreshTokenInvalidError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for RefreshTokenInvalidError {}
 
 /// 刷新 Token
 pub(crate) async fn refresh_token(
@@ -145,6 +163,18 @@ async fn refresh_social_token(
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+
+        // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
+        if status.as_u16() == 400
+            && body_text.contains("\"invalid_grant\"")
+            && body_text.contains("Invalid refresh token provided")
+        {
+            return Err(RefreshTokenInvalidError {
+                message: format!("Social refreshToken 已失效 (invalid_grant): {}", body_text),
+            }
+            .into());
+        }
+
         let error_msg = match status.as_u16() {
             401 => "OAuth 凭证已过期或无效，需要重新认证",
             403 => "权限不足，无法刷新 Token",
@@ -230,6 +260,18 @@ async fn refresh_idc_token(
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+
+        // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
+        if status.as_u16() == 400
+            && body_text.contains("\"invalid_grant\"")
+            && body_text.contains("Invalid refresh token provided")
+        {
+            return Err(RefreshTokenInvalidError {
+                message: format!("IdC refreshToken 已失效 (invalid_grant): {}", body_text),
+            }
+            .into());
+        }
+
         let error_msg = match status.as_u16() {
             401 => "IdC 凭证已过期或无效，需要重新认证",
             403 => "权限不足，无法刷新 Token",
@@ -367,6 +409,8 @@ enum DisabledReason {
     TooManyRefreshFailures,
     /// 额度已用尽（如 MONTHLY_REQUEST_COUNT）
     QuotaExceeded,
+    /// Refresh Token 永久失效（服务端返回 invalid_grant）
+    InvalidRefreshToken,
 }
 
 /// 统计数据持久化条目
@@ -742,8 +786,15 @@ impl MultiTokenManager {
                     return Ok(ctx);
                 }
                 Err(e) => {
-                    let has_available = self.report_refresh_failure(id);
-                    tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
+                    // refreshToken 永久失效 → 立即禁用，不累计重试
+                    let has_available =
+                        if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                            tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
+                            self.report_refresh_token_invalid(id)
+                        } else {
+                            tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
+                            self.report_refresh_failure(id)
+                        };
                     attempt_count += 1;
                     if !has_available {
                         anyhow::bail!("所有凭据均已禁用（0/{}）", total);
@@ -1206,6 +1257,54 @@ impl MultiTokenManager {
         result
     }
 
+    /// 报告指定凭据的 refreshToken 永久失效（invalid_grant）。
+    ///
+    /// 立即禁用凭据，不累计、不重试。
+    /// 返回是否还有可用凭据。
+    pub fn report_refresh_token_invalid(&self, id: u64) -> bool {
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => return entries.iter().any(|e| !e.disabled),
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|e| !e.disabled);
+            }
+
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
+
+            tracing::error!(
+                "凭据 #{} refreshToken 已失效 (invalid_grant)，已立即禁用",
+                id
+            );
+
+            if let Some(next) = entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .min_by_key(|e| e.credentials.priority)
+            {
+                *current_id = next.id;
+                tracing::info!(
+                    "已切换到凭据 #{}（优先级 {}）",
+                    next.id,
+                    next.credentials.priority
+                );
+                true
+            } else {
+                tracing::error!("所有凭据均已禁用！");
+                false
+            }
+        };
+        self.save_stats_debounced();
+        result
+    }
+
     /// 切换到优先级最高的可用凭据
     ///
     /// 返回是否成功切换
@@ -1271,6 +1370,7 @@ impl MultiTokenManager {
                         DisabledReason::TooManyFailures => "TooManyFailures",
                         DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
                         DisabledReason::QuotaExceeded => "QuotaExceeded",
+                        DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
                     }.to_string()),
                 })
                 .collect(),
