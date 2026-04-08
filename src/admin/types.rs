@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::config::ClientMode;
+
 // ============ 凭据状态 ============
 
 /// 所有凭据状态响应
@@ -122,6 +124,9 @@ pub struct AddCredentialRequest {
 
     /// 凭据级代理认证密码（可选）
     pub proxy_password: Option<String>,
+
+    /// 凭据级客户端模拟模式（可选，"kiro-ide" 或 "kiro-cli"）
+    pub client_mode: Option<ClientMode>,
 }
 
 fn default_auth_method() -> String {

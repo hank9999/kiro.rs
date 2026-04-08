@@ -45,6 +45,16 @@ impl KiroProvider {
         Self::with_proxy(token_manager, None)
     }
 
+    /// 获取客户端模式的 origin 值
+    pub fn origin(&self) -> &'static str {
+        self.token_manager.config().client_mode.origin()
+    }
+
+    /// 是否为 kiro-cli 模式
+    pub fn is_cli_mode(&self) -> bool {
+        self.token_manager.config().client_mode.is_cli()
+    }
+
     /// 创建带代理配置的 KiroProvider 实例
     pub fn with_proxy(token_manager: Arc<MultiTokenManager>, proxy: Option<ProxyConfig>) -> Self {
         let tls_backend = token_manager.config().tls_backend;
@@ -220,20 +230,13 @@ impl KiroProvider {
             };
 
             let config = self.token_manager.config();
-            let machine_id = match machine_id::generate_from_credentials(&ctx.credentials, config) {
-                Some(id) => id,
-                None => {
-                    last_error = Some(anyhow::anyhow!("无法生成 machine_id，请检查凭证配置"));
-                    continue;
-                }
-            };
+            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config)
+                .unwrap_or_default();
+            let mode = ctx.credentials.effective_client_mode(config);
 
             let url = self.mcp_url_for(&ctx.credentials);
-            let x_amz_user_agent = format!("aws-sdk-js/1.0.34 KiroIDE-{}-{}", config.kiro_version, machine_id);
-            let user_agent = format!(
-                "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
-                config.system_version, config.node_version, config.kiro_version, machine_id
-            );
+            let x_amz_user_agent = config.streaming_x_amz_user_agent(&machine_id, mode);
+            let user_agent = config.streaming_user_agent(&machine_id, mode);
 
             // 发送请求
             let mut request = self
@@ -385,20 +388,13 @@ impl KiroProvider {
             };
 
             let config = self.token_manager.config();
-            let machine_id = match machine_id::generate_from_credentials(&ctx.credentials, config) {
-                Some(id) => id,
-                None => {
-                    last_error = Some(anyhow::anyhow!("无法生成 machine_id，请检查凭证配置"));
-                    continue;
-                }
-            };
+            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config)
+                .unwrap_or_default();
+            let mode = ctx.credentials.effective_client_mode(config);
 
             let url = self.base_url_for(&ctx.credentials);
-            let x_amz_user_agent = format!("aws-sdk-js/1.0.34 KiroIDE-{}-{}", config.kiro_version, machine_id);
-            let user_agent = format!(
-                "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
-                config.system_version, config.node_version, config.kiro_version, machine_id
-            );
+            let x_amz_user_agent = config.streaming_x_amz_user_agent(&machine_id, mode);
+            let user_agent = config.streaming_user_agent(&machine_id, mode);
 
             // 注入实际凭据的 profile_arn 到请求体
             let body = Self::inject_profile_arn(request_body, &ctx.credentials.profile_arn);
@@ -409,7 +405,7 @@ impl KiroProvider {
                 .post(&url)
                 .body(body)
                 .header("content-type", "application/json")
-                .header("x-amzn-codewhisperer-optout", "true")
+                .header("x-amzn-codewhisperer-optout", "false")
                 .header("x-amzn-kiro-agent-mode", "vibe")
                 .header("x-amz-user-agent", &x_amz_user_agent)
                 .header("user-agent", &user_agent)

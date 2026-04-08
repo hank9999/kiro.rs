@@ -115,7 +115,7 @@ impl UserInputMessage {
             content: content.into(),
             model_id: model_id.into(),
             images: Vec::new(),
-            origin: Some("AI_EDITOR".to_string()),
+            origin: None,
         }
     }
 
@@ -144,6 +144,9 @@ impl UserInputMessage {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputMessageContext {
+    /// 环境状态（操作系统、工作目录等）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_state: Option<EnvState>,
     /// 工具执行结果列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_results: Vec<ToolResult>,
@@ -152,10 +155,26 @@ pub struct UserInputMessageContext {
     pub tools: Vec<Tool>,
 }
 
+/// 环境状态信息
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvState {
+    /// 操作系统
+    pub operating_system: String,
+    /// 当前工作目录
+    pub current_working_directory: String,
+}
+
 impl UserInputMessageContext {
     /// 创建新的消息上下文
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 设置环境状态
+    pub fn with_env_state(mut self, env_state: EnvState) -> Self {
+        self.env_state = Some(env_state);
+        self
     }
 
     /// 设置工具列表
@@ -272,7 +291,7 @@ pub struct UserMessage {
 }
 
 fn is_default_context(ctx: &UserInputMessageContext) -> bool {
-    ctx.tools.is_empty() && ctx.tool_results.is_empty()
+    ctx.env_state.is_none() && ctx.tools.is_empty() && ctx.tool_results.is_empty()
 }
 
 impl UserMessage {
@@ -281,7 +300,7 @@ impl UserMessage {
         Self {
             content: content.into(),
             model_id: model_id.into(),
-            origin: Some("AI_EDITOR".to_string()),
+            origin: None,
             images: Vec::new(),
             user_input_message_context: UserInputMessageContext::default(),
         }

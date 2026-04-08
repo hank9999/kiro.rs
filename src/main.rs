@@ -3,6 +3,8 @@ mod admin_ui;
 mod anthropic;
 mod common;
 mod http_client;
+#[cfg(feature = "import-kiro-cli")]
+mod import;
 mod kiro;
 mod model;
 pub mod token;
@@ -42,6 +44,32 @@ async fn main() {
     let credentials_path = args
         .credentials
         .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
+
+    // 如果指定了 --import-kiro-cli，从 kiro-cli 数据库导入凭据
+    #[cfg(feature = "import-kiro-cli")]
+    if args.import_kiro_cli {
+        let db_path = args
+            .kiro_cli_db
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(import::default_db_path);
+        tracing::info!("从 kiro-cli 数据库导入凭据: {}", db_path.display());
+        match import::import_credentials(&db_path) {
+            Ok(cred) => {
+                let json = serde_json::to_string_pretty(&cred).unwrap();
+                std::fs::write(&credentials_path, &json).unwrap_or_else(|e| {
+                    tracing::error!("写入凭据文件失败: {}", e);
+                    std::process::exit(1);
+                });
+                tracing::info!("凭据已导入到: {}", credentials_path);
+            }
+            Err(e) => {
+                tracing::error!("导入凭据失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
         tracing::error!("加载凭证失败: {}", e);
         std::process::exit(1);

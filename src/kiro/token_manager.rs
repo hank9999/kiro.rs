@@ -177,25 +177,35 @@ async fn refresh_social_token(
     let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
     let refresh_domain = format!("prod.{}.auth.desktop.kiro.dev", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config)
-        .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
-    let kiro_version = &config.kiro_version;
+        .unwrap_or_default();
+    let mode = credentials.effective_client_mode(config);
+    let refresh_ua = config.refresh_user_agent(&machine_id, mode);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
     let body = RefreshRequest {
         refresh_token: refresh_token.to_string(),
     };
 
-    let response = client
+    let mut req = client
         .post(&refresh_url)
-        .header("Accept", "application/json, text/plain, */*")
         .header("Content-Type", "application/json")
-        .header(
-            "User-Agent",
-            format!("KiroIDE-{}-{}", kiro_version, machine_id),
-        )
-        .header("Accept-Encoding", "gzip, compress, deflate, br")
-        .header("host", &refresh_domain)
-        .header("Connection", "close")
+        .header("User-Agent", &refresh_ua);
+
+    if mode.is_cli() {
+        // kiro-cli 风格: 精简 header，无 host/connection
+        req = req
+            .header("Accept", "*/*")
+            .header("Accept-Encoding", "gzip");
+    } else {
+        // KiroIDE 风格: 原有行为
+        req = req
+            .header("Accept", "application/json, text/plain, */*")
+            .header("Accept-Encoding", "gzip, compress, deflate, br")
+            .header("host", &refresh_domain)
+            .header("Connection", "close");
+    }
+
+    let response = req
         .json(&body)
         .send()
         .await?;
@@ -333,15 +343,13 @@ pub(crate) async fn get_usage_limits(
     let region = credentials.effective_api_region(config);
     let host = format!("q.{}.amazonaws.com", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config)
-        .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
-    let kiro_version = &config.kiro_version;
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
+        .unwrap_or_default();
+    let mode = credentials.effective_client_mode(config);
 
     // 构建 URL
     let mut url = format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
-        host
+        "https://{}/getUsageLimits?origin={}&resourceType=AGENTIC_REQUEST",
+        host, mode.origin()
     );
 
     // profileArn 是可选的
@@ -350,14 +358,8 @@ pub(crate) async fn get_usage_limits(
     }
 
     // 构建 User-Agent headers
-    let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        os_name, node_version, kiro_version, machine_id
-    );
-    let amz_user_agent = format!(
-        "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
-        kiro_version, machine_id
-    );
+    let user_agent = config.runtime_user_agent(&machine_id, mode);
+    let amz_user_agent = config.runtime_x_amz_user_agent(&machine_id, mode);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 

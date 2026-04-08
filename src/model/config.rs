@@ -16,6 +16,32 @@ impl Default for TlsBackend {
     }
 }
 
+/// 客户端模拟模式
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientMode {
+    /// 模拟 Kiro IDE（默认，原有行为）
+    #[default]
+    KiroIde,
+    /// 模拟 Kiro CLI
+    KiroCli,
+}
+
+impl ClientMode {
+    /// 获取 origin 字段值
+    pub fn origin(&self) -> &'static str {
+        match self {
+            ClientMode::KiroIde => "AI_EDITOR",
+            ClientMode::KiroCli => "KIRO_CLI",
+        }
+    }
+
+    /// 是否为 kiro-cli 模式
+    pub fn is_cli(&self) -> bool {
+        matches!(self, ClientMode::KiroCli)
+    }
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,6 +116,14 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// 客户端模拟模式（"kiro-ide" 或 "kiro-cli"）
+    #[serde(default)]
+    pub client_mode: ClientMode,
+
+    /// kiro-cli 版本号（仅 kiro-cli 模式使用）
+    #[serde(default = "default_kiro_cli_version")]
+    pub kiro_cli_version: String,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -132,6 +166,10 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_kiro_cli_version() -> String {
+    "1.29.3".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -154,6 +192,8 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            client_mode: ClientMode::default(),
+            kiro_cli_version: default_kiro_cli_version(),
             config_path: None,
         }
     }
@@ -175,6 +215,58 @@ impl Config {
     /// 优先使用 api_region，未配置时回退到 region
     pub fn effective_api_region(&self) -> &str {
         self.api_region.as_deref().unwrap_or(&self.region)
+    }
+
+    /// 生成 API 请求的 user-agent（streaming API）
+    pub fn streaming_user_agent(&self, machine_id: &str, mode: ClientMode) -> String {
+        match mode {
+            ClientMode::KiroCli => format!(
+                "aws-sdk-rust/1.3.14 ua/2.1 api/codewhispererstreaming/0.1.14474 os/linux lang/rust/1.92.0 md/appVersion-{} app/AmazonQ-For-CLI",
+                self.kiro_cli_version
+            ),
+            ClientMode::KiroIde => format!(
+                "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
+                self.system_version, self.node_version, self.kiro_version, machine_id
+            ),
+        }
+    }
+
+    /// 生成 API 请求的 x-amz-user-agent（streaming API）
+    pub fn streaming_x_amz_user_agent(&self, machine_id: &str, mode: ClientMode) -> String {
+        match mode {
+            ClientMode::KiroCli => "aws-sdk-rust/1.3.14 ua/2.1 api/codewhispererstreaming/0.1.14474 os/linux lang/rust/1.92.0 m/F app/AmazonQ-For-CLI".to_string(),
+            ClientMode::KiroIde => format!("aws-sdk-js/1.0.34 KiroIDE-{}-{}", self.kiro_version, machine_id),
+        }
+    }
+
+    /// 生成 runtime API 的 user-agent（非 streaming）
+    pub fn runtime_user_agent(&self, machine_id: &str, mode: ClientMode) -> String {
+        match mode {
+            ClientMode::KiroCli => format!(
+                "aws-sdk-rust/1.3.14 ua/2.1 api/codewhispererruntime/0.1.14474 os/linux lang/rust/1.92.0 md/appVersion-{} app/AmazonQ-For-CLI",
+                self.kiro_cli_version
+            ),
+            ClientMode::KiroIde => format!(
+                "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+                self.system_version, self.node_version, self.kiro_version, machine_id
+            ),
+        }
+    }
+
+    /// 生成 runtime API 的 x-amz-user-agent（非 streaming）
+    pub fn runtime_x_amz_user_agent(&self, machine_id: &str, mode: ClientMode) -> String {
+        match mode {
+            ClientMode::KiroCli => "aws-sdk-rust/1.3.14 ua/2.1 api/codewhispererruntime/0.1.14474 os/linux lang/rust/1.92.0 m/F app/AmazonQ-For-CLI".to_string(),
+            ClientMode::KiroIde => format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", self.kiro_version, machine_id),
+        }
+    }
+
+    /// 生成 token 刷新的 user-agent
+    pub fn refresh_user_agent(&self, machine_id: &str, mode: ClientMode) -> String {
+        match mode {
+            ClientMode::KiroCli => "Kiro-CLI".to_string(),
+            ClientMode::KiroIde => format!("KiroIDE-{}-{}", self.kiro_version, machine_id),
+        }
     }
 
     /// 从文件加载配置
