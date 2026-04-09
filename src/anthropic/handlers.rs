@@ -293,8 +293,9 @@ pub async fn post_messages(
         )
         .await
     } else {
-        // 非流式响应
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, tool_name_map).await
+        // 非流式响应：仅在配置开启时提取 thinking 块
+        let extract_thinking = state.extract_thinking && thinking_enabled;
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
     }
 }
 
@@ -440,6 +441,7 @@ async fn handle_non_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
@@ -567,7 +569,25 @@ async fn handle_non_stream_request(
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
 
-    if !text_content.is_empty() {
+    if thinking_enabled {
+        // 从完整文本中提取 thinking 块
+        let (thinking, remaining_text) =
+            super::stream::extract_thinking_from_complete_text(&text_content);
+
+        if let Some(thinking_text) = thinking {
+            content.push(json!({
+                "type": "thinking",
+                "thinking": thinking_text
+            }));
+        }
+
+        if !remaining_text.is_empty() {
+            content.push(json!({
+                "type": "text",
+                "text": remaining_text
+            }));
+        }
+    } else if !text_content.is_empty() {
         content.push(json!({
             "type": "text",
             "text": text_content
@@ -786,8 +806,9 @@ pub async fn post_messages_cc(
         )
         .await
     } else {
-        // 非流式响应（复用现有逻辑，已经使用正确的 input_tokens）
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, tool_name_map).await
+        // 非流式响应：仅在配置开启时提取 thinking 块
+        let extract_thinking = state.extract_thinking && thinking_enabled;
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
     }
 }
 

@@ -171,6 +171,60 @@ fn find_real_thinking_start_tag(buffer: &str) -> Option<usize> {
     None
 }
 
+/// 从完整文本中提取 thinking 块（用于非流式响应）
+///
+/// 使用与流式处理相同的标签检测逻辑（引用字符过滤），确保一致性。
+/// 非流式场景下文本已完整，无需处理跨 chunk 分割问题。
+///
+/// # 返回值
+/// - `(Some(thinking_content), remaining_text)` — 检测到有效 thinking 块
+/// - `(None, original_text)` — 未检测到，原样返回
+pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>, String) {
+    let start_pos = match find_real_thinking_start_tag(text) {
+        Some(pos) => pos,
+        None => return (None, text.to_string()),
+    };
+
+    let before = &text[..start_pos];
+    let after_open = &text[start_pos + "<thinking>".len()..];
+
+    // 查找结束标签：优先匹配带 \n\n 后缀的，退而使用末尾匹配
+    let (thinking_raw, text_after) =
+        if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
+            (
+                &after_open[..end_pos],
+                &after_open[end_pos + "</thinking>\n\n".len()..],
+            )
+        } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
+            let after_tag = end_pos + "</thinking>".len();
+            (
+                &after_open[..end_pos],
+                after_open[after_tag..].trim_start(),
+            )
+        } else {
+            // 找不到有效的结束标签，不做提取
+            return (None, text.to_string());
+        };
+
+    // 剥离开头的换行符（与流式处理一致：模型输出 <thinking>\n）
+    let thinking_content = thinking_raw
+        .strip_prefix('\n')
+        .unwrap_or(thinking_raw);
+
+    // 组装剩余文本：跳过纯空白的 before 部分
+    let mut remaining = String::new();
+    if !before.trim().is_empty() {
+        remaining.push_str(before);
+    }
+    remaining.push_str(text_after);
+
+    if thinking_content.is_empty() {
+        (None, remaining)
+    } else {
+        (Some(thinking_content.to_string()), remaining)
+    }
+}
+
 /// SSE 事件
 #[derive(Debug, Clone)]
 pub struct SseEvent {

@@ -90,6 +90,13 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// 是否开启非流式响应的 thinking 块提取（默认 true）
+    ///
+    /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
+    /// 独立的 `{"type": "thinking", ...}` 内容块，与流式响应行为一致。
+    #[serde(default = "default_extract_thinking")]
+    pub extract_thinking: bool,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -132,6 +139,10 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_extract_thinking() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -154,6 +165,7 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            extract_thinking: default_extract_thinking(),
             config_path: None,
         }
     }

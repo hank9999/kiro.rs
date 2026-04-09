@@ -23,14 +23,17 @@ pub struct AppState {
     /// Kiro Provider（可选，用于实际 API 调用）
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
     pub kiro_provider: Option<Arc<KiroProvider>>,
+    /// 是否开启非流式响应的 thinking 块提取
+    pub extract_thinking: bool,
 }
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>) -> Self {
+    pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
+            extract_thinking,
         }
     }
 
