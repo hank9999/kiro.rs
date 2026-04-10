@@ -126,19 +126,6 @@ impl EventStreamDecoder {
         }
     }
 
-    /// 创建具有自定义配置的解码器
-    pub fn with_config(capacity: usize, max_errors: usize, max_buffer_size: usize) -> Self {
-        Self {
-            buffer: BytesMut::with_capacity(capacity),
-            state: DecoderState::Ready,
-            frames_decoded: 0,
-            error_count: 0,
-            max_errors,
-            max_buffer_size,
-            bytes_skipped: 0,
-        }
-    }
-
     /// 向解码器提供数据
     ///
     /// # Returns
@@ -303,70 +290,6 @@ impl EventStreamDecoder {
         }
     }
 
-    // ==================== 生命周期管理方法 ====================
-
-    /// 重置解码器到初始状态
-    ///
-    /// 清空缓冲区和所有计数器，恢复到 Ready 状态
-    pub fn reset(&mut self) {
-        self.buffer.clear();
-        self.state = DecoderState::Ready;
-        self.frames_decoded = 0;
-        self.error_count = 0;
-        self.bytes_skipped = 0;
-    }
-
-    /// 获取当前状态
-    pub fn state(&self) -> DecoderState {
-        self.state
-    }
-
-    /// 检查是否处于 Ready 状态
-    pub fn is_ready(&self) -> bool {
-        self.state == DecoderState::Ready
-    }
-
-    /// 检查是否处于 Stopped 状态
-    pub fn is_stopped(&self) -> bool {
-        self.state == DecoderState::Stopped
-    }
-
-    /// 检查是否处于 Recovering 状态
-    pub fn is_recovering(&self) -> bool {
-        self.state == DecoderState::Recovering
-    }
-
-    /// 获取已解码的帧数量
-    pub fn frames_decoded(&self) -> usize {
-        self.frames_decoded
-    }
-
-    /// 获取当前连续错误计数
-    pub fn error_count(&self) -> usize {
-        self.error_count
-    }
-
-    /// 获取跳过的字节数
-    pub fn bytes_skipped(&self) -> usize {
-        self.bytes_skipped
-    }
-
-    /// 获取缓冲区中待处理的字节数
-    pub fn buffer_len(&self) -> usize {
-        self.buffer.len()
-    }
-
-    /// 尝试从 Stopped 状态恢复
-    ///
-    /// 重置错误计数并转移到 Ready 状态
-    /// 注意：缓冲区内容保留，可能仍包含损坏数据
-    pub fn try_resume(&mut self) {
-        if self.state == DecoderState::Stopped {
-            self.error_count = 0;
-            self.state = DecoderState::Ready;
-            tracing::info!("解码器从 Stopped 状态恢复");
-        }
-    }
 }
 
 /// 解码迭代器
@@ -398,25 +321,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_decoder_new() {
-        let decoder = EventStreamDecoder::new();
-        assert_eq!(decoder.state(), DecoderState::Ready);
-        assert_eq!(decoder.frames_decoded(), 0);
-        assert_eq!(decoder.error_count(), 0);
-    }
-
-    #[test]
     fn test_decoder_feed() {
         let mut decoder = EventStreamDecoder::new();
         assert!(decoder.feed(&[1, 2, 3, 4]).is_ok());
-        assert_eq!(decoder.buffer_len(), 4);
-    }
-
-    #[test]
-    fn test_decoder_buffer_overflow() {
-        let mut decoder = EventStreamDecoder::with_config(1024, 5, 100);
-        let result = decoder.feed(&[0u8; 101]);
-        assert!(matches!(result, Err(ParseError::BufferOverflow { .. })));
     }
 
     #[test]
@@ -426,40 +333,5 @@ mod tests {
 
         let result = decoder.decode();
         assert!(matches!(result, Ok(None)));
-        assert_eq!(decoder.state(), DecoderState::Ready);
-    }
-
-    #[test]
-    fn test_decoder_reset() {
-        let mut decoder = EventStreamDecoder::new();
-        decoder.feed(&[1, 2, 3, 4]).unwrap();
-
-        decoder.reset();
-        assert_eq!(decoder.state(), DecoderState::Ready);
-        assert_eq!(decoder.buffer_len(), 0);
-        assert_eq!(decoder.frames_decoded(), 0);
-    }
-
-    #[test]
-    fn test_decoder_state_transitions() {
-        let decoder = EventStreamDecoder::new();
-
-        // 初始状态
-        assert!(decoder.is_ready());
-        assert!(!decoder.is_stopped());
-        assert!(!decoder.is_recovering());
-    }
-
-    #[test]
-    fn test_decoder_try_resume() {
-        let mut decoder = EventStreamDecoder::new();
-
-        // 手动设置为 Stopped 状态进行测试
-        decoder.state = DecoderState::Stopped;
-        decoder.error_count = 5;
-
-        decoder.try_resume();
-        assert!(decoder.is_ready());
-        assert_eq!(decoder.error_count(), 0);
     }
 }

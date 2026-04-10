@@ -175,6 +175,7 @@ async fn main() {
         api_keys.clone(),
         config_path.clone().into(),
         request_monitor.clone(),
+        config.extract_thinking,
     );
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）

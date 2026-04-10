@@ -33,6 +33,8 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 请求监控器
     pub request_monitor: RequestMonitor,
+    /// 是否开启非流式响应的 thinking 块提取
+    pub extract_thinking: bool,
 }
 
 impl AppState {
@@ -41,12 +43,14 @@ impl AppState {
         api_keys: Vec<String>,
         config_path: PathBuf,
         request_monitor: RequestMonitor,
+        extract_thinking: bool,
     ) -> Self {
         Self {
             api_keys: Arc::new(RwLock::new(api_keys)),
             config_path,
             kiro_provider: None,
             request_monitor,
+            extract_thinking,
         }
     }
 

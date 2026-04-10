@@ -42,6 +42,7 @@ pub struct McpArguments {
 
 /// MCP 响应
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct McpResponse {
     pub error: Option<McpError>,
     pub id: String,
@@ -58,6 +59,7 @@ pub struct McpError {
 
 /// MCP 结果
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct McpResult {
     pub content: Vec<McpContent>,
     #[serde(rename = "isError")]
@@ -74,6 +76,7 @@ pub struct McpContent {
 
 /// WebSearch 搜索结果
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct WebSearchResults {
     pub results: Vec<WebSearchResult>,
     #[serde(rename = "totalResults")]
@@ -84,6 +87,7 @@ pub struct WebSearchResults {
 
 /// 单个搜索结果
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct WebSearchResult {
     pub title: String,
     pub url: String,

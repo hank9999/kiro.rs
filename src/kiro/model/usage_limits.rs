@@ -33,6 +33,7 @@ pub struct SubscriptionInfo {
 /// 使用量明细
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct UsageBreakdown {
     /// 当前使用量
     #[serde(default)]
@@ -93,6 +94,7 @@ impl Bonus {
 /// 免费试用信息
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct FreeTrialInfo {
     /// 当前使用量
     #[serde(default)]

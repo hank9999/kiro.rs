@@ -217,29 +217,6 @@ pub enum Message {
     Assistant(HistoryAssistantMessage),
 }
 
-#[allow(dead_code)]
-impl Message {
-    /// 创建用户消息
-    pub fn user(content: impl Into<String>, model_id: impl Into<String>) -> Self {
-        Self::User(HistoryUserMessage::new(content, model_id))
-    }
-
-    /// 创建助手消息
-    pub fn assistant(content: impl Into<String>) -> Self {
-        Self::Assistant(HistoryAssistantMessage::new(content))
-    }
-
-    /// 判断是否为用户消息
-    pub fn is_user(&self) -> bool {
-        matches!(self, Self::User(_))
-    }
-
-    /// 判断是否为助手消息
-    pub fn is_assistant(&self) -> bool {
-        matches!(self, Self::Assistant(_))
-    }
-}
-
 /// 历史用户消息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -374,21 +351,10 @@ mod tests {
     }
 
     #[test]
-    fn test_message_enum() {
-        let user_msg = Message::user("Hello", "model-id");
-        assert!(user_msg.is_user());
-        assert!(!user_msg.is_assistant());
-
-        let assistant_msg = Message::assistant("Hi there!");
-        assert!(assistant_msg.is_assistant());
-        assert!(!assistant_msg.is_user());
-    }
-
-    #[test]
     fn test_history_serialize() {
         let history = vec![
-            Message::user("Hello", "claude-3-5-sonnet"),
-            Message::assistant("Hi! How can I help you?"),
+            Message::User(HistoryUserMessage::new("Hello", "claude-3-5-sonnet")),
+            Message::Assistant(HistoryAssistantMessage::new("Hi! How can I help you?")),
         ];
 
         let json = serde_json::to_string(&history).unwrap();

@@ -1,7 +1,7 @@
 //! Token 管理模块
 //!
 //! 负责 Token 过期检测和刷新，支持 Social 和 IdC 认证方式
-//! 支持单凭据 (TokenManager) 和多凭据 (MultiTokenManager) 管理
+//! 支持多凭据 (MultiTokenManager) 管理
 
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
@@ -23,64 +24,6 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
-
-/// Token 管理器
-///
-/// 负责管理凭据和 Token 的自动刷新
-pub struct TokenManager {
-    config: Config,
-    credentials: KiroCredentials,
-    proxy: Option<ProxyConfig>,
-}
-
-impl TokenManager {
-    /// 创建新的 TokenManager 实例
-    pub fn new(config: Config, credentials: KiroCredentials, proxy: Option<ProxyConfig>) -> Self {
-        Self {
-            config,
-            credentials,
-            proxy,
-        }
-    }
-
-    /// 获取凭据的引用
-    pub fn credentials(&self) -> &KiroCredentials {
-        &self.credentials
-    }
-
-    /// 获取配置的引用
-    pub fn config(&self) -> &Config {
-        &self.config
-    }
-
-    /// 确保获取有效的访问 Token
-    ///
-    /// 如果 Token 过期或即将过期，会自动刷新
-    pub async fn ensure_valid_token(&mut self) -> anyhow::Result<String> {
-        if is_token_expired(&self.credentials) || is_token_expiring_soon(&self.credentials) {
-            self.credentials =
-                refresh_token(&self.credentials, &self.config, self.proxy.as_ref()).await?;
-
-            // 刷新后再次检查 token 时间有效性
-            if is_token_expired(&self.credentials) {
-                anyhow::bail!("刷新后的 Token 仍然无效或已过期");
-            }
-        }
-
-        self.credentials
-            .access_token
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("没有可用的 accessToken"))
-    }
-
-    /// 获取使用额度信息
-    ///
-    /// 调用 getUsageLimits API 查询当前账户的使用额度
-    pub async fn get_usage_limits(&mut self) -> anyhow::Result<UsageLimitsResponse> {
-        let token = self.ensure_valid_token().await?;
-        get_usage_limits(&self.credentials, &self.config, &token, self.proxy.as_ref()).await
-    }
-}
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -133,6 +76,23 @@ pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::R
 
     Ok(())
 }
+
+/// Refresh Token 永久失效错误
+///
+/// 当服务端返回 400 + `invalid_grant` 时，表示 refreshToken 已被撤销或过期，
+/// 不应重试，需立即禁用对应凭据。
+#[derive(Debug)]
+pub(crate) struct RefreshTokenInvalidError {
+    pub message: String,
+}
+
+impl fmt::Display for RefreshTokenInvalidError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for RefreshTokenInvalidError {}
 
 /// 刷新 Token
 pub(crate) async fn refresh_token(
@@ -203,6 +163,18 @@ async fn refresh_social_token(
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+
+        // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
+        if status.as_u16() == 400
+            && body_text.contains("\"invalid_grant\"")
+            && body_text.contains("Invalid refresh token provided")
+        {
+            return Err(RefreshTokenInvalidError {
+                message: format!("Social refreshToken 已失效 (invalid_grant): {}", body_text),
+            }
+            .into());
+        }
+
         let error_msg = match status.as_u16() {
             401 => "OAuth 凭证已过期或无效，需要重新认证",
             403 => "权限不足，无法刷新 Token",
@@ -288,6 +260,18 @@ async fn refresh_idc_token(
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+
+        // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
+        if status.as_u16() == 400
+            && body_text.contains("\"invalid_grant\"")
+            && body_text.contains("Invalid refresh token provided")
+        {
+            return Err(RefreshTokenInvalidError {
+                message: format!("IdC refreshToken 已失效 (invalid_grant): {}", body_text),
+            }
+            .into());
+        }
+
         let error_msg = match status.as_u16() {
             401 => "IdC 凭证已过期或无效，需要重新认证",
             403 => "权限不足，无法刷新 Token",
@@ -422,6 +406,8 @@ enum DisabledReason {
     TooManyRefreshFailures,
     /// 额度已用尽（如 MONTHLY_REQUEST_COUNT）
     QuotaExceeded,
+    /// Refresh Token 永久失效（服务端返回 invalid_grant）
+    InvalidRefreshToken,
 }
 
 /// 统计数据持久化条目
@@ -643,17 +629,6 @@ impl MultiTokenManager {
         &self.config
     }
 
-    /// 获取当前活动凭据的克隆
-    pub fn credentials(&self) -> KiroCredentials {
-        let entries = self.entries.lock();
-        let current_id = *self.current_id.lock();
-        entries
-            .iter()
-            .find(|e| e.id == current_id)
-            .map(|e| e.credentials.clone())
-            .unwrap_or_default()
-    }
-
     /// 获取凭据总数
     pub fn total_count(&self) -> usize {
         self.entries.lock().len()
@@ -808,8 +783,15 @@ impl MultiTokenManager {
                     return Ok(ctx);
                 }
                 Err(e) => {
-                    let has_available = self.report_refresh_failure(id);
-                    tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
+                    // refreshToken 永久失效 → 立即禁用，不累计重试
+                    let has_available =
+                        if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                            tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
+                            self.report_refresh_token_invalid(id)
+                        } else {
+                            tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
+                            self.report_refresh_failure(id)
+                        };
                     attempt_count += 1;
                     if !has_available {
                         anyhow::bail!("所有凭据均已禁用（0/{}）", total);
@@ -819,30 +801,9 @@ impl MultiTokenManager {
         }
     }
 
-    /// 切换到下一个优先级最高的可用凭据（内部方法）
-    fn switch_to_next_by_priority(&self) {
-        let entries = self.entries.lock();
-        let mut current_id = self.current_id.lock();
-
-        // 选择优先级最高的未禁用凭据（排除当前凭据）
-        if let Some(entry) = entries
-            .iter()
-            .filter(|e| !e.disabled && e.id != *current_id)
-            .min_by_key(|e| e.credentials.priority)
-        {
-            *current_id = entry.id;
-            tracing::info!(
-                "已切换到凭据 #{}（优先级 {}）",
-                entry.id,
-                entry.credentials.priority
-            );
-        }
-    }
-
     /// 选择优先级最高的未禁用凭据作为当前凭据（内部方法）
     ///
-    /// 与 `switch_to_next_by_priority` 不同，此方法不排除当前凭据，
-    /// 纯粹按优先级选择，用于优先级变更后立即生效
+    /// 纯粹按优先级选择，不排除当前凭据，用于优先级变更后立即生效
     fn select_highest_priority(&self) {
         let entries = self.entries.lock();
         let mut current_id = self.current_id.lock();
@@ -1293,6 +1254,54 @@ impl MultiTokenManager {
         result
     }
 
+    /// 报告指定凭据的 refreshToken 永久失效（invalid_grant）。
+    ///
+    /// 立即禁用凭据，不累计、不重试。
+    /// 返回是否还有可用凭据。
+    pub fn report_refresh_token_invalid(&self, id: u64) -> bool {
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => return entries.iter().any(|e| !e.disabled),
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|e| !e.disabled);
+            }
+
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
+
+            tracing::error!(
+                "凭据 #{} refreshToken 已失效 (invalid_grant)，已立即禁用",
+                id
+            );
+
+            if let Some(next) = entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .min_by_key(|e| e.credentials.priority)
+            {
+                *current_id = next.id;
+                tracing::info!(
+                    "已切换到凭据 #{}（优先级 {}）",
+                    next.id,
+                    next.credentials.priority
+                );
+                true
+            } else {
+                tracing::error!("所有凭据均已禁用！");
+                false
+            }
+        };
+        self.save_stats_debounced();
+        result
+    }
+
     /// 切换到优先级最高的可用凭据
     ///
     /// 返回是否成功切换
@@ -1317,19 +1326,6 @@ impl MultiTokenManager {
             // 没有其他可用凭据，检查当前凭据是否可用
             entries.iter().any(|e| e.id == *current_id && !e.disabled)
         }
-    }
-
-    /// 获取使用额度信息
-    pub async fn get_usage_limits(&self) -> anyhow::Result<UsageLimitsResponse> {
-        let ctx = self.acquire_context(None).await?;
-        let effective_proxy = ctx.credentials.effective_proxy(self.proxy.as_ref());
-        get_usage_limits(
-            &ctx.credentials,
-            &self.config,
-            &ctx.token,
-            effective_proxy.as_ref(),
-        )
-        .await
     }
 
     // ========================================================================
@@ -1372,6 +1368,7 @@ impl MultiTokenManager {
                             DisabledReason::TooManyFailures => "TooManyFailures",
                             DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
                             DisabledReason::QuotaExceeded => "QuotaExceeded",
+                            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
                         }
                         .to_string()
                     }),
@@ -1803,14 +1800,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_token_manager_new() {
-        let config = Config::default();
-        let credentials = KiroCredentials::default();
-        let tm = TokenManager::new(config, credentials, None);
-        assert!(tm.credentials().access_token.is_none());
-    }
-
-    #[test]
     fn test_is_token_expired_with_expired_token() {
         let mut credentials = KiroCredentials::default();
         credentials.expires_at = Some("2020-01-01T00:00:00Z".to_string());
@@ -1998,18 +1987,11 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
-        // 初始是第一个凭据
-        assert_eq!(
-            manager.credentials().refresh_token,
-            Some("token1".to_string())
-        );
+        let initial_id = manager.snapshot().current_id;
 
         // 切换到下一个
         assert!(manager.switch_to_next());
-        assert_eq!(
-            manager.credentials().refresh_token,
-            Some("token2".to_string())
-        );
+        assert_ne!(manager.snapshot().current_id, initial_id);
     }
 
     #[test]
