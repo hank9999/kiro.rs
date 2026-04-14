@@ -216,6 +216,10 @@ impl KiroProvider {
                 request = request.header("x-amzn-kiro-profile-arn", arn);
             }
 
+            if ctx.credentials.is_api_key_credential() {
+                request = request.header("tokentype", "API_KEY");
+            }
+
             let response = match request
                 .header("x-amz-user-agent", &x_amz_user_agent)
                 .header("user-agent", &user_agent)
@@ -373,7 +377,7 @@ impl KiroProvider {
             let body = Self::inject_profile_arn(request_body, &ctx.credentials.profile_arn);
 
             // 发送请求
-            let response = match self
+            let mut request = self
                 .client_for(&ctx.credentials)?
                 .post(&url)
                 .body(body)
@@ -386,7 +390,13 @@ impl KiroProvider {
                 .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
                 .header("amz-sdk-request", "attempt=1; max=3")
                 .header("Authorization", format!("Bearer {}", ctx.token))
-                .header("Connection", "close")
+                .header("Connection", "close");
+
+            if ctx.credentials.is_api_key_credential() {
+                request = request.header("tokentype", "API_KEY");
+            }
+
+            let response = match request
                 .send()
                 .await
             {
