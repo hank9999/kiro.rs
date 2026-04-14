@@ -57,6 +57,13 @@ pub fn generate_from_credentials(credentials: &KiroCredentials, config: &Config)
         }
     }
 
+    // 使用 kiroApiKey 生成（API Key 凭据）
+    if let Some(ref api_key) = credentials.kiro_api_key {
+        if !api_key.is_empty() {
+            return Some(sha256_hex(&format!("KiroAPIKey/{}", api_key)));
+        }
+    }
+
     // 没有有效的凭证
     None
 }

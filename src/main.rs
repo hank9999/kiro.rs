@@ -51,7 +51,22 @@ async fn main() {
     let is_multiple_format = credentials_config.is_multiple();
 
     // 转换为按优先级排序的凭据列表
-    let credentials_list = credentials_config.into_sorted_credentials();
+    let mut credentials_list = credentials_config.into_sorted_credentials();
+
+    // 检查 KIRO_API_KEY 环境变量，自动创建 API Key 凭据
+    if let Ok(kiro_api_key) = std::env::var("KIRO_API_KEY") {
+        if !kiro_api_key.is_empty() {
+            tracing::info!("检测到 KIRO_API_KEY 环境变量，添加 API Key 凭据（最高优先级）");
+            let api_key_cred = KiroCredentials {
+                kiro_api_key: Some(kiro_api_key),
+                auth_method: Some("api_key".to_string()),
+                priority: 0,
+                ..Default::default()
+            };
+            credentials_list.insert(0, api_key_cred);
+        }
+    }
+
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
 
     // 获取第一个凭据用于日志显示

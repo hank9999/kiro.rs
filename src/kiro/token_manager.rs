@@ -100,6 +100,11 @@ pub(crate) async fn refresh_token(
     config: &Config,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<KiroCredentials> {
+    // API Key 凭据不需要刷新，直接返回
+    if credentials.is_api_key_credential() {
+        return Ok(credentials.clone());
+    }
+
     validate_refresh_token(credentials)?;
 
     // 根据 auth_method 选择刷新方式
@@ -841,6 +846,19 @@ impl MultiTokenManager {
         id: u64,
         credentials: &KiroCredentials,
     ) -> anyhow::Result<CallContext> {
+        // API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需刷新
+        if credentials.is_api_key_credential() {
+            let token = credentials
+                .kiro_api_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
+            return Ok(CallContext {
+                id,
+                credentials: credentials.clone(),
+                token,
+            });
+        }
+
         // 第一次检查（无锁）：快速判断是否需要刷新
         let needs_refresh = is_token_expired(credentials) || is_token_expiring_soon(credentials);
 
@@ -1349,16 +1367,35 @@ impl MultiTokenManager {
                     priority: e.credentials.priority,
                     disabled: e.disabled,
                     failure_count: e.failure_count,
-                    auth_method: e.credentials.auth_method.as_deref().map(|m| {
-                        if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
-                            "idc".to_string()
-                        } else {
-                            m.to_string()
-                        }
-                    }),
+                    auth_method: if e.credentials.is_api_key_credential() {
+                        Some("api_key".to_string())
+                    } else {
+                        e.credentials.auth_method.as_deref().map(|m| {
+                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
+                                "idc".to_string()
+                            } else {
+                                m.to_string()
+                            }
+                        })
+                    },
                     has_profile_arn: e.credentials.profile_arn.is_some(),
-                    expires_at: e.credentials.expires_at.clone(),
-                    refresh_token_hash: e.credentials.refresh_token.as_deref().map(sha256_hex),
+                    expires_at: if e.credentials.is_api_key_credential() {
+                        None // API Key 不过期
+                    } else {
+                        e.credentials.expires_at.clone()
+                    },
+                    refresh_token_hash: if e.credentials.is_api_key_credential() {
+                        // API Key 凭据显示脱敏的 key
+                        e.credentials.kiro_api_key.as_deref().map(|k| {
+                            if k.len() > 8 {
+                                format!("{}...{}", &k[..8], &k[k.len()-4..])
+                            } else {
+                                "***".to_string()
+                            }
+                        })
+                    } else {
+                        e.credentials.refresh_token.as_deref().map(sha256_hex)
+                    },
                     email: e.credentials.email.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),

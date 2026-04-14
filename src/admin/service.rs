@@ -210,6 +210,7 @@ impl AdminService {
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
             disabled: false, // 新添加的凭据默认启用
+            kiro_api_key: None,
         };
 
         // 调用 token_manager 添加凭据
