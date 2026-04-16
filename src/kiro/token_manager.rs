@@ -1492,6 +1492,12 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
+                anyhow::bail!(
+                    "凭据 #{} 因配置无效被禁用，请修正配置后重启服务",
+                    id
+                );
+            }
             entry.failure_count = 0;
             entry.refresh_failure_count = 0;
             entry.disabled = false;
