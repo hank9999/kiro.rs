@@ -9,8 +9,8 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, SetDefaultRateLimitsRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SetRateLimitsRequest, SuccessResponse,
     },
 };
 
@@ -50,6 +50,19 @@ pub async fn set_credential_priority(
             id, payload.priority
         )))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/rate-limits
+/// 设置凭据级限流规则
+pub async fn set_credential_rate_limits(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetRateLimitsRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credential_rate_limits(id, payload.rate_limits) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 限流规则已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -136,6 +149,24 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/rate-limits
+/// 获取全局默认限流规则
+pub async fn get_default_rate_limits(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_default_rate_limits())
+}
+
+/// PUT /api/admin/config/rate-limits
+/// 设置全局默认限流规则
+pub async fn set_default_rate_limits(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetDefaultRateLimitsRequest>,
+) -> impl IntoResponse {
+    match state.service.set_default_rate_limits(payload.default_rate_limits) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

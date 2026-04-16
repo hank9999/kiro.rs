@@ -71,25 +71,28 @@ impl KiroProvider {
 
     /// 获取凭据级 API 基础 URL
     fn base_url_for(&self, credentials: &KiroCredentials) -> String {
+        let config = self.token_manager.config();
         format!(
             "https://q.{}.amazonaws.com/generateAssistantResponse",
-            credentials.effective_api_region(self.token_manager.config())
+            credentials.effective_api_region(&config)
         )
     }
 
     /// 获取凭据级 MCP API URL
     fn mcp_url_for(&self, credentials: &KiroCredentials) -> String {
+        let config = self.token_manager.config();
         format!(
             "https://q.{}.amazonaws.com/mcp",
-            credentials.effective_api_region(self.token_manager.config())
+            credentials.effective_api_region(&config)
         )
     }
 
     /// 获取凭据级 API 基础域名
     fn base_domain_for(&self, credentials: &KiroCredentials) -> String {
+        let config = self.token_manager.config();
         format!(
             "q.{}.amazonaws.com",
-            credentials.effective_api_region(self.token_manager.config())
+            credentials.effective_api_region(&config)
         )
     }
 
@@ -189,7 +192,7 @@ impl KiroProvider {
             };
 
             let config = self.token_manager.config();
-            let machine_id = match machine_id::generate_from_credentials(&ctx.credentials, config) {
+            let machine_id = match machine_id::generate_from_credentials(&ctx.credentials, &config) {
                 Some(id) => id,
                 None => {
                     last_error = Some(anyhow::anyhow!("无法生成 machine_id，请检查凭证配置"));
@@ -354,7 +357,7 @@ impl KiroProvider {
             };
 
             let config = self.token_manager.config();
-            let machine_id = match machine_id::generate_from_credentials(&ctx.credentials, config) {
+            let machine_id = match machine_id::generate_from_credentials(&ctx.credentials, &config) {
                 Some(id) => id,
                 None => {
                     last_error = Some(anyhow::anyhow!("无法生成 machine_id，请检查凭证配置"));

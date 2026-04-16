@@ -1,3 +1,8 @@
+export interface RateLimitRule {
+  window: string
+  maxRequests: number
+}
+
 // 凭据状态响应
 export interface CredentialsStatusResponse {
   total: number
@@ -24,6 +29,10 @@ export interface CredentialStatusItem {
   proxyUrl?: string
   refreshFailureCount: number
   disabledReason?: string
+  rateLimits?: RateLimitRule[]
+  effectiveRateLimits: RateLimitRule[]
+  rateLimited: boolean
+  nextAvailableAt?: string
 }
 
 // 余额响应
@@ -73,6 +82,7 @@ export interface AddCredentialRequest {
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
+  rateLimits?: RateLimitRule[]
 }
 
 // 添加凭据响应
@@ -81,4 +91,8 @@ export interface AddCredentialResponse {
   message: string
   credentialId: number
   email?: string
+}
+
+export interface DefaultRateLimitsResponse {
+  defaultRateLimits?: RateLimitRule[]
 }

@@ -9,6 +9,7 @@ use std::path::Path;
 
 use crate::http_client::ProxyConfig;
 use crate::model::config::Config;
+use crate::model::rate_limit::{RateLimitRule, effective_rate_limit_rules, validate_rate_limit_rules};
 
 /// Kiro OAuth 凭证
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -96,6 +97,11 @@ pub struct KiroCredentials {
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
     pub disabled: bool,
+
+    /// 凭据级限流规则（可选）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limits: Option<Vec<RateLimitRule>>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -147,6 +153,14 @@ impl CredentialsConfig {
         }
 
         let config = serde_json::from_str(&content)?;
+        match &config {
+            CredentialsConfig::Single(cred) => cred.validate("credentials")?,
+            CredentialsConfig::Multiple(creds) => {
+                for (idx, cred) in creds.iter().enumerate() {
+                    cred.validate(&format!("credentials[{idx}]"))?;
+                }
+            }
+        }
         Ok(config)
     }
 
@@ -245,6 +259,21 @@ impl KiroCredentials {
             None => true,
         }
     }
+
+    pub fn effective_rate_limits(&self, config: &Config) -> Vec<RateLimitRule> {
+        effective_rate_limit_rules(
+            config.default_rate_limits.as_deref(),
+            self.rate_limits.as_deref(),
+        )
+        .unwrap_or_default()
+    }
+
+    pub fn validate(&self, source: &str) -> anyhow::Result<()> {
+        validate_rate_limit_rules(
+            self.rate_limits.as_deref(),
+            &format!("{source}.rateLimits"),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -314,6 +343,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            rate_limits: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -431,6 +461,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            rate_limits: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -461,6 +492,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            rate_limits: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -573,6 +605,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            rate_limits: None,
         };
 
         let json = original.to_pretty_json().unwrap();

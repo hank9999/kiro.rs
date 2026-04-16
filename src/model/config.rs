@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::model::rate_limit::{RateLimitRule, validate_rate_limit_rules};
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum TlsBackend {
@@ -86,6 +88,11 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
+    /// 全局默认限流规则（每个凭据的默认值）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_rate_limits: Option<Vec<RateLimitRule>>,
+
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
@@ -164,6 +171,7 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            default_rate_limits: None,
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             config_path: None,
@@ -201,6 +209,10 @@ impl Config {
 
         let content = fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&content)?;
+        validate_rate_limit_rules(
+            config.default_rate_limits.as_deref(),
+            "config.defaultRateLimits",
+        )?;
         config.config_path = Some(path.to_path_buf());
         Ok(config)
     }

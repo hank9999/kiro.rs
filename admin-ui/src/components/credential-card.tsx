@@ -7,6 +7,7 @@ import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { Input } from '@/components/ui/input'
 import { Checkbox } from '@/components/ui/checkbox'
+import { RateLimitDialog } from '@/components/rate-limit-dialog'
 import {
   Dialog,
   DialogContent,
@@ -19,10 +20,12 @@ import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
 import {
   useSetDisabled,
   useSetPriority,
+  useSetCredentialRateLimits,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
 } from '@/hooks/use-credentials'
+import type { RateLimitRule } from '@/types/api'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
@@ -49,6 +52,18 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
+function formatRateLimits(rateLimits?: RateLimitRule[]): string {
+  if (!rateLimits || rateLimits.length === 0) return '未配置'
+  return rateLimits
+    .map((rule) => `${rule.window} / ${rule.maxRequests}`)
+    .join('，')
+}
+
+function formatDateTime(value?: string): string {
+  if (!value) return '-'
+  return new Date(value).toLocaleString()
+}
+
 export function CredentialCard({
   credential,
   onViewBalance,
@@ -60,9 +75,11 @@ export function CredentialCard({
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [showRateLimitDialog, setShowRateLimitDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
+  const setCredentialRateLimits = useSetCredentialRateLimits()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
@@ -243,9 +260,25 @@ export function CredentialCard({
               <span className="text-muted-foreground">成功次数：</span>
               <span className="font-medium">{credential.successCount}</span>
             </div>
+            <div>
+              <span className="text-muted-foreground">限流状态：</span>
+              <span className={credential.rateLimited ? 'text-amber-600 font-medium' : 'font-medium'}>
+                {credential.rateLimited ? '限流中' : '正常'}
+              </span>
+            </div>
             <div className="col-span-2">
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
+            </div>
+            {credential.rateLimited && credential.nextAvailableAt && (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">恢复时间：</span>
+                <span className="font-medium">{formatDateTime(credential.nextAvailableAt)}</span>
+              </div>
+            )}
+            <div className="col-span-2">
+              <span className="text-muted-foreground">限流规则：</span>
+              <span className="font-medium">{formatRateLimits(credential.effectiveRateLimits)}</span>
             </div>
             <div className="col-span-2">
               <span className="text-muted-foreground">剩余用量：</span>
@@ -297,6 +330,14 @@ export function CredentialCard({
             >
               <RefreshCw className={`h-4 w-4 mr-1 ${forceRefresh.isPending ? 'animate-spin' : ''}`} />
               刷新 Token
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setShowRateLimitDialog(true)}
+              disabled={setCredentialRateLimits.isPending}
+            >
+              编辑限流
             </Button>
             <Button
               size="sm"
@@ -383,6 +424,29 @@ export function CredentialCard({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <RateLimitDialog
+        open={showRateLimitDialog}
+        onOpenChange={setShowRateLimitDialog}
+        title={`编辑凭据 #${credential.id} 限流`}
+        description="这里只配置该凭据自己的限流规则。留空保存会移除凭据级规则，回退到全局默认限流。"
+        initialRules={credential.rateLimits}
+        loading={setCredentialRateLimits.isPending}
+        onSave={(rules) => {
+          setCredentialRateLimits.mutate(
+            { id: credential.id, rateLimits: rules },
+            {
+              onSuccess: (res) => {
+                toast.success(res.message)
+                setShowRateLimitDialog(false)
+              },
+              onError: (err) => {
+                toast.error('操作失败: ' + (err as Error).message)
+              },
+            }
+          )
+        }}
+      />
     </>
   )
 }

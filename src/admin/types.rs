@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::rate_limit::RateLimitRule;
+
 // ============ 凭据状态 ============
 
 /// 所有凭据状态响应
@@ -56,6 +58,16 @@ pub struct CredentialStatusItem {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// 凭据自身配置的限流规则
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limits: Option<Vec<RateLimitRule>>,
+    /// 当前生效的限流规则
+    pub effective_rate_limits: Vec<RateLimitRule>,
+    /// 当前是否因限流暂时不可用
+    pub rate_limited: bool,
+    /// 最早恢复可用时间（RFC3339）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_available_at: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -74,6 +86,15 @@ pub struct SetDisabledRequest {
 pub struct SetPriorityRequest {
     /// 新优先级值
     pub priority: u32,
+}
+
+/// 设置凭据级限流规则请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRateLimitsRequest {
+    /// 限流规则；传空数组或 null 表示清空凭据级覆盖
+    #[serde(default)]
+    pub rate_limits: Option<Vec<RateLimitRule>>,
 }
 
 /// 添加凭据请求
@@ -122,6 +143,10 @@ pub struct AddCredentialRequest {
 
     /// 凭据级代理认证密码（可选）
     pub proxy_password: Option<String>,
+
+    /// 凭据级限流规则（可选）
+    #[serde(default)]
+    pub rate_limits: Option<Vec<RateLimitRule>>,
 }
 
 fn default_auth_method() -> String {
@@ -179,6 +204,21 @@ pub struct LoadBalancingModeResponse {
 pub struct SetLoadBalancingModeRequest {
     /// 模式（"priority" 或 "balanced"）
     pub mode: String,
+}
+
+/// 全局默认限流规则响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefaultRateLimitsResponse {
+    pub default_rate_limits: Option<Vec<RateLimitRule>>,
+}
+
+/// 设置全局默认限流规则请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetDefaultRateLimitsRequest {
+    #[serde(default)]
+    pub default_rate_limits: Option<Vec<RateLimitRule>>,
 }
 
 // ============ 通用响应 ============

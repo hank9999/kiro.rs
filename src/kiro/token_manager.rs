@@ -5,12 +5,13 @@
 
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
+use tokio::time::{Instant as TokioInstant, sleep_until};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +25,7 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
+use crate::model::rate_limit::{RateLimitRule, ResolvedRateLimitRule, resolve_rate_limit_rules};
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -396,6 +398,8 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 运行时限流状态（仅内存）
+    rate_limit_state: CredentialRateLimitState,
 }
 
 /// 禁用原因
@@ -418,6 +422,23 @@ enum DisabledReason {
 struct StatsEntry {
     success_count: u64,
     last_used_at: Option<String>,
+}
+
+#[derive(Default)]
+struct CredentialRateLimitState {
+    request_timestamps: VecDeque<Instant>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RateLimitAvailability {
+    Ready,
+    LimitedUntil(Instant),
+}
+
+enum CredentialSelection {
+    Ready(u64, KiroCredentials),
+    WaitUntil(Instant),
+    NoneAvailable,
 }
 
 // ============================================================================
@@ -460,6 +481,16 @@ pub struct CredentialEntrySnapshot {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// 凭据自身声明的限流规则
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limits: Option<Vec<RateLimitRule>>,
+    /// 当前生效的限流规则
+    pub effective_rate_limits: Vec<RateLimitRule>,
+    /// 当前是否因限流不可用
+    pub rate_limited: bool,
+    /// 最早恢复可用时间（RFC3339 格式）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_available_at: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -481,7 +512,7 @@ pub struct ManagerSnapshot {
 /// 支持多个凭据的管理，实现固定优先级 + 故障转移策略
 /// 故障统计基于 API 调用结果，而非 Token 刷新结果
 pub struct MultiTokenManager {
-    config: Config,
+    config: RwLock<Config>,
     proxy: Option<ProxyConfig>,
     /// 凭据条目列表
     entries: Mutex<Vec<CredentialEntry>>,
@@ -575,6 +606,7 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     last_used_at: None,
+                    rate_limit_state: CredentialRateLimitState::default(),
                 }
             })
             .collect();
@@ -600,7 +632,7 @@ impl MultiTokenManager {
 
         let load_balancing_mode = config.load_balancing_mode.clone();
         let manager = Self {
-            config,
+            config: RwLock::new(config),
             proxy,
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
@@ -628,8 +660,8 @@ impl MultiTokenManager {
     }
 
     /// 获取配置的引用
-    pub fn config(&self) -> &Config {
-        &self.config
+    pub fn config(&self) -> Config {
+        self.config.read().clone()
     }
 
     /// 获取凭据总数
@@ -642,58 +674,180 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
-    /// 根据负载均衡模式选择下一个凭据
-    ///
-    /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：均衡选择可用凭据
-    ///
-    /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
-        let entries = self.entries.lock();
-
-        // 检查是否是 opus 模型
+    fn supports_model(credentials: &KiroCredentials, model: Option<&str>) -> bool {
         let is_opus = model
             .map(|m| m.to_lowercase().contains("opus"))
             .unwrap_or(false);
+        !is_opus || credentials.supports_opus()
+    }
 
-        // 过滤可用凭据
-        let available: Vec<_> = entries
-            .iter()
-            .filter(|e| {
-                if e.disabled {
-                    return false;
-                }
-                // 如果是 opus 模型，需要检查订阅等级
-                if is_opus && !e.credentials.supports_opus() {
-                    return false;
-                }
-                true
-            })
-            .collect();
+    fn effective_resolved_rate_limits(
+        credentials: &KiroCredentials,
+        config: &Config,
+    ) -> Vec<ResolvedRateLimitRule> {
+        let effective = credentials.effective_rate_limits(config);
+        resolve_rate_limit_rules(&effective, "effectiveRateLimits").unwrap_or_default()
+    }
 
-        if available.is_empty() {
-            return None;
+    fn check_rate_limit(
+        state: &mut CredentialRateLimitState,
+        rules: &[ResolvedRateLimitRule],
+        now: Instant,
+    ) -> RateLimitAvailability {
+        if rules.is_empty() {
+            return RateLimitAvailability::Ready;
         }
 
+        let max_window = rules.iter().map(|rule| rule.window_seconds).max().unwrap_or(0);
+        let max_window_duration = StdDuration::from_secs(max_window);
+        while let Some(front) = state.request_timestamps.front() {
+            if now.duration_since(*front) >= max_window_duration {
+                state.request_timestamps.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        let mut limited_until = None;
+        for rule in rules {
+            let window_duration = StdDuration::from_secs(rule.window_seconds);
+            let in_window: Vec<_> = state
+                .request_timestamps
+                .iter()
+                .copied()
+                .filter(|ts| ts.checked_add(window_duration).is_some_and(|end| end > now))
+                .collect();
+
+            let count = in_window.len();
+            if count >= rule.max_requests as usize {
+                let release_index = count - rule.max_requests as usize;
+                if let Some(ts) = in_window.get(release_index) {
+                    let available_at = *ts + window_duration;
+                    limited_until = Some(match limited_until {
+                        Some(current) if current >= available_at => current,
+                        _ => available_at,
+                    });
+                }
+            }
+        }
+
+        limited_until
+            .map(RateLimitAvailability::LimitedUntil)
+            .unwrap_or(RateLimitAvailability::Ready)
+    }
+
+    fn reserve_rate_limit_slot(&self, id: u64, now: Instant) {
+        let config = self.config();
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            let rules = Self::effective_resolved_rate_limits(&entry.credentials, &config);
+            let _ = Self::check_rate_limit(&mut entry.rate_limit_state, &rules, now);
+            entry.rate_limit_state.request_timestamps.push_back(now);
+        }
+    }
+
+    fn instant_to_rfc3339(instant: Instant, now: Instant, wall_now: DateTime<Utc>) -> Option<String> {
+        let wait = instant.checked_duration_since(now)?;
+        let chrono_wait = Duration::from_std(wait).ok()?;
+        Some((wall_now + chrono_wait).to_rfc3339())
+    }
+
+    fn normalize_optional_rate_limits(
+        rate_limits: Option<Vec<RateLimitRule>>,
+        source: &str,
+    ) -> anyhow::Result<Option<Vec<RateLimitRule>>> {
+        let Some(rate_limits) = rate_limits else {
+            return Ok(None);
+        };
+
+        if rate_limits.is_empty() {
+            return Ok(None);
+        }
+
+        let normalized = resolve_rate_limit_rules(&rate_limits, source)?
+            .into_iter()
+            .map(|rule| RateLimitRule {
+                window: rule.window,
+                max_requests: rule.max_requests,
+            })
+            .collect::<Vec<_>>();
+        Ok(Some(normalized))
+    }
+
+    fn select_next_credential(&self, model: Option<&str>) -> CredentialSelection {
+        let config = self.config();
         let mode = self.load_balancing_mode.lock().clone();
-        let mode = mode.as_str();
+        let now = Instant::now();
+        let mut entries = self.entries.lock();
+        let current_id_value = *self.current_id.lock();
+        let mut earliest_wait: Option<Instant> = None;
 
-        match mode {
-            "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
-                let entry = available
-                    .iter()
-                    .min_by_key(|e| (e.success_count, e.credentials.priority))?;
+        if mode != "balanced" {
+            if let Some(entry) = entries
+                .iter_mut()
+                .find(|e| e.id == current_id_value && !e.disabled)
+            {
+                if Self::supports_model(&entry.credentials, model) {
+                    let rules = Self::effective_resolved_rate_limits(&entry.credentials, &config);
+                    if matches!(
+                        Self::check_rate_limit(&mut entry.rate_limit_state, &rules, now),
+                        RateLimitAvailability::Ready
+                    ) {
+                        return CredentialSelection::Ready(entry.id, entry.credentials.clone());
+                    }
+                    if let RateLimitAvailability::LimitedUntil(next) =
+                        Self::check_rate_limit(&mut entry.rate_limit_state, &rules, now)
+                    {
+                        earliest_wait = Some(match earliest_wait {
+                            Some(current) if current <= next => current,
+                            _ => next,
+                        });
+                    }
+                }
+            }
+        }
 
-                Some((entry.id, entry.credentials.clone()))
+        let mut available_indices = Vec::new();
+        for (idx, entry) in entries.iter_mut().enumerate() {
+            if entry.disabled || !Self::supports_model(&entry.credentials, model) {
+                continue;
             }
-            _ => {
-                // priority 模式（默认）：选择优先级最高的
-                let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
-                Some((entry.id, entry.credentials.clone()))
+
+            let rules = Self::effective_resolved_rate_limits(&entry.credentials, &config);
+            match Self::check_rate_limit(&mut entry.rate_limit_state, &rules, now) {
+                RateLimitAvailability::Ready => available_indices.push(idx),
+                RateLimitAvailability::LimitedUntil(next) => {
+                    earliest_wait = Some(match earliest_wait {
+                        Some(current) if current <= next => current,
+                        _ => next,
+                    });
+                }
             }
+        }
+
+        if !available_indices.is_empty() {
+            let selected_index = match mode.as_str() {
+                "balanced" => available_indices
+                    .into_iter()
+                    .min_by_key(|idx| {
+                        let entry = &entries[*idx];
+                        (entry.success_count, entry.credentials.priority)
+                    })
+                    .unwrap(),
+                _ => available_indices
+                    .into_iter()
+                    .min_by_key(|idx| entries[*idx].credentials.priority)
+                    .unwrap(),
+            };
+
+            let selected = &entries[selected_index];
+            return CredentialSelection::Ready(selected.id, selected.credentials.clone());
+        }
+
+        if let Some(next) = earliest_wait {
+            CredentialSelection::WaitUntil(next)
+        } else {
+            CredentialSelection::NoneAvailable
         }
     }
 
@@ -721,30 +875,24 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+            let (id, credentials) = match self.select_next_credential(model) {
+                CredentialSelection::Ready(id, credentials) => {
+                    let mut current_id = self.current_id.lock();
+                    *current_id = id;
+                    (id, credentials)
+                }
+                CredentialSelection::WaitUntil(next) => {
+                    let now = Instant::now();
+                    if let Some(wait) = next.checked_duration_since(now) {
+                        tracing::debug!("所有可用凭据均处于限流中，等待 {:?} 后重试", wait);
+                        sleep_until(TokioInstant::from_std(next)).await;
+                    }
+                    continue;
+                }
+                CredentialSelection::NoneAvailable => {
+                    let mut best = None;
 
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
-                    None
-                } else {
-                    let entries = self.entries.lock();
-                    let current_id = *self.current_id.lock();
-                    entries
-                        .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
-                        .map(|e| (e.id, e.credentials.clone()))
-                };
-
-                if let Some(hit) = current_hit {
-                    hit
-                } else {
-                    // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model);
-
-                    // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
-                    if best.is_none() {
+                    {
                         let mut entries = self.entries.lock();
                         if entries.iter().any(|e| {
                             e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
@@ -759,23 +907,23 @@ impl MultiTokenManager {
                                     e.failure_count = 0;
                                 }
                             }
-                            drop(entries);
-                            best = self.select_next_credential(model);
                         }
                     }
 
-                    if let Some((new_id, new_creds)) = best {
-                        // 更新 current_id
+                    if let CredentialSelection::Ready(id, credentials) =
+                        self.select_next_credential(model)
+                    {
+                        best = Some((id, credentials));
+                    }
+
+                    if let Some((id, credentials)) = best {
                         let mut current_id = self.current_id.lock();
-                        *current_id = new_id;
-                        (new_id, new_creds)
+                        *current_id = id;
+                        (id, credentials)
                     } else {
                         let entries = self.entries.lock();
-                        // 注意：必须在 bail! 之前计算 available_count，
-                        // 因为 available_count() 会尝试获取 entries 锁，
-                        // 而此时我们已经持有该锁，会导致死锁
                         let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                        anyhow::bail!("所有凭据均已禁用或不支持当前模型（{}/{}）", available, total);
                     }
                 }
             };
@@ -783,6 +931,7 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
+                    self.reserve_rate_limit_slot(id, Instant::now());
                     return Ok(ctx);
                 }
                 Err(e) => {
@@ -861,8 +1010,9 @@ impl MultiTokenManager {
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 // 确实需要刷新
                 let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+                let config = self.config();
                 let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+                    refresh_token(&current_creds, &config, effective_proxy.as_ref()).await?;
 
                 if is_token_expired(&new_creds) {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
@@ -1337,41 +1487,62 @@ impl MultiTokenManager {
 
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
-        let entries = self.entries.lock();
+        let config = self.config();
+        let now = Instant::now();
+        let wall_now = Utc::now();
+        let mut entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
 
         ManagerSnapshot {
             entries: entries
-                .iter()
-                .map(|e| CredentialEntrySnapshot {
-                    id: e.id,
-                    priority: e.credentials.priority,
-                    disabled: e.disabled,
-                    failure_count: e.failure_count,
-                    auth_method: e.credentials.auth_method.as_deref().map(|m| {
-                        if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
-                            "idc".to_string()
-                        } else {
-                            m.to_string()
+                .iter_mut()
+                .map(|e| {
+                    let effective_rate_limits = e.credentials.effective_rate_limits(&config);
+                    let resolved = Self::effective_resolved_rate_limits(&e.credentials, &config);
+                    let rate_limit_availability =
+                        Self::check_rate_limit(&mut e.rate_limit_state, &resolved, now);
+                    let next_available_at = match rate_limit_availability {
+                        RateLimitAvailability::Ready => None,
+                        RateLimitAvailability::LimitedUntil(next) => {
+                            Self::instant_to_rfc3339(next, now, wall_now)
                         }
-                    }),
-                    has_profile_arn: e.credentials.profile_arn.is_some(),
-                    expires_at: e.credentials.expires_at.clone(),
-                    refresh_token_hash: e.credentials.refresh_token.as_deref().map(sha256_hex),
-                    email: e.credentials.email.clone(),
-                    success_count: e.success_count,
-                    last_used_at: e.last_used_at.clone(),
-                    has_proxy: e.credentials.proxy_url.is_some(),
-                    proxy_url: e.credentials.proxy_url.clone(),
-                    refresh_failure_count: e.refresh_failure_count,
-                    disabled_reason: e.disabled_reason.map(|r| match r {
-                        DisabledReason::Manual => "Manual",
-                        DisabledReason::TooManyFailures => "TooManyFailures",
-                        DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
-                        DisabledReason::QuotaExceeded => "QuotaExceeded",
-                        DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
-                    }.to_string()),
+                    };
+
+                    CredentialEntrySnapshot {
+                        id: e.id,
+                        priority: e.credentials.priority,
+                        disabled: e.disabled,
+                        failure_count: e.failure_count,
+                        auth_method: e.credentials.auth_method.as_deref().map(|m| {
+                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam")
+                            {
+                                "idc".to_string()
+                            } else {
+                                m.to_string()
+                            }
+                        }),
+                        has_profile_arn: e.credentials.profile_arn.is_some(),
+                        expires_at: e.credentials.expires_at.clone(),
+                        refresh_token_hash: e.credentials.refresh_token.as_deref().map(sha256_hex),
+                        email: e.credentials.email.clone(),
+                        success_count: e.success_count,
+                        last_used_at: e.last_used_at.clone(),
+                        has_proxy: e.credentials.proxy_url.is_some(),
+                        proxy_url: e.credentials.proxy_url.clone(),
+                        refresh_failure_count: e.refresh_failure_count,
+                        disabled_reason: e.disabled_reason.map(|r| match r {
+                            DisabledReason::Manual => "Manual",
+                            DisabledReason::TooManyFailures => "TooManyFailures",
+                            DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
+                            DisabledReason::QuotaExceeded => "QuotaExceeded",
+                            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
+                        }.to_string()),
+                        rate_limits: e.credentials.rate_limits.clone(),
+                        effective_rate_limits,
+                        rate_limited: next_available_at.is_some(),
+                        next_available_at,
+                    }
                 })
                 .collect(),
             current_id,
@@ -1423,6 +1594,27 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 设置凭据级限流规则（Admin API）
+    pub fn set_rate_limits(
+        &self,
+        id: u64,
+        rate_limits: Option<Vec<RateLimitRule>>,
+    ) -> anyhow::Result<()> {
+        let normalized = Self::normalize_optional_rate_limits(rate_limits, "credentials.rateLimits")?;
+
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.rate_limits = normalized;
+        }
+
+        self.persist_credentials()?;
+        Ok(())
+    }
+
     /// 重置凭据失败计数并重新启用（Admin API）
     pub fn reset_and_enable(&self, id: u64) -> anyhow::Result<()> {
         {
@@ -1468,8 +1660,9 @@ impl MultiTokenManager {
 
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+                let config = self.config();
                 let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+                    refresh_token(&current_creds, &config, effective_proxy.as_ref()).await?;
                 {
                     let mut entries = self.entries.lock();
                     if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -1504,7 +1697,9 @@ impl MultiTokenManager {
         };
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let config = self.config();
+        let usage_limits =
+            get_usage_limits(&credentials, &config, &token, effective_proxy.as_ref()).await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -1581,8 +1776,9 @@ impl MultiTokenManager {
 
         // 3. 尝试刷新 Token 验证凭据有效性
         let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
+        let config = self.config();
         let mut validated_cred =
-            refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?;
+            refresh_token(&new_cred, &config, effective_proxy.as_ref()).await?;
 
         // 4. 分配新 ID
         let new_id = {
@@ -1610,6 +1806,7 @@ impl MultiTokenManager {
         validated_cred.proxy_url = new_cred.proxy_url;
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
+        validated_cred.rate_limits = new_cred.rate_limits;
 
         {
             let mut entries = self.entries.lock();
@@ -1622,6 +1819,7 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                rate_limit_state: CredentialRateLimitState::default(),
             });
         }
 
@@ -1717,8 +1915,8 @@ impl MultiTokenManager {
 
         // 无条件调用 refresh_token
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let new_creds =
-            refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
+        let config = self.config();
+        let new_creds = refresh_token(&credentials, &config, effective_proxy.as_ref()).await?;
 
         // 更新 entries 中对应凭据
         {
@@ -1738,6 +1936,30 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    pub fn get_default_rate_limits(&self) -> Option<Vec<RateLimitRule>> {
+        self.config.read().default_rate_limits.clone()
+    }
+
+    pub fn set_default_rate_limits(
+        &self,
+        rate_limits: Option<Vec<RateLimitRule>>,
+    ) -> anyhow::Result<()> {
+        let normalized =
+            Self::normalize_optional_rate_limits(rate_limits, "config.defaultRateLimits")?;
+
+        let mut config = self.config.write();
+        let previous = config.default_rate_limits.clone();
+        config.default_rate_limits = normalized;
+
+        if let Err(err) = config.save() {
+            config.default_rate_limits = previous;
+            return Err(err);
+        }
+
+        tracing::info!("全局默认限流规则已更新");
+        Ok(())
+    }
+
     /// 获取负载均衡模式（Admin API）
     pub fn get_load_balancing_mode(&self) -> String {
         self.load_balancing_mode.lock().clone()
@@ -1746,7 +1968,8 @@ impl MultiTokenManager {
     fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
         use anyhow::Context;
 
-        let config_path = match self.config.config_path() {
+        let config = self.config();
+        let config_path = match config.config_path() {
             Some(path) => path.to_path_buf(),
             None => {
                 tracing::warn!("配置文件路径未知，负载均衡模式仅在当前进程生效: {}", mode);
@@ -2022,6 +2245,55 @@ mod tests {
         assert_eq!(manager.get_load_balancing_mode(), "balanced");
 
         std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[test]
+    fn test_snapshot_marks_rate_limited_credential() {
+        let mut config = Config::default();
+        config.default_rate_limits = Some(vec![RateLimitRule {
+            window: "1m".to_string(),
+            max_requests: 1,
+        }]);
+
+        let mut credential = KiroCredentials::default();
+        credential.access_token = Some("token".to_string());
+        credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![credential], None, None, false).unwrap();
+        manager.reserve_rate_limit_slot(1, Instant::now());
+
+        let snapshot = manager.snapshot();
+        let entry = &snapshot.entries[0];
+        assert!(entry.rate_limited);
+        assert!(entry.next_available_at.is_some());
+        assert_eq!(entry.effective_rate_limits.len(), 1);
+        assert_eq!(entry.effective_rate_limits[0].window, "1m");
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_skips_rate_limited_current_credential() {
+        let config = Config::default();
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        cred1.rate_limits = Some(vec![RateLimitRule {
+            window: "1m".to_string(),
+            max_requests: 1,
+        }]);
+
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        manager.reserve_rate_limit_slot(1, Instant::now());
+        let ctx = manager.acquire_context(None).await.unwrap();
+
+        assert_eq!(ctx.id, 2);
+        assert_eq!(ctx.token, "t2");
     }
 
     #[tokio::test]

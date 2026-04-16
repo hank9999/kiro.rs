@@ -12,7 +12,16 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
+import { RateLimitDialog } from '@/components/rate-limit-dialog'
+import {
+  useCredentials,
+  useDefaultRateLimits,
+  useDeleteCredential,
+  useResetFailure,
+  useLoadBalancingMode,
+  useSetDefaultRateLimits,
+  useSetLoadBalancingMode,
+} from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
@@ -38,6 +47,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
+  const [rateLimitDialogOpen, setRateLimitDialogOpen] = useState(false)
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
@@ -54,6 +64,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
+  const { data: defaultRateLimitsData } = useDefaultRateLimits()
+  const { mutate: setDefaultRateLimits, isPending: isSettingRateLimits } = useSetDefaultRateLimits()
 
   // 计算分页
   const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
@@ -548,6 +560,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <Button
               variant="outline"
               size="sm"
+              onClick={() => setRateLimitDialogOpen(true)}
+              disabled={isSettingRateLimits}
+              title="编辑全局默认限流"
+            >
+              全局限流
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
               onClick={handleToggleLoadBalancing}
               disabled={isLoadingMode || isSettingMode}
               title="切换负载均衡模式"
@@ -780,6 +801,26 @@ export function Dashboard({ onLogout }: DashboardProps) {
         progress={verifyProgress}
         results={verifyResults}
         onCancel={handleCancelVerify}
+      />
+
+      <RateLimitDialog
+        open={rateLimitDialogOpen}
+        onOpenChange={setRateLimitDialogOpen}
+        title="全局默认限流"
+        description="这里配置未单独设置限流规则的凭据所使用的默认限流。只要凭据自己配置了规则，就会完全忽略全局默认限流。"
+        initialRules={defaultRateLimitsData?.defaultRateLimits}
+        loading={isSettingRateLimits}
+        onSave={(rules) => {
+          setDefaultRateLimits(rules, {
+            onSuccess: () => {
+              toast.success('全局默认限流规则已更新')
+              setRateLimitDialogOpen(false)
+            },
+            onError: (error) => {
+              toast.error(`更新失败: ${extractErrorMessage(error)}`)
+            },
+          })
+        }}
       />
     </div>
   )

@@ -65,6 +65,10 @@ pub fn build_client(
 
         builder = builder.proxy(proxy);
         tracing::debug!("HTTP Client 使用代理: {}", proxy_config.url);
+    } else {
+        // 未显式配置代理时，明确禁用系统代理探测。
+        // 这样可避免不同运行环境下隐式继承系统/环境代理，语义也更符合本项目配置预期。
+        builder = builder.no_proxy();
     }
 
     Ok(builder.build()?)

@@ -14,7 +14,8 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    CredentialsStatusResponse, DefaultRateLimitsResponse, LoadBalancingModeResponse,
+    SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -77,6 +78,10 @@ impl AdminService {
                 proxy_url: entry.proxy_url,
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
+                rate_limits: entry.rate_limits,
+                effective_rate_limits: entry.effective_rate_limits,
+                rate_limited: entry.rate_limited,
+                next_available_at: entry.next_available_at,
             })
             .collect();
 
@@ -209,6 +214,7 @@ impl AdminService {
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
+            rate_limits: req.rate_limits,
             disabled: false, // 新添加的凭据默认启用
         };
 
@@ -255,6 +261,12 @@ impl AdminService {
         }
     }
 
+    pub fn get_default_rate_limits(&self) -> DefaultRateLimitsResponse {
+        DefaultRateLimitsResponse {
+            default_rate_limits: self.token_manager.get_default_rate_limits(),
+        }
+    }
+
     /// 设置负载均衡模式
     pub fn set_load_balancing_mode(
         &self,
@@ -272,6 +284,27 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
+    }
+
+    pub fn set_default_rate_limits(
+        &self,
+        rate_limits: Option<Vec<crate::model::rate_limit::RateLimitRule>>,
+    ) -> Result<DefaultRateLimitsResponse, AdminServiceError> {
+        self.token_manager
+            .set_default_rate_limits(rate_limits)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_default_rate_limits())
+    }
+
+    pub fn set_credential_rate_limits(
+        &self,
+        id: u64,
+        rate_limits: Option<Vec<crate::model::rate_limit::RateLimitRule>>,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_rate_limits(id, rate_limits)
+            .map_err(|e| self.classify_error(e, id))
     }
 
     /// 强制刷新指定凭据的 Token

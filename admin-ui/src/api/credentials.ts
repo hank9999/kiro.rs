@@ -8,6 +8,8 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  DefaultRateLimitsResponse,
+  RateLimitRule,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -57,6 +59,18 @@ export async function setCredentialPriority(
   return data
 }
 
+// 设置凭据限流规则
+export async function setCredentialRateLimits(
+  id: number,
+  rateLimits?: RateLimitRule[]
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/rate-limits`,
+    { rateLimits }
+  )
+  return data
+}
+
 // 重置失败计数
 export async function resetCredentialFailure(
   id: number
@@ -102,5 +116,21 @@ export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'bala
 // 设置负载均衡模式
 export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
   const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
+  return data
+}
+
+// 获取全局默认限流规则
+export async function getDefaultRateLimits(): Promise<DefaultRateLimitsResponse> {
+  const { data } = await api.get<DefaultRateLimitsResponse>('/config/rate-limits')
+  return data
+}
+
+// 设置全局默认限流规则
+export async function setDefaultRateLimits(
+  defaultRateLimits?: RateLimitRule[]
+): Promise<DefaultRateLimitsResponse> {
+  const { data } = await api.put<DefaultRateLimitsResponse>('/config/rate-limits', {
+    defaultRateLimits,
+  })
   return data
 }

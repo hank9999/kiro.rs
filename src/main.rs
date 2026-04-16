@@ -151,8 +151,11 @@ async fn main() {
         tracing::info!("  GET  /api/admin/credentials");
         tracing::info!("  POST /api/admin/credentials/:index/disabled");
         tracing::info!("  POST /api/admin/credentials/:index/priority");
+        tracing::info!("  POST /api/admin/credentials/:index/rate-limits");
         tracing::info!("  POST /api/admin/credentials/:index/reset");
         tracing::info!("  GET  /api/admin/credentials/:index/balance");
+        tracing::info!("  GET  /api/admin/config/rate-limits");
+        tracing::info!("  PUT  /api/admin/config/rate-limits");
         tracing::info!("Admin UI:");
         tracing::info!("  GET  /admin");
     }

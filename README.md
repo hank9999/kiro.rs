@@ -45,6 +45,7 @@
 - **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询等
 - **多级 Region 配置**: 支持全局和凭据级别的 Auth Region / API Region 配置
 - **凭据级代理**: 支持为每个凭据单独配置 HTTP/SOCKS5 代理，优先级：凭据代理 > 全局代理 > 无代理
+- **自定义多窗口限流**: 支持全局默认限流和凭据级覆盖，时间窗口支持 `30s` / `5m` / `2h` / `1d` 等自定义配置
 
 ---
 
@@ -189,6 +190,7 @@ docker-compose up
 | `proxyUsername` | string | - | 代理用户名 |
 | `proxyPassword` | string | - | 代理密码 |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
+| `defaultRateLimits` | array | - | 全局默认限流规则（作为每个凭据的默认值） |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 
@@ -214,6 +216,10 @@ docker-compose up
    "proxyUsername": "user",
    "proxyPassword": "pass",
    "adminApiKey": "sk-admin-your-secret-key",
+   "defaultRateLimits": [
+      { "window": "5m", "maxRequests": 100 },
+      { "window": "24h", "maxRequests": 3000 }
+   ],
    "loadBalancingMode": "priority",
    "extractThinking": true
 }
@@ -244,6 +250,7 @@ docker-compose up
 | `proxyUrl`     | string | 凭据级代理 URL（可选，特殊值 `direct` 表示不使用代理）       |
 | `proxyUsername`| string | 凭据级代理用户名（可选）                                |
 | `proxyPassword`| string | 凭据级代理密码（可选）                                 |
+| `rateLimits`   | array  | 凭据级限流规则（可选，配置后将整套替代全局默认值）              |
 
 说明：
 - IdC / Builder-ID / IAM 在本项目里属于同一种登录方式，配置时统一使用 `authMethod: "idc"`
@@ -271,7 +278,11 @@ docker-compose up
       "refreshToken": "第一个凭据的刷新token",
       "expiresAt": "2025-12-31T02:32:45.144Z",
       "authMethod": "social",
-      "priority": 0
+      "priority": 0,
+      "rateLimits": [
+         { "window": "2m", "maxRequests": 20 },
+         { "window": "12h", "maxRequests": 800 }
+      ]
    },
    {
       "refreshToken": "第二个凭据的刷新token",
@@ -300,6 +311,60 @@ docker-compose up
 - 单凭据最多重试 3 次，单请求最多重试 9 次
 - 自动故障转移到下一个可用凭据
 - 多凭据格式下 Token 刷新后自动回写到源文件
+
+### 限流配置
+
+支持全局默认限流和凭据级覆盖，规则结构如下：
+
+```json
+{ "window": "5m", "maxRequests": 100 }
+```
+
+- `window` 支持自定义时间窗口，格式为 `正整数 + 单位`
+- 单位支持：`s`（秒）、`m`（分钟）、`h`（小时）、`d`（天）
+- 示例：`30s`、`5m`、`90m`、`2h`、`1d`
+- `maxRequests` 必须大于 0
+
+生效规则：
+
+- `config.defaultRateLimits` 是全局默认值
+- 如果凭据未配置 `rateLimits`，则使用全局默认值
+- 如果凭据配置了 `rateLimits`，则整套使用凭据自己的规则，完全忽略全局默认值
+- 多条规则按“且”生效，任一窗口超限则该凭据暂时不可用
+- 当某个凭据限流时，系统会自动切换到其他可用凭据；如果全部凭据都被限流，请求会等待最早恢复的凭据而不是直接报错
+- 仅真实上游请求计入限流：`/generateAssistantResponse` 和 `/mcp`
+- Token 刷新、余额查询、Admin API 不计入限流
+
+示例：
+
+```json
+{
+   "defaultRateLimits": [
+      { "window": "5m", "maxRequests": 100 },
+      { "window": "24h", "maxRequests": 3000 }
+   ]
+}
+```
+
+```json
+[
+   {
+      "refreshToken": "凭据A",
+      "rateLimits": [
+         { "window": "2m", "maxRequests": 20 },
+         { "window": "1d", "maxRequests": 2000 }
+      ]
+   },
+   {
+      "refreshToken": "凭据B"
+   }
+]
+```
+
+上面配置下：
+
+- 凭据 A 生效规则为：`2m=20`、`1d=2000`
+- 凭据 B 生效规则为：`5m=100`、`24h=3000`
 
 ### Region 配置
 
@@ -450,8 +515,13 @@ RUST_LOG=debug ./target/release/kiro-rs
   - `DELETE /api/admin/credentials/:id` - 删除凭据
   - `POST /api/admin/credentials/:id/disabled` - 设置凭据禁用状态
   - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
+  - `POST /api/admin/credentials/:id/rate-limits` - 设置凭据级限流规则
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
   - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
+  - `GET /api/admin/config/rate-limits` - 获取全局默认限流规则
+  - `PUT /api/admin/config/rate-limits` - 设置全局默认限流规则
+  - `GET /api/admin/config/load-balancing` - 获取负载均衡模式
+  - `PUT /api/admin/config/load-balancing` - 设置负载均衡模式
 
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）

@@ -3,6 +3,7 @@ import {
   getCredentials,
   setCredentialDisabled,
   setCredentialPriority,
+  setCredentialRateLimits,
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
@@ -10,8 +11,10 @@ import {
   deleteCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getDefaultRateLimits,
+  setDefaultRateLimits,
 } from '@/api/credentials'
-import type { AddCredentialRequest } from '@/types/api'
+import type { AddCredentialRequest, RateLimitRule } from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -50,6 +53,18 @@ export function useSetPriority() {
   return useMutation({
     mutationFn: ({ id, priority }: { id: number; priority: number }) =>
       setCredentialPriority(id, priority),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 设置凭据限流规则
+export function useSetCredentialRateLimits() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, rateLimits }: { id: number; rateLimits?: RateLimitRule[] }) =>
+      setCredentialRateLimits(id, rateLimits),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
@@ -108,6 +123,14 @@ export function useLoadBalancingMode() {
   })
 }
 
+// 获取全局默认限流规则
+export function useDefaultRateLimits() {
+  return useQuery({
+    queryKey: ['defaultRateLimits'],
+    queryFn: getDefaultRateLimits,
+  })
+}
+
 // 设置负载均衡模式
 export function useSetLoadBalancingMode() {
   const queryClient = useQueryClient()
@@ -115,6 +138,18 @@ export function useSetLoadBalancingMode() {
     mutationFn: setLoadBalancingMode,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+    },
+  })
+}
+
+// 设置全局默认限流规则
+export function useSetDefaultRateLimits() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setDefaultRateLimits,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['defaultRateLimits'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })
 }
