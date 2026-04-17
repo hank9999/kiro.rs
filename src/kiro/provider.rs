@@ -133,11 +133,17 @@ impl KiroProvider {
     ///
     /// # Arguments
     /// * `request_body` - JSON 格式的请求体字符串
+    /// * `credential_id` - 可选的凭证 ID，指定使用特定凭证
     ///
     /// # Returns
     /// 返回原始的 HTTP Response，不做解析
-    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, false).await
+    pub async fn call_api(
+        &self,
+        request_body: &str,
+        credential_id: Option<u64>,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.call_api_with_retry(request_body, false, credential_id)
+            .await
     }
 
     /// 发送流式 API 请求
@@ -150,11 +156,17 @@ impl KiroProvider {
     ///
     /// # Arguments
     /// * `request_body` - JSON 格式的请求体字符串
+    /// * `credential_id` - 可选的凭证 ID，指定使用特定凭证
     ///
     /// # Returns
     /// 返回原始的 HTTP Response，调用方负责处理流式数据
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, true).await
+    pub async fn call_api_stream(
+        &self,
+        request_body: &str,
+        credential_id: Option<u64>,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.call_api_with_retry(request_body, true, credential_id)
+            .await
     }
 
     /// 发送 MCP API 请求
@@ -337,6 +349,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
+        credential_id: Option<u64>,
     ) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
@@ -349,11 +362,26 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
-                Ok(c) => c,
-                Err(e) => {
-                    last_error = Some(e);
-                    continue;
+            let ctx = match credential_id {
+                Some(id) => {
+                    // 使用指定凭证 ID
+                    match self.token_manager.acquire_context_by_id(id).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            // 指定凭证不可用，直接返回错误，不重试其他凭证
+                            return Err(e);
+                        }
+                    }
+                }
+                None => {
+                    // 使用系统配置的策略自动选择凭证（priority 或 balanced 模式）
+                    match self.token_manager.acquire_context(model.as_deref()).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            last_error = Some(e);
+                            continue;
+                        }
+                    }
                 }
             };
 

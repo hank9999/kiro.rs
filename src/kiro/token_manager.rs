@@ -851,6 +851,38 @@ impl MultiTokenManager {
         }
     }
 
+    /// 获取指定凭证的 API 调用上下文
+    ///
+    /// 直接使用指定 ID 的凭证，不经过负载均衡选择
+    /// 如果凭证被禁用或不存在，返回错误
+    ///
+    /// # 参数
+    /// - `id`: 凭证 ID
+    ///
+    /// # 返回
+    /// - `Ok(CallContext)` - 成功获取凭证上下文
+    /// - `Err(_)` - 凭证不存在、已禁用或 Token 刷新失败
+    pub async fn acquire_context_by_id(&self, id: u64) -> anyhow::Result<CallContext> {
+        // 查找指定 ID 的凭证
+        let credentials = {
+            let entries = self.entries.lock();
+            let entry = entries
+                .iter()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            // 检查凭据是否被禁用
+            if entry.disabled {
+                anyhow::bail!("凭据已禁用: {}", id);
+            }
+
+            entry.credentials.clone()
+        };
+
+        // 尝试获取/刷新 Token
+        self.try_ensure_token(id, &credentials).await
+    }
+
     /// 选择优先级最高的未禁用凭据作为当前凭据（内部方法）
     ///
     /// 纯粹按优先级选择，不排除当前凭据，用于优先级变更后立即生效
@@ -2596,5 +2628,70 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    // ============ acquire_context_by_id 测试 ============
+
+    #[tokio::test]
+    async fn test_acquire_context_by_id_success() {
+        let config = Config::default();
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("token1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("token2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        // 凭据会自动分配 ID（从 1 开始）
+        let ctx = manager.acquire_context_by_id(2).await.unwrap();
+        assert_eq!(ctx.id, 2);
+        assert_eq!(ctx.token, "token2");
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_by_id_not_found() {
+        let config = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("token".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        let err = manager.acquire_context_by_id(999).await.err().unwrap();
+        assert!(err.to_string().contains("凭据不存在"));
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_by_id_disabled() {
+        let config = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("token".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        cred.disabled = true;
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        let err = manager.acquire_context_by_id(1).await.err().unwrap();
+        assert!(err.to_string().contains("凭据已禁用"));
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_by_id_refreshes_token() {
+        let config = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("old_token".to_string());
+        // Token 已过期
+        cred.expires_at = Some((Utc::now() - Duration::hours(1)).to_rfc3339());
+        cred.refresh_token = Some("refresh".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        // 应该尝试刷新 Token，但会失败（因为没有真实的刷新服务）
+        let err = manager.acquire_context_by_id(1).await.err();
+        assert!(err.is_some());
     }
 }

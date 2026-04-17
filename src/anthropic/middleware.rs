@@ -15,6 +15,10 @@ use crate::kiro::provider::KiroProvider;
 
 use super::types::ErrorResponse;
 
+/// 凭证 ID（通过请求扩展传递）
+#[derive(Clone, Copy, Debug)]
+pub struct CredentialId(pub u64);
+
 /// 应用共享状态
 #[derive(Clone)]
 pub struct AppState {
@@ -45,14 +49,39 @@ impl AppState {
 }
 
 /// API Key 认证中间件
+///
+/// 支持两种 API key 格式：
+/// - `{base_key}` - 完全匹配配置的 API key，使用系统配置的策略（priority 或 balanced 模式）
+/// - `{base_key}-{credential_id}` - 直接使用指定凭证
+///
+/// 认证逻辑：
+/// 1. 先检查是否完全匹配配置的 API key → 使用系统配置的策略
+/// 2. 尝试解析凭证 ID → 使用指定凭证
+/// 3. 都不匹配 → 返回 401
 pub async fn auth_middleware(
     State(state): State<AppState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
     match auth::extract_api_key(&request) {
-        Some(key) if auth::constant_time_eq(&key, &state.api_key) => next.run(request).await,
-        _ => {
+        Some(key) => {
+            // 1. 先检查是否完全匹配（使用系统配置的策略）
+            if auth::constant_time_eq(&key, &state.api_key) {
+                return next.run(request).await;
+            }
+
+            // 2. 尝试解析凭证 ID
+            if let Some(credential_id) = auth::parse_credential_id(&key, &state.api_key) {
+                tracing::debug!("API key 指定使用凭证 ID: {}", credential_id);
+                request.extensions_mut().insert(CredentialId(credential_id));
+                return next.run(request).await;
+            }
+
+            // 3. 都不匹配，返回 401
+            let error = ErrorResponse::authentication_error();
+            (StatusCode::UNAUTHORIZED, Json(error)).into_response()
+        }
+        None => {
             let error = ErrorResponse::authentication_error();
             (StatusCode::UNAUTHORIZED, Json(error)).into_response()
         }
