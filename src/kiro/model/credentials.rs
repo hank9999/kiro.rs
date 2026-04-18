@@ -96,6 +96,19 @@ pub struct KiroCredentials {
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
     pub disabled: bool,
+
+    /// Kiro API Key（headless 模式）
+    /// 格式: ksk_xxxxxxxx
+    /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kiro_api_key: Option<String>,
+
+    /// 端点名称（可选）
+    ///
+    /// 决定该凭据走哪套 Kiro API。未配置时回退到 `config.defaultEndpoint`（默认 "ide"）。
+    /// 端点名必须在启动时注册的端点 registry 中存在。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -106,6 +119,8 @@ fn is_zero(value: &u32) -> bool {
 fn canonicalize_auth_method_value(value: &str) -> &str {
     if value.eq_ignore_ascii_case("builder-id") || value.eq_ignore_ascii_case("iam") {
         "idc"
+    } else if value.eq_ignore_ascii_case("api_key") || value.eq_ignore_ascii_case("apikey") {
+        "api_key"
     } else {
         value
     }
@@ -245,6 +260,18 @@ impl KiroCredentials {
             None => true,
         }
     }
+
+    /// 检查是否为 API Key 凭据
+    ///
+    /// API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需 refreshToken
+    pub fn is_api_key_credential(&self) -> bool {
+        self.kiro_api_key.is_some()
+            || self
+                .auth_method
+                .as_deref()
+                .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
+                .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
@@ -314,6 +341,8 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            kiro_api_key: None,
+            endpoint: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -410,7 +439,6 @@ mod tests {
 
     #[test]
     fn test_region_field_serialization() {
-        // 测试序列化时正确输出 region 字段
         let creds = KiroCredentials {
             id: None,
             access_token: None,
@@ -431,6 +459,8 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            kiro_api_key: None,
+            endpoint: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -440,7 +470,6 @@ mod tests {
 
     #[test]
     fn test_region_field_none_not_serialized() {
-        // 测试 region 为 None 时不序列化
         let creds = KiroCredentials {
             id: None,
             access_token: None,
@@ -461,6 +490,8 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            kiro_api_key: None,
+            endpoint: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -573,6 +604,8 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            kiro_api_key: None,
+            endpoint: None,
         };
 
         let json = original.to_pretty_json().unwrap();

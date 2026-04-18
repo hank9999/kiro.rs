@@ -5,6 +5,7 @@
   "tlsBackend": "rustls",
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
+  "defaultEndpoint": "ide",
   "proxyUrl": null,
   "proxyPool": {
     "enabled": false,
@@ -21,4 +22,3 @@
     "cooldownSecs": 30
   }
 }
-

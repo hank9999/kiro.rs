@@ -164,6 +164,17 @@ export function CredentialCard({
                 {credential.disabled && credential.disabledReason && (
                   <Badge variant="outline">{credential.disabledReason}</Badge>
                 )}
+                {credential.authMethod && (
+                  <Badge variant="secondary">
+                    {credential.authMethod === 'api_key' ? 'API Key' :
+                     credential.authMethod === 'idc' ? 'IdC' :
+                     credential.authMethod === 'social' ? 'Social' :
+                     credential.authMethod}
+                  </Badge>
+                )}
+                {credential.endpoint && (
+                  <Badge variant="outline">{credential.endpoint}</Badge>
+                )}
               </CardTitle>
             </div>
             <div className="flex items-center gap-2">
@@ -249,6 +260,12 @@ export function CredentialCard({
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
             </div>
+            {credential.maskedApiKey && (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">API Key：</span>
+                <span className="font-mono font-medium">{credential.maskedApiKey}</span>
+              </div>
+            )}
             <div className="col-span-2">
               <span className="text-muted-foreground">剩余用量：</span>
               {loadingBalance ? (
@@ -300,8 +317,8 @@ export function CredentialCard({
               size="sm"
               variant="outline"
               onClick={handleForceRefresh}
-              disabled={forceRefresh.isPending || credential.disabled}
-              title={credential.disabled ? '已禁用的凭据无法刷新 Token' : '强制刷新 Token'}
+              disabled={forceRefresh.isPending || credential.disabled || credential.authMethod === 'api_key'}
+              title={credential.authMethod === 'api_key' ? 'API Key 凭据无需刷新 Token' : credential.disabled ? '已禁用的凭据无法刷新 Token' : '强制刷新 Token'}
             >
               <RefreshCw className={`h-4 w-4 mr-1 ${forceRefresh.isPending ? 'animate-spin' : ''}`} />
               刷新 Token

@@ -10,6 +10,7 @@ mod openai;
 pub mod token;
 
 use std::{
+    collections::HashMap,
     ffi::OsStr,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -17,6 +18,7 @@ use std::{
 };
 
 use clap::Parser;
+use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -117,7 +119,24 @@ async fn main() {
     let is_multiple_format = credentials_config.is_multiple();
 
     // 转换为按优先级排序的凭据列表
-    let credentials_list = credentials_config.into_sorted_credentials();
+    let mut credentials_list = credentials_config.into_sorted_credentials();
+
+    // 检查 KIRO_API_KEY 环境变量，自动创建 API Key 凭据
+    if let Ok(kiro_api_key) = std::env::var("KIRO_API_KEY") {
+        if kiro_api_key.is_empty() {
+            tracing::warn!("KIRO_API_KEY 环境变量已设置但为空，视为未配置");
+        } else {
+            tracing::info!("检测到 KIRO_API_KEY 环境变量，添加 API Key 凭据（最高优先级）");
+            let api_key_cred = KiroCredentials {
+                kiro_api_key: Some(kiro_api_key),
+                auth_method: Some("api_key".to_string()),
+                priority: 0,
+                ..Default::default()
+            };
+            credentials_list.insert(0, api_key_cred);
+        }
+    }
+
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
 
     // 获取第一个凭据用于日志显示
@@ -155,6 +174,39 @@ async fn main() {
         );
     }
 
+    // 构建端点注册表（上游新增：支持按凭据选择 ide/cli 端点）
+    let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+    {
+        let ide = IdeEndpoint::new();
+        endpoints.insert(ide.name().to_string(), Arc::new(ide));
+    }
+
+    // 校验默认端点存在
+    if !endpoints.contains_key(&config.default_endpoint) {
+        tracing::error!("默认端点 \"{}\" 未注册", config.default_endpoint);
+        std::process::exit(1);
+    }
+
+    // 校验所有凭据声明的端点都已注册
+    for cred in &credentials_list {
+        let name = cred
+            .endpoint
+            .as_deref()
+            .unwrap_or(&config.default_endpoint);
+        if !endpoints.contains_key(name) {
+            tracing::error!(
+                "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
+                cred.id,
+                name,
+                endpoints.keys().collect::<Vec<_>>()
+            );
+            std::process::exit(1);
+        }
+    }
+
+    let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
+
+
     // 创建 MultiTokenManager 和 KiroProvider
     let token_manager = MultiTokenManager::new(
         config.clone(),
@@ -173,6 +225,8 @@ async fn main() {
         token_manager.clone(),
         proxy_config.clone(),
         proxy_pool.clone(),
+        endpoints,
+        config.default_endpoint.clone(),
     );
     let request_monitor = monitoring::RequestMonitor::new(500);
 
@@ -217,6 +271,7 @@ async fn main() {
                 request_monitor.clone(),
                 log_path,
                 config_path.into(),
+                endpoint_names.clone(),
             );
             let admin_state = admin::AdminState::new(admin_key, admin_service, app_state);
             let admin_app = admin::create_admin_router(admin_state);
