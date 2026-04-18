@@ -6,7 +6,7 @@
 //! [`KiroEndpoint`] 抽象了请求侧的差异点；`KiroProvider` 持有一个 endpoint 注册表，
 //! 按凭据的 `endpoint` 字段选择对应实现。
 
-use reqwest::RequestBuilder;
+use reqwest::{Client, RequestBuilder};
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
@@ -15,12 +15,91 @@ pub mod ide;
 
 pub use ide::IdeEndpoint;
 
+/// Kiro 端点上的单次请求类型
+///
+/// 上层统一通过 [`KiroEndpoint::build_request`] 构造 `RequestBuilder`，
+/// 由 endpoint 负责根据变体决定 URL / method / body 变换 / header 装饰。
+///
+/// 注：`stream` 与 `model` 字段在阶段 1 仅占位，Provider 将在阶段 4 读取它们。
+#[allow(dead_code)]
+pub enum KiroRequest<'a> {
+    /// 生成式 Assistant 请求（流式或非流式，视 `stream` 字段）
+    GenerateAssistant {
+        body: &'a str,
+        stream: bool,
+        model: Option<&'a str>,
+    },
+    /// MCP 工具调用请求
+    Mcp { body: &'a str },
+    /// 获取使用额度（GET 请求，无请求体）
+    UsageLimits,
+}
+
+/// Endpoint 层错误语义分类
+///
+/// Provider 重试循环根据分类决定：禁用凭据 / bail / 瞬态重试 / 强制刷新 token。
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointErrorKind {
+    /// 402 + 月度配额用尽标记：禁用凭据 + 故障转移
+    MonthlyQuotaExhausted,
+    /// 401/403 + bearer token 失效标记：强制刷新 token（每凭据一次机会）
+    BearerTokenInvalid,
+    /// 400 Bad Request：直接 bail，不重试、不计入失败
+    BadRequest,
+    /// 其他未分类 4xx（经 401/402/403 特殊分支处理后的剩余 4xx）：bail
+    ClientError,
+    /// 408/429/5xx：瞬态错误，sleep + 重试，不禁用
+    Transient,
+    /// 兜底：当作可重试瞬态错误
+    Unknown,
+}
+
 /// Kiro 端点
 ///
 /// 同一个 `KiroProvider` 可持有多个 endpoint 实现，按凭据级字段切换。
 pub trait KiroEndpoint: Send + Sync {
     /// 端点名称（对应 credentials.endpoint / config.defaultEndpoint 的取值）
     fn name(&self) -> &'static str;
+
+    /// 基于 `client` 构造一个未发送的 `RequestBuilder`
+    ///
+    /// 实现负责根据 `req` 变体确定 URL、method、请求体加工、所有 header（包括 Authorization、
+    /// content-type、Connection、host、user-agent 等端点相关项）。
+    ///
+    /// 默认实现为 `unimplemented!`，具体端点必须 override。
+    #[allow(dead_code)]
+    fn build_request(
+        &self,
+        _client: &Client,
+        _ctx: &RequestContext<'_>,
+        _req: &KiroRequest<'_>,
+    ) -> anyhow::Result<RequestBuilder> {
+        unimplemented!("endpoint {} 未实现 build_request", self.name())
+    }
+
+    /// 根据上游响应 status + body 分类错误类型
+    ///
+    /// 默认实现覆盖 IDE 通用语义；有特殊错误格式的端点可 override。
+    #[allow(dead_code)]
+    fn classify_error(&self, status: u16, body: &str) -> EndpointErrorKind {
+        if status == 402 && self.is_monthly_request_limit(body) {
+            return EndpointErrorKind::MonthlyQuotaExhausted;
+        }
+        if matches!(status, 401 | 403) && self.is_bearer_token_invalid(body) {
+            return EndpointErrorKind::BearerTokenInvalid;
+        }
+        if status == 400 {
+            return EndpointErrorKind::BadRequest;
+        }
+        if matches!(status, 408 | 429) || (500..600).contains(&status) {
+            return EndpointErrorKind::Transient;
+        }
+        if (400..500).contains(&status) {
+            return EndpointErrorKind::ClientError;
+        }
+        EndpointErrorKind::Unknown
+    }
 
     /// API endpoint URL
     fn api_url(&self, ctx: &RequestContext<'_>) -> String;
@@ -129,5 +208,133 @@ mod tests {
             "The bearer token included in the request is invalid"
         ));
         assert!(!default_is_bearer_token_invalid("unrelated error"));
+    }
+
+    /// 仅依赖默认实现的探针端点，专门用来覆盖 trait 的默认 `classify_error`
+    struct ProbeEndpoint;
+
+    impl KiroEndpoint for ProbeEndpoint {
+        fn name(&self) -> &'static str {
+            "probe"
+        }
+        fn api_url(&self, _ctx: &RequestContext<'_>) -> String {
+            String::new()
+        }
+        fn mcp_url(&self, _ctx: &RequestContext<'_>) -> String {
+            String::new()
+        }
+        fn decorate_api(&self, req: RequestBuilder, _ctx: &RequestContext<'_>) -> RequestBuilder {
+            req
+        }
+        fn decorate_mcp(&self, req: RequestBuilder, _ctx: &RequestContext<'_>) -> RequestBuilder {
+            req
+        }
+        fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
+            body.to_string()
+        }
+    }
+
+    #[test]
+    fn test_classify_error_monthly_quota_exhausted() {
+        let probe = ProbeEndpoint;
+        let body = r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#;
+        assert_eq!(
+            probe.classify_error(402, body),
+            EndpointErrorKind::MonthlyQuotaExhausted
+        );
+    }
+
+    #[test]
+    fn test_classify_error_bearer_token_invalid_401() {
+        let probe = ProbeEndpoint;
+        let body = "The bearer token included in the request is invalid";
+        assert_eq!(
+            probe.classify_error(401, body),
+            EndpointErrorKind::BearerTokenInvalid
+        );
+    }
+
+    #[test]
+    fn test_classify_error_bearer_token_invalid_403() {
+        let probe = ProbeEndpoint;
+        let body = "The bearer token included in the request is invalid";
+        assert_eq!(
+            probe.classify_error(403, body),
+            EndpointErrorKind::BearerTokenInvalid
+        );
+    }
+
+    #[test]
+    fn test_classify_error_bad_request() {
+        let probe = ProbeEndpoint;
+        assert_eq!(
+            probe.classify_error(400, "{}"),
+            EndpointErrorKind::BadRequest
+        );
+    }
+
+    #[test]
+    fn test_classify_error_transient_429_500() {
+        let probe = ProbeEndpoint;
+        assert_eq!(probe.classify_error(429, "{}"), EndpointErrorKind::Transient);
+        assert_eq!(probe.classify_error(408, "{}"), EndpointErrorKind::Transient);
+        assert_eq!(probe.classify_error(500, "{}"), EndpointErrorKind::Transient);
+        assert_eq!(probe.classify_error(502, "{}"), EndpointErrorKind::Transient);
+        assert_eq!(probe.classify_error(599, "{}"), EndpointErrorKind::Transient);
+    }
+
+    #[test]
+    fn test_classify_error_402_without_marker_is_client_error() {
+        let probe = ProbeEndpoint;
+        assert_eq!(
+            probe.classify_error(402, "{}"),
+            EndpointErrorKind::ClientError
+        );
+    }
+
+    #[test]
+    fn test_classify_error_404_is_client_error() {
+        let probe = ProbeEndpoint;
+        assert_eq!(
+            probe.classify_error(404, "{}"),
+            EndpointErrorKind::ClientError
+        );
+    }
+
+    #[test]
+    fn test_classify_error_401_without_marker_is_client_error() {
+        // 401 但 body 不含 bearer 失效标记 → 走普通 4xx arm
+        let probe = ProbeEndpoint;
+        assert_eq!(
+            probe.classify_error(401, "{}"),
+            EndpointErrorKind::ClientError
+        );
+    }
+
+    #[test]
+    fn test_classify_error_200_is_unknown() {
+        let probe = ProbeEndpoint;
+        assert_eq!(probe.classify_error(200, "{}"), EndpointErrorKind::Unknown);
+    }
+
+    #[test]
+    fn test_kiro_request_variants_constructible() {
+        let _g = KiroRequest::GenerateAssistant {
+            body: "{}",
+            stream: true,
+            model: Some("claude"),
+        };
+        let _m = KiroRequest::Mcp { body: "{}" };
+        let _u = KiroRequest::UsageLimits;
+    }
+
+    #[test]
+    fn test_endpoint_error_kind_debug() {
+        assert!(format!("{:?}", EndpointErrorKind::MonthlyQuotaExhausted).contains("Monthly"));
+        assert!(format!("{:?}", EndpointErrorKind::BearerTokenInvalid).contains("Bearer"));
+        assert!(format!("{:?}", EndpointErrorKind::BadRequest).contains("Bad"));
+        assert!(format!("{:?}", EndpointErrorKind::ClientError).contains("Client"));
+        assert!(format!("{:?}", EndpointErrorKind::Transient).contains("Transient"));
+        assert!(format!("{:?}", EndpointErrorKind::Unknown).contains("Unknown"));
     }
 }
