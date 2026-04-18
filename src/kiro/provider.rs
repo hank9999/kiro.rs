@@ -102,125 +102,9 @@ impl KiroProvider {
 
     /// 内部方法：带重试逻辑的 MCP API 调用
     async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        let total_credentials = self.token_manager.total_count();
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
-        let mut last_error: Option<anyhow::Error> = None;
-        let mut force_refreshed: HashSet<u64> = HashSet::new();
-
-        for attempt in 0..max_retries {
-            // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
-                Ok(c) => c,
-                Err(e) => {
-                    last_error = Some(e);
-                    continue;
-                }
-            };
-
-            let config = self.token_manager.config();
-            let endpoint = Arc::clone(&ctx.endpoint);
-
-            let rctx = RequestContext {
-                credentials: &ctx.credentials,
-                token: &ctx.token,
-                machine_id: &ctx.machine_id,
-                config,
-            };
-
-            let client = self.client_for(&ctx.credentials)?;
-            let kiro_req = KiroRequest::Mcp { body: request_body };
-            let request = endpoint.build_request(&client, &rctx, &kiro_req)?;
-
-            let response = match request.send().await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    tracing::warn!(
-                        "MCP 请求发送失败（尝试 {}/{}）: {}",
-                        attempt + 1,
-                        max_retries,
-                        e
-                    );
-                    last_error = Some(e.into());
-                    if attempt + 1 < max_retries {
-                        sleep(Self::retry_delay(attempt)).await;
-                    }
-                    continue;
-                }
-            };
-
-            let status = response.status();
-
-            // 成功响应
-            if status.is_success() {
-                self.token_manager.report_success(ctx.id);
-                return Ok(response);
-            }
-
-            // 失败响应
-            let body = response.text().await.unwrap_or_default();
-
-            match endpoint.classify_error(status.as_u16(), &body) {
-                EndpointErrorKind::MonthlyQuotaExhausted => {
-                    let has_available = self.token_manager.report_quota_exhausted(ctx.id);
-                    if !has_available {
-                        anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
-                    }
-                    last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
-                    continue;
-                }
-                EndpointErrorKind::BadRequest => {
-                    anyhow::bail!("MCP 请求失败: {} {}", status, body);
-                }
-                EndpointErrorKind::BearerTokenInvalid => {
-                    // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
-                    if !force_refreshed.contains(&ctx.id) {
-                        force_refreshed.insert(ctx.id);
-                        tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                        if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
-                            tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
-                            continue;
-                        }
-                        tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
-                    }
-
-                    let has_available = self.token_manager.report_failure(ctx.id);
-                    if !has_available {
-                        anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
-                    }
-                    last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
-                    continue;
-                }
-                EndpointErrorKind::Transient => {
-                    tracing::warn!(
-                        "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
-                        attempt + 1,
-                        max_retries,
-                        status,
-                        body
-                    );
-                    last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
-                    if attempt + 1 < max_retries {
-                        sleep(Self::retry_delay(attempt)).await;
-                    }
-                    continue;
-                }
-                EndpointErrorKind::ClientError => {
-                    anyhow::bail!("MCP 请求失败: {} {}", status, body);
-                }
-                EndpointErrorKind::Unknown => {
-                    // 兜底：当作可重试瞬态错误（不切换凭据）
-                    last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
-                    if attempt + 1 < max_retries {
-                        sleep(Self::retry_delay(attempt)).await;
-                    }
-                    continue;
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| {
-            anyhow::anyhow!("MCP 请求失败：已达到最大重试次数（{}次）", max_retries)
-        }))
+        // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
+        let req = KiroRequest::Mcp { body: request_body };
+        self.call_with_retry(&req, None, "MCP 请求").await
     }
 
     /// 内部方法：带重试逻辑的 API 调用
@@ -234,18 +118,46 @@ impl KiroProvider {
         request_body: &str,
         is_stream: bool,
     ) -> anyhow::Result<reqwest::Response> {
+        let model = Self::extract_model_from_request(request_body);
+        let kind_label = if is_stream {
+            "流式 API 请求"
+        } else {
+            "非流式 API 请求"
+        };
+        let req = KiroRequest::GenerateAssistant {
+            body: request_body,
+            stream: is_stream,
+            model: model.as_deref(),
+        };
+        self.call_with_retry(&req, model.as_deref(), kind_label).await
+    }
+
+    /// 统一的带重试循环实现
+    ///
+    /// # 参数
+    /// - `req`: KiroRequest 变体（内部仅含引用，单次构造即可多次传给 build_request）
+    /// - `model_for_acquire`: 传给 `acquire_context` 用于凭据过滤（opus 等模型）
+    /// - `kind_label`: 日志与错误消息前缀（如 "MCP 请求" / "流式 API 请求" / "非流式 API 请求"）
+    ///
+    /// 该 helper 承载 §5 所有契约：
+    /// - force_refreshed Set 语义：每凭据一次强制刷新机会
+    /// - 错误分支顺序：402 → 400 → 401/403 → 瞬态 → 其他 4xx → 兜底
+    /// - anyhow 错误消息格式：统一通过 `kind_label` 前缀（字节级等价于重构前
+    ///   "{api_type} API 请求失败"、"MCP 请求失败"）
+    /// - sleep 时机与 retry 次数
+    async fn call_with_retry(
+        &self,
+        req: &KiroRequest<'_>,
+        model_for_acquire: Option<&str>,
+        kind_label: &str,
+    ) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
-        let api_type = if is_stream { "流式" } else { "非流式" };
-
-        // 尝试从请求体中提取模型信息
-        let model = Self::extract_model_from_request(request_body);
 
         for attempt in 0..max_retries {
-            // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let ctx = match self.token_manager.acquire_context(model_for_acquire).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -264,24 +176,18 @@ impl KiroProvider {
             };
 
             let client = self.client_for(&ctx.credentials)?;
-            let kiro_req = KiroRequest::GenerateAssistant {
-                body: request_body,
-                stream: is_stream,
-                model: model.as_deref(),
-            };
-            let request = endpoint.build_request(&client, &rctx, &kiro_req)?;
+            let request = endpoint.build_request(&client, &rctx, req)?;
 
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
-                        "API 请求发送失败（尝试 {}/{}）: {}",
+                        "{}发送失败（尝试 {}/{}）: {}",
+                        kind_label,
                         attempt + 1,
                         max_retries,
                         e
                     );
-                    // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
-                    // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
@@ -304,7 +210,8 @@ impl KiroProvider {
             match endpoint.classify_error(status.as_u16(), &body) {
                 EndpointErrorKind::MonthlyQuotaExhausted => {
                     tracing::warn!(
-                        "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
+                        "{}失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
+                        kind_label,
                         attempt + 1,
                         max_retries,
                         status,
@@ -314,27 +221,28 @@ impl KiroProvider {
                     let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                     if !has_available {
                         anyhow::bail!(
-                            "{} API 请求失败（所有凭据已用尽）: {} {}",
-                            api_type,
+                            "{}失败（所有凭据已用尽）: {} {}",
+                            kind_label,
                             status,
                             body
                         );
                     }
 
                     last_error = Some(anyhow::anyhow!(
-                        "{} API 请求失败: {} {}",
-                        api_type,
+                        "{}失败: {} {}",
+                        kind_label,
                         status,
                         body
                     ));
                     continue;
                 }
                 EndpointErrorKind::BadRequest => {
-                    anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                    anyhow::bail!("{}失败: {} {}", kind_label, status, body);
                 }
                 EndpointErrorKind::BearerTokenInvalid => {
                     tracing::warn!(
-                        "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
+                        "{}失败（可能为凭据错误，尝试 {}/{}）: {} {}",
+                        kind_label,
                         attempt + 1,
                         max_retries,
                         status,
@@ -355,16 +263,16 @@ impl KiroProvider {
                     let has_available = self.token_manager.report_failure(ctx.id);
                     if !has_available {
                         anyhow::bail!(
-                            "{} API 请求失败（所有凭据已用尽）: {} {}",
-                            api_type,
+                            "{}失败（所有凭据已用尽）: {} {}",
+                            kind_label,
                             status,
                             body
                         );
                     }
 
                     last_error = Some(anyhow::anyhow!(
-                        "{} API 请求失败: {} {}",
-                        api_type,
+                        "{}失败: {} {}",
+                        kind_label,
                         status,
                         body
                     ));
@@ -372,15 +280,16 @@ impl KiroProvider {
                 }
                 EndpointErrorKind::Transient => {
                     tracing::warn!(
-                        "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
+                        "{}失败（上游瞬态错误，尝试 {}/{}）: {} {}",
+                        kind_label,
                         attempt + 1,
                         max_retries,
                         status,
                         body
                     );
                     last_error = Some(anyhow::anyhow!(
-                        "{} API 请求失败: {} {}",
-                        api_type,
+                        "{}失败: {} {}",
+                        kind_label,
                         status,
                         body
                     ));
@@ -390,20 +299,21 @@ impl KiroProvider {
                     continue;
                 }
                 EndpointErrorKind::ClientError => {
-                    anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                    anyhow::bail!("{}失败: {} {}", kind_label, status, body);
                 }
                 EndpointErrorKind::Unknown => {
                     // 兜底：当作可重试的瞬态错误处理（不切换凭据）
                     tracing::warn!(
-                        "API 请求失败（未知错误，尝试 {}/{}）: {} {}",
+                        "{}失败（未知错误，尝试 {}/{}）: {} {}",
+                        kind_label,
                         attempt + 1,
                         max_retries,
                         status,
                         body
                     );
                     last_error = Some(anyhow::anyhow!(
-                        "{} API 请求失败: {} {}",
-                        api_type,
+                        "{}失败: {} {}",
+                        kind_label,
                         status,
                         body
                     ));
@@ -418,8 +328,8 @@ impl KiroProvider {
         // 所有重试都失败
         Err(last_error.unwrap_or_else(|| {
             anyhow::anyhow!(
-                "{} API 请求失败：已达到最大重试次数（{}次）",
-                api_type,
+                "{}失败：已达到最大重试次数（{}次）",
+                kind_label,
                 max_retries
             )
         }))

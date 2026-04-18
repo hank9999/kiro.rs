@@ -322,60 +322,34 @@ async fn refresh_idc_token(
 }
 
 /// 获取使用额度信息
+///
+/// 通过 endpoint 的 `build_request(UsageLimits)` 构造请求，保证与历史 IDE 请求
+/// 字节级一致（URL / headers / tokentype 行为均由 IDE endpoint 负责维护）。
+/// 本函数仅负责 HTTP 发送、状态码 → 中文错误消息的转译，错误文案被 Admin 层
+/// `classify_balance_error` 做字符串匹配使用，切勿随意变更。
 pub(crate) async fn get_usage_limits(
+    endpoint: &dyn KiroEndpoint,
     credentials: &KiroCredentials,
     config: &Config,
     token: &str,
+    machine_id: &str,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<UsageLimitsResponse> {
+    use crate::kiro::endpoint::{KiroRequest, RequestContext};
+
     tracing::debug!("正在获取使用额度信息...");
 
-    // 优先级：凭据.api_region > config.api_region > config.region
-    let region = credentials.effective_api_region(config);
-    let host = format!("q.{}.amazonaws.com", region);
-    let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
-
-    // 构建 URL
-    let mut url = format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
-        host
-    );
-
-    // profileArn 是可选的
-    if let Some(profile_arn) = &credentials.profile_arn {
-        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
-    }
-
-    // 构建 User-Agent headers
-    let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        os_name, node_version, kiro_version, machine_id
-    );
-    let amz_user_agent = format!(
-        "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
-        kiro_version, machine_id
-    );
-
+    let rctx = RequestContext {
+        credentials,
+        token,
+        machine_id,
+        config,
+    };
     let client = build_client(proxy, 60, config.tls_backend)?;
-
-    let mut request = client
-        .get(&url)
-        .header("x-amz-user-agent", &amz_user_agent)
-        .header("user-agent", &user_agent)
-        .header("host", &host)
-        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=1")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Connection", "close");
-
-    if credentials.is_api_key_credential() {
-        request = request.header("tokentype", "API_KEY");
-    }
-
-    let response = request.send().await?;
+    let response = endpoint
+        .build_request(&client, &rctx, &KiroRequest::UsageLimits)?
+        .send()
+        .await?;
 
     let status = response.status();
     if !status.is_success() {
@@ -1623,7 +1597,17 @@ impl MultiTokenManager {
         };
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let endpoint = self.endpoint_registry.resolve(&credentials);
+        let machine_id = machine_id::generate_from_credentials(&credentials, &self.config);
+        let usage_limits = get_usage_limits(
+            endpoint.as_ref(),
+            &credentials,
+            &self.config,
+            &token,
+            &machine_id,
+            effective_proxy.as_ref(),
+        )
+        .await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
