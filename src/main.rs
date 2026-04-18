@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
-use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
+use kiro::endpoint::{EndpointRegistry, IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -103,30 +103,33 @@ async fn main() {
         endpoints.insert(ide.name().to_string(), Arc::new(ide));
     }
 
-    // 校验默认端点存在
-    if !endpoints.contains_key(&config.default_endpoint) {
-        tracing::error!("默认端点 \"{}\" 未注册", config.default_endpoint);
-        std::process::exit(1);
-    }
+    // 构造 EndpointRegistry：内部校验 default 已注册
+    let endpoint_registry = EndpointRegistry::new(endpoints, config.default_endpoint.clone())
+        .unwrap_or_else(|e| {
+            tracing::error!("{}", e);
+            std::process::exit(1);
+        });
 
-    // 校验所有凭据声明的端点都已注册
+    // 严格校验所有凭据声明的端点都已注册（保持原启动时错误语义）
     for cred in &credentials_list {
         let name = cred
             .endpoint
             .as_deref()
             .unwrap_or(&config.default_endpoint);
-        if !endpoints.contains_key(name) {
+        if !endpoint_registry.contains(name) {
+            let mut known = endpoint_registry.names();
+            known.sort();
             tracing::error!(
                 "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
                 cred.id,
                 name,
-                endpoints.keys().collect::<Vec<_>>()
+                known
             );
             std::process::exit(1);
         }
     }
 
-    let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
+    let endpoint_registry = Arc::new(endpoint_registry);
 
     // 创建 MultiTokenManager 和 KiroProvider
     let token_manager = MultiTokenManager::new(
@@ -144,8 +147,7 @@ async fn main() {
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
-        endpoints,
-        config.default_endpoint.clone(),
+        Arc::clone(&endpoint_registry),
     );
 
     // 初始化 count_tokens 配置
@@ -178,7 +180,7 @@ async fn main() {
             anthropic_app
         } else {
             let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
+                admin::AdminService::new(token_manager.clone(), Arc::clone(&endpoint_registry));
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 

@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 use crate::http_client::{ProxyConfig, build_client};
-use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+use crate::kiro::endpoint::{EndpointRegistry, KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
@@ -39,10 +39,8 @@ pub struct KiroProvider {
     client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
-    /// 端点实现注册表（key: endpoint 名称）
-    endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
-    /// 默认端点名称（凭据未指定 endpoint 时使用）
-    default_endpoint: String,
+    /// 端点注册表（凭据 → 端点实现解析；默认端点也在内部记录）
+    endpoint_registry: Arc<EndpointRegistry>,
 }
 
 impl KiroProvider {
@@ -51,19 +49,12 @@ impl KiroProvider {
     /// # Arguments
     /// * `token_manager` - 多凭据 Token 管理器
     /// * `proxy` - 全局代理配置
-    /// * `endpoints` - 端点名 → 实现的注册表（至少包含 `default_endpoint` 对应条目）
-    /// * `default_endpoint` - 凭据未显式指定 endpoint 时使用的名称
+    /// * `endpoint_registry` - 端点注册表（main.rs 负责保证 default 与凭据声明均已校验）
     pub fn with_proxy(
         token_manager: Arc<MultiTokenManager>,
         proxy: Option<ProxyConfig>,
-        endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
-        default_endpoint: String,
+        endpoint_registry: Arc<EndpointRegistry>,
     ) -> Self {
-        assert!(
-            endpoints.contains_key(&default_endpoint),
-            "默认端点 {} 未在 endpoints 注册表中",
-            default_endpoint
-        );
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client
         let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
@@ -76,8 +67,7 @@ impl KiroProvider {
             global_proxy: proxy,
             client_cache: Mutex::new(cache),
             tls_backend,
-            endpoints,
-            default_endpoint,
+            endpoint_registry,
         }
     }
 
@@ -94,18 +84,11 @@ impl KiroProvider {
     }
 
     /// 根据凭据选择 endpoint 实现
-    fn endpoint_for(
-        &self,
-        credentials: &KiroCredentials,
-    ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
-        let name = credentials
-            .endpoint
-            .as_deref()
-            .unwrap_or(&self.default_endpoint);
-        self.endpoints
-            .get(name)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+    ///
+    /// 委托给 [`EndpointRegistry::resolve`]：未指定 endpoint / 指定但未注册均回退到默认端点。
+    /// 因此返回类型不再是 `Result`，调用方无需处理"端点解析失败"分支。
+    fn endpoint_for(&self, credentials: &KiroCredentials) -> Arc<dyn KiroEndpoint> {
+        self.endpoint_registry.resolve(credentials)
     }
 
     /// 发送非流式 API 请求
@@ -145,15 +128,7 @@ impl KiroProvider {
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
 
-            let endpoint = match self.endpoint_for(&ctx.credentials) {
-                Ok(e) => e,
-                Err(e) => {
-                    last_error = Some(e);
-                    // endpoint 解析失败：记为失败，换下一张凭据
-                    self.token_manager.report_failure(ctx.id);
-                    continue;
-                }
-            };
+            let endpoint = self.endpoint_for(&ctx.credentials);
 
             let rctx = RequestContext {
                 credentials: &ctx.credentials,
@@ -303,14 +278,7 @@ impl KiroProvider {
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
 
-            let endpoint = match self.endpoint_for(&ctx.credentials) {
-                Ok(e) => e,
-                Err(e) => {
-                    last_error = Some(e);
-                    self.token_manager.report_failure(ctx.id);
-                    continue;
-                }
-            };
+            let endpoint = self.endpoint_for(&ctx.credentials);
 
             let rctx = RequestContext {
                 credentials: &ctx.credentials,

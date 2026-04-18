@@ -6,6 +6,9 @@
 //! [`KiroEndpoint`] 抽象了请求侧的差异点；`KiroProvider` 持有一个 endpoint 注册表，
 //! 按凭据的 `endpoint` 字段选择对应实现。
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use reqwest::{Client, RequestBuilder};
 
 use crate::kiro::model::credentials::KiroCredentials;
@@ -14,6 +17,66 @@ use crate::model::config::Config;
 pub mod ide;
 
 pub use ide::IdeEndpoint;
+
+/// 端点名 → 实现的注册表 + 默认端点名
+///
+/// 统一承载原先散落在 `main.rs` / `KiroProvider.endpoints` / `AdminService.known_endpoints`
+/// 的三份副本。Provider 重试循环、AdminService 校验、TokenManager 预解析 CallContext
+/// 均从同一个 `Arc<EndpointRegistry>` 取用。
+pub struct EndpointRegistry {
+    endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
+    default: String,
+}
+
+impl EndpointRegistry {
+    /// 构造注册表，若 `default` 未在 `endpoints` 中会失败
+    pub fn new(
+        endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
+        default: String,
+    ) -> anyhow::Result<Self> {
+        if !endpoints.contains_key(&default) {
+            anyhow::bail!(
+                "默认端点 \"{}\" 未注册（已注册: {:?}）",
+                default,
+                endpoints.keys().collect::<Vec<_>>()
+            );
+        }
+        Ok(Self { endpoints, default })
+    }
+
+    /// 根据凭据 `endpoint` 字段解析端点实现
+    ///
+    /// - 凭据指定 endpoint 且已注册 → 对应实现
+    /// - 凭据未指定 → 默认端点
+    /// - 凭据指定但未注册 → 回退到默认端点并 warn（保持运行时路由不中断；
+    ///   启动时由 main.rs 做严格校验保证凭据一致性）
+    pub fn resolve(&self, credentials: &KiroCredentials) -> Arc<dyn KiroEndpoint> {
+        let name = credentials.endpoint.as_deref().unwrap_or(&self.default);
+        if let Some(ep) = self.endpoints.get(name) {
+            return Arc::clone(ep);
+        }
+        tracing::warn!(
+            "凭据指定端点 \"{}\" 未注册，回退到默认 \"{}\"",
+            name,
+            self.default
+        );
+        Arc::clone(
+            self.endpoints
+                .get(&self.default)
+                .expect("默认端点在 new() 中已校验存在"),
+        )
+    }
+
+    /// 判断是否存在指定名称的端点
+    pub fn contains(&self, name: &str) -> bool {
+        self.endpoints.contains_key(name)
+    }
+
+    /// 所有已注册的端点名称（顺序未定义）
+    pub fn names(&self) -> Vec<&str> {
+        self.endpoints.keys().map(|s| s.as_str()).collect()
+    }
+}
 
 /// Kiro 端点上的单次请求类型
 ///
@@ -326,6 +389,95 @@ mod tests {
         };
         let _m = KiroRequest::Mcp { body: "{}" };
         let _u = KiroRequest::UsageLimits;
+    }
+
+    struct NamedProbeEndpoint(&'static str);
+    impl KiroEndpoint for NamedProbeEndpoint {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn api_url(&self, _ctx: &RequestContext<'_>) -> String {
+            String::new()
+        }
+        fn mcp_url(&self, _ctx: &RequestContext<'_>) -> String {
+            String::new()
+        }
+        fn decorate_api(&self, req: RequestBuilder, _ctx: &RequestContext<'_>) -> RequestBuilder {
+            req
+        }
+        fn decorate_mcp(&self, req: RequestBuilder, _ctx: &RequestContext<'_>) -> RequestBuilder {
+            req
+        }
+        fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
+            body.to_string()
+        }
+    }
+
+    fn registry_with(names: &[&'static str], default: &str) -> HashMap<String, Arc<dyn KiroEndpoint>> {
+        let mut map: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        for name in names {
+            map.insert((*name).to_string(), Arc::new(NamedProbeEndpoint(name)));
+        }
+        // default 参数只是为了签名一致，不在此处校验
+        let _ = default;
+        map
+    }
+
+    #[test]
+    fn test_registry_new_rejects_missing_default() {
+        let endpoints = registry_with(&["ide"], "cli");
+        assert!(EndpointRegistry::new(endpoints, "cli".to_string()).is_err());
+    }
+
+    #[test]
+    fn test_registry_new_accepts_present_default() {
+        let endpoints = registry_with(&["ide"], "ide");
+        assert!(EndpointRegistry::new(endpoints, "ide".to_string()).is_ok());
+    }
+
+    #[test]
+    fn test_registry_resolve_explicit() {
+        let endpoints = registry_with(&["ide"], "ide");
+        let reg = EndpointRegistry::new(endpoints, "ide".to_string()).unwrap();
+        let creds = KiroCredentials {
+            endpoint: Some("ide".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(reg.resolve(&creds).name(), "ide");
+    }
+
+    #[test]
+    fn test_registry_resolve_default_when_none() {
+        let endpoints = registry_with(&["ide"], "ide");
+        let reg = EndpointRegistry::new(endpoints, "ide".to_string()).unwrap();
+        let creds = KiroCredentials {
+            endpoint: None,
+            ..Default::default()
+        };
+        assert_eq!(reg.resolve(&creds).name(), "ide");
+    }
+
+    #[test]
+    fn test_registry_resolve_unknown_falls_back_to_default() {
+        let endpoints = registry_with(&["ide"], "ide");
+        let reg = EndpointRegistry::new(endpoints, "ide".to_string()).unwrap();
+        let creds = KiroCredentials {
+            endpoint: Some("nonexistent".to_string()),
+            ..Default::default()
+        };
+        // 不应 panic，返回默认
+        assert_eq!(reg.resolve(&creds).name(), "ide");
+    }
+
+    #[test]
+    fn test_registry_contains_and_names() {
+        let endpoints = registry_with(&["ide"], "ide");
+        let reg = EndpointRegistry::new(endpoints, "ide".to_string()).unwrap();
+        assert!(reg.contains("ide"));
+        assert!(!reg.contains("cli"));
+        let mut names = reg.names();
+        names.sort();
+        assert_eq!(names, vec!["ide"]);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Admin API 业务逻辑服务
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -8,6 +8,7 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::kiro::endpoint::EndpointRegistry;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 
@@ -36,14 +37,14 @@ pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     cache_path: Option<PathBuf>,
-    /// 已注册的端点名称集合（用于 add_credential 校验）
-    known_endpoints: HashSet<String>,
+    /// 端点注册表（用于 add_credential 校验）
+    endpoint_registry: Arc<EndpointRegistry>,
 }
 
 impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
-        known_endpoints: impl IntoIterator<Item = String>,
+        endpoint_registry: Arc<EndpointRegistry>,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -55,7 +56,7 @@ impl AdminService {
             token_manager,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
-            known_endpoints: known_endpoints.into_iter().collect(),
+            endpoint_registry,
         }
     }
 
@@ -200,9 +201,8 @@ impl AdminService {
     ) -> Result<AddCredentialResponse, AdminServiceError> {
         // 校验端点名：未指定则默认合法，指定则必须已注册
         if let Some(ref name) = req.endpoint {
-            if !self.known_endpoints.contains(name) {
-                let mut known: Vec<&str> =
-                    self.known_endpoints.iter().map(|s| s.as_str()).collect();
+            if !self.endpoint_registry.contains(name) {
+                let mut known: Vec<&str> = self.endpoint_registry.names();
                 known.sort();
                 return Err(AdminServiceError::InvalidCredential(format!(
                     "未知端点 \"{}\"，已注册端点: {:?}",
