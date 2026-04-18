@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, Globe } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -23,6 +23,7 @@ import {
   useDeleteCredential,
   useForceRefreshToken,
 } from '@/hooks/use-credentials'
+import { EditCredentialProxyDialog } from '@/components/edit-credential-proxy-dialog'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
@@ -60,6 +61,7 @@ export function CredentialCard({
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [showProxyDialog, setShowProxyDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
@@ -264,12 +266,18 @@ export function CredentialCard({
                 <span className="text-sm text-muted-foreground ml-1">未知</span>
               )}
             </div>
-            {credential.hasProxy && (
-              <div className="col-span-2">
-                <span className="text-muted-foreground">代理：</span>
-                <span className="font-medium">{credential.proxyUrl}</span>
-              </div>
-            )}
+            <div className="col-span-2">
+              <span className="text-muted-foreground">代理：</span>
+              {credential.hasProxy ? (
+                <span className="font-medium font-mono text-xs ml-1">
+                  {credential.proxyUrl}
+                </span>
+              ) : (
+                <span className="text-muted-foreground text-xs ml-1">
+                  继承（代理池 / 全局 / 直连）
+                </span>
+              )}
+            </div>
             {credential.hasProfileArn && (
               <div className="col-span-2">
                 <Badge variant="secondary">有 Profile ARN</Badge>
@@ -344,6 +352,15 @@ export function CredentialCard({
             </Button>
             <Button
               size="sm"
+              variant="outline"
+              onClick={() => setShowProxyDialog(true)}
+              title="编辑此凭据的代理"
+            >
+              <Globe className="h-4 w-4 mr-1" />
+              代理
+            </Button>
+            <Button
+              size="sm"
               variant="destructive"
               onClick={() => setShowDeleteDialog(true)}
               disabled={!credential.disabled}
@@ -383,6 +400,13 @@ export function CredentialCard({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* 编辑代理对话框 */}
+      <EditCredentialProxyDialog
+        open={showProxyDialog}
+        onOpenChange={setShowProxyDialog}
+        credential={credential}
+      />
     </>
   )
 }

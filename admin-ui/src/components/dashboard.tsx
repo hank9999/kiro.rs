@@ -15,6 +15,7 @@ import { KamImportDialog } from '@/components/kam-import-dialog'
 import { ActivityMonitor } from '@/components/activity-monitor'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { ApiKeyManagement } from '@/components/api-key-management'
+import { ProxySettings } from '@/components/proxy-settings'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
@@ -25,7 +26,7 @@ interface DashboardProps {
 }
 
 export function Dashboard({ onLogout }: DashboardProps) {
-  const [activeTab, setActiveTab] = useState<'credentials' | 'api-keys'>('credentials')
+  const [activeTab, setActiveTab] = useState<'credentials' | 'api-keys' | 'proxy'>('credentials')
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
@@ -577,6 +578,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <TabsList className="mb-6">
             <TabsTrigger value="credentials">凭据管理</TabsTrigger>
             <TabsTrigger value="api-keys">API Keys</TabsTrigger>
+            <TabsTrigger value="proxy">代理池</TabsTrigger>
           </TabsList>
 
           <TabsContent value="credentials" className="space-y-6">
@@ -762,6 +764,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
           <TabsContent value="api-keys">
             <ApiKeyManagement />
+          </TabsContent>
+
+          <TabsContent value="proxy">
+            <ProxySettings />
           </TabsContent>
         </Tabs>
       </main>

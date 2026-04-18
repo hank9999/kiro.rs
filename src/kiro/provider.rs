@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, ProxyPool, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
@@ -31,7 +31,7 @@ const MAX_TOTAL_RETRIES: usize = 9;
 /// 支持多凭据故障转移和重试机制
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
-    /// 全局代理配置（用于凭据无自定义代理时的回退）
+    /// 全局代理配置（用于凭据无自定义代理且无代理池时的回退）
     global_proxy: Option<ProxyConfig>,
     /// Client 缓存：key = effective proxy config, value = reqwest::Client
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client
@@ -62,17 +62,41 @@ impl KiroProvider {
 
     /// 创建新的 KiroProvider 实例
     pub fn new(token_manager: Arc<MultiTokenManager>) -> Self {
-        Self::with_proxy(token_manager, None)
+        Self::with_proxy_and_pool(token_manager, None, None)
     }
 
-    /// 创建带代理配置的 KiroProvider 实例
+    /// 创建带代理配置的 KiroProvider 实例（向后兼容）
     pub fn with_proxy(token_manager: Arc<MultiTokenManager>, proxy: Option<ProxyConfig>) -> Self {
+        Self::with_proxy_and_pool(token_manager, proxy, None)
+    }
+
+    /// 创建带代理配置和代理池的 KiroProvider 实例
+    ///
+    /// 注意：传入的 `proxy_pool` 会被设置到 `token_manager`，后续热更新通过
+    /// `token_manager.replace_proxy_pool()` 完成，这里不再单独持有。
+    pub fn with_proxy_and_pool(
+        token_manager: Arc<MultiTokenManager>,
+        proxy: Option<ProxyConfig>,
+        proxy_pool: Option<Arc<ProxyPool>>,
+    ) -> Self {
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client
         let initial_client =
             build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
+
+        // 预热：为代理池中每个代理预构建 Client
+        if let Some(pool) = proxy_pool.as_ref() {
+            for entry in pool.entries() {
+                let key = Some(entry.clone());
+                cache.entry(key.clone()).or_insert_with(|| {
+                    build_client(Some(entry), 720, tls_backend).expect("创建代理池 Client 失败")
+                });
+            }
+            // 把代理池塞进 token_manager，供 API 调用与 Token 刷新共用
+            token_manager.replace_proxy_pool(Some(pool.clone()));
+        }
 
         Self {
             token_manager,
@@ -82,16 +106,85 @@ impl KiroProvider {
         }
     }
 
+    /// 计算凭据当次调用的有效代理
+    ///
+    /// 优先级：凭据级代理 > 代理池（pick） > 全局单代理 > 无代理
+    fn effective_proxy_for(&self, credentials: &KiroCredentials) -> Option<ProxyConfig> {
+        // 1. 显式 direct 或凭据自带代理，直接遵循
+        if let Some(url) = credentials.proxy_url.as_deref() {
+            if url.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) {
+                return None;
+            }
+            // 凭据自定义代理覆盖池与全局
+            return credentials.effective_proxy(self.global_proxy.as_ref());
+        }
+
+        // 2. 无显式凭据代理，优先走代理池（动态读取，支持热更新）
+        if let Some(pool) = self.token_manager.proxy_pool_snapshot() {
+            if let Some(picked) = pool.pick(credentials.id) {
+                return Some(picked);
+            }
+        }
+
+        // 3. 回退到全局单代理
+        self.global_proxy.clone()
+    }
+
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
-        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let (client, _proxy) = self.client_and_proxy_for(credentials)?;
+        Ok(client)
+    }
+
+    /// 构建 client 并返回本次调用所使用的代理配置
+    ///
+    /// 返回的 `Option<ProxyConfig>` 用于失败后标记代理冷却（429/限流场景）
+    fn client_and_proxy_for(
+        &self,
+        credentials: &KiroCredentials,
+    ) -> anyhow::Result<(Client, Option<ProxyConfig>)> {
+        let effective = self.effective_proxy_for(credentials);
+
+        // 请求级 debug 日志：显示本次请求使用哪个代理
+        match effective.as_ref() {
+            Some(p) => tracing::debug!(
+                credential_id = credentials.id,
+                proxy = %mask_proxy_url(&p.url),
+                "请求将通过代理发出"
+            ),
+            None => tracing::debug!(
+                credential_id = credentials.id,
+                proxy = "direct",
+                "请求将直连（无代理）"
+            ),
+        }
+
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&effective) {
-            return Ok(client.clone());
+            return Ok((client.clone(), effective));
         }
         let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
-        cache.insert(effective, client.clone());
-        Ok(client)
+        cache.insert(effective.clone(), client.clone());
+        Ok((client, effective))
+    }
+
+    /// 将本次请求使用的代理标记为限流冷却（仅当该代理属于当前代理池时）
+    ///
+    /// 调用时机：上游返回 429 / 503 或底层网络错误。
+    /// 若代理不属于池（如凭据级代理或全局单代理），静默忽略。
+    fn mark_proxy_cooldown(&self, proxy: Option<&ProxyConfig>, reason: &str) {
+        let Some(p) = proxy else { return };
+        let Some(pool) = self.token_manager.proxy_pool_snapshot() else {
+            return;
+        };
+        if pool.mark_rate_limited(p) {
+            tracing::warn!(
+                proxy = %mask_proxy_url(&p.url),
+                cooldown_secs = pool.default_cooldown().as_secs(),
+                reason = %reason,
+                "代理被标记为限流，进入冷却期"
+            );
+        }
     }
 
     /// 获取 token_manager 的引用
@@ -269,9 +362,10 @@ impl KiroProvider {
             );
             let request_body = Self::inject_profile_arn(request_body, &ctx.credentials);
 
-            // 发送请求
-            let mut request = self
-                .client_for(&ctx.credentials)?
+            // 构建 client 同时拿到本次使用的代理配置（用于失败后标记冷却）
+            let (http_client, current_proxy) = self.client_and_proxy_for(&ctx.credentials)?;
+
+            let mut request = http_client
                 .post(&url)
                 .body(request_body.clone())
                 .header("content-type", "application/json")
@@ -301,9 +395,11 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
+                    // 网络错误通常意味着代理链路不稳定，标记冷却以便下次重试走别的代理
+                    self.mark_proxy_cooldown(current_proxy.as_ref(), "network-error");
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
-                        sleep(Self::retry_delay(attempt)).await;
+                        sleep(Self::short_retry_delay()).await;
                     }
                     continue;
                 }
@@ -366,9 +462,23 @@ impl KiroProvider {
                     status,
                     body
                 );
+                // 429/503 → 标记代理冷却，下一次重试自动换代理
+                let should_cooldown = matches!(status.as_u16(), 429 | 503);
+                if should_cooldown {
+                    self.mark_proxy_cooldown(
+                        current_proxy.as_ref(),
+                        &format!("upstream-{}", status.as_u16()),
+                    );
+                }
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 if attempt + 1 < max_retries {
-                    sleep(Self::retry_delay(attempt)).await;
+                    // 冷却场景：已换代理，用短 sleep（100ms）；其他瞬态错误走指数退避
+                    let delay = if should_cooldown {
+                        Self::short_retry_delay()
+                    } else {
+                        Self::retry_delay(attempt)
+                    };
+                    sleep(delay).await;
                 }
                 continue;
             }
@@ -440,9 +550,10 @@ impl KiroProvider {
             );
             let request_body = Self::inject_profile_arn(request_body, &ctx.credentials);
 
-            // 发送请求
-            let mut request = self
-                .client_for(&ctx.credentials)?
+            // 构建 client 同时拿到本次使用的代理配置（用于失败后标记冷却）
+            let (http_client, current_proxy) = self.client_and_proxy_for(&ctx.credentials)?;
+
+            let mut request = http_client
                 .post(&url)
                 .body(request_body.clone())
                 .header("content-type", "application/json")
@@ -470,11 +581,12 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
-                    // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
-                    // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
+                    // 网络错误：标记代理冷却（下次 pick 会跳过该代理）
+                    // 不切换凭据（网络错误不是凭据问题）
+                    self.mark_proxy_cooldown(current_proxy.as_ref(), "network-error");
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
-                        sleep(Self::retry_delay(attempt)).await;
+                        sleep(Self::short_retry_delay()).await;
                     }
                     continue;
                 }
@@ -583,6 +695,14 @@ impl KiroProvider {
                     status,
                     body
                 );
+                // 429/503 → 标记代理冷却，下一次重试自动换代理
+                let should_cooldown = matches!(status.as_u16(), 429 | 503);
+                if should_cooldown {
+                    self.mark_proxy_cooldown(
+                        current_proxy.as_ref(),
+                        &format!("upstream-{}", status.as_u16()),
+                    );
+                }
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
                     api_type,
@@ -590,7 +710,14 @@ impl KiroProvider {
                     body
                 ));
                 if attempt + 1 < max_retries {
-                    sleep(Self::retry_delay(attempt)).await;
+                    // 冷却场景：已换代理，用短 sleep（100ms）即可
+                    // 其他瞬态错误：走指数退避
+                    let delay = if should_cooldown {
+                        Self::short_retry_delay()
+                    } else {
+                        Self::retry_delay(attempt)
+                    };
+                    sleep(delay).await;
                 }
                 continue;
             }
@@ -640,6 +767,16 @@ impl KiroProvider {
         Duration::from_millis(backoff.saturating_add(jitter))
     }
 
+    /// 短重试间隔：用于 429/503/网络错误场景
+    ///
+    /// 因为已经通过代理冷却切换到了新代理，无需长时间等待；
+    /// 加少量抖动避免多个请求同时打向新代理
+    fn short_retry_delay() -> Duration {
+        const BASE_MS: u64 = 100;
+        let jitter = fastrand::u64(0..=40);
+        Duration::from_millis(BASE_MS + jitter)
+    }
+
     fn is_monthly_request_limit(body: &str) -> bool {
         if body.contains("MONTHLY_REQUEST_COUNT") {
             return true;
@@ -670,6 +807,20 @@ impl KiroProvider {
     fn is_bearer_token_invalid(body: &str) -> bool {
         body.contains("The bearer token included in the request is invalid")
     }
+}
+
+/// 屏蔽代理 URL 中的用户名密码后再记录到日志
+///
+/// 例如 `socks5h://user:pass@host:10001` → `socks5h://***@host:10001`
+fn mask_proxy_url(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let (scheme, rest) = url.split_at(scheme_end + 3);
+        if let Some(at) = rest.find('@') {
+            let host = &rest[at + 1..];
+            return format!("{}***@{}", scheme, host);
+        }
+    }
+    url.to_string()
 }
 
 #[cfg(test)]

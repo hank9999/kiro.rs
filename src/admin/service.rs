@@ -11,18 +11,24 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::anthropic::{available_models, types::ModelsResponse};
+use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::monitoring::{RequestActivitySnapshot, RequestMonitor};
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, AddApiKeyRequest, ApiKeyInfo,
+    AddApiKeyRequest, AddCredentialRequest, AddCredentialResponse, ApiKeyInfo,
     ApiKeysListResponse, BalanceResponse, CredentialStatusItem, CredentialsStatusResponse,
     GenerateApiKeyRequest, GenerateApiKeyResponse, LoadBalancingModeResponse, LogsResponse,
-    SetLoadBalancingModeRequest, UpdateApiKeyRequest,
+    ProxyPoolDto, ProxyPoolStatusResponse, ProxyPoolTemplateDto, ProxyTestItem,
+    ProxyTestResponse, SetLoadBalancingModeRequest, TestProxyPoolRequest,
+    UpdateApiKeyRequest, UpdateCredentialProxyRequest,
 };
-use crate::model::config::{ApiKeyConfig, Config};
+use crate::model::config::{
+    ApiKeyConfig, Config, ProxyPoolConfig, ProxyPoolTemplate,
+};
+use std::time::{Duration, Instant};
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
@@ -92,7 +98,7 @@ impl AdminService {
                 success_count: entry.success_count,
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
-                proxy_url: entry.proxy_url,
+                proxy_url: entry.proxy_url.as_deref().map(mask_proxy_url),
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
             })
@@ -721,6 +727,223 @@ impl AdminService {
         Ok(())
     }
 
+    // ============ 代理池管理 ============
+
+    /// 读取当前代理池配置（从 config.json）
+    ///
+    /// 注意：返回值会 mask password，避免通过 GET 接口泄露密码
+    pub fn get_proxy_pool(&self) -> Result<ProxyPoolStatusResponse, AdminServiceError> {
+        let config = Config::load(&self.config_path)
+            .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+
+        let mut dto = match &config.proxy_pool {
+            Some(pool) => pool_config_to_dto(pool),
+            None => ProxyPoolDto::default(),
+        };
+        // 屏蔽 password，GET 返回给前端时不暴露明文
+        if dto.password.is_some() {
+            dto.password = Some("***".to_string());
+        }
+
+        let snapshot = self.token_manager.proxy_pool_snapshot();
+        let (proxies, resolved_urls, size, default_cooldown_secs) = match snapshot.as_ref() {
+            Some(pool) => {
+                let entries = pool.entries();
+                let cooldowns = pool.cooldown_snapshot();
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+
+                let mut urls = Vec::with_capacity(entries.len());
+                let mut items = Vec::with_capacity(entries.len());
+                for (i, entry) in entries.iter().enumerate() {
+                    let masked = mask_proxy_url(&entry.url);
+                    urls.push(masked.clone());
+                    let until = cooldowns.get(i).copied().unwrap_or(0);
+                    let remaining = if until > now_ms {
+                        (until - now_ms).div_ceil(1000)
+                    } else {
+                        0
+                    };
+                    items.push(crate::admin::types::ProxyPoolItemStatus {
+                        url: masked,
+                        cooldown_until_ms: until,
+                        cooldown_remaining_secs: remaining,
+                    });
+                }
+                (items, urls, pool.len(), pool.default_cooldown().as_secs())
+            }
+            None => (
+                Vec::new(),
+                Vec::new(),
+                0,
+                crate::model::config::ProxyPoolConfig::DEFAULT_COOLDOWN_SECS,
+            ),
+        };
+
+        let active = snapshot.is_some();
+        let server_time_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        Ok(ProxyPoolStatusResponse {
+            config: dto,
+            proxies,
+            resolved_urls,
+            size,
+            active,
+            server_time_ms,
+            default_cooldown_secs,
+        })
+    }
+
+    /// 更新代理池配置（持久化 + 热更新运行时池）
+    pub fn update_proxy_pool(
+        &self,
+        mut dto: ProxyPoolDto,
+    ) -> Result<ProxyPoolStatusResponse, AdminServiceError> {
+        let strategy = dto.strategy.trim();
+        let valid_strategies = ["round-robin", "random", "per-credential"];
+        if !valid_strategies.contains(&strategy) {
+            return Err(AdminServiceError::InvalidRequest(
+                "strategy 必须是 round-robin / random / per-credential 之一".to_string(),
+            ));
+        }
+
+        // 加载现有配置
+        let mut config = Config::load(&self.config_path)
+            .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+
+        // 如果 password 字段为 "***"（占位符），保留原密码；其他情况按传入值覆盖
+        if matches!(dto.password.as_deref(), Some("***")) {
+            dto.password = config
+                .proxy_pool
+                .as_ref()
+                .and_then(|p| p.password.clone());
+        }
+
+        let pool_cfg = dto_to_pool_config(&dto);
+
+        config.proxy_pool = Some(pool_cfg.clone());
+        config
+            .save()
+            .map_err(|e| AdminServiceError::InternalError(format!("保存配置失败: {}", e)))?;
+
+        // 重建运行时代理池
+        let new_pool = config.build_proxy_pool().map(std::sync::Arc::new);
+        self.token_manager.replace_proxy_pool(new_pool.clone());
+
+        if let Some(pool) = new_pool.as_ref() {
+            tracing::info!(
+                "代理池已更新：共 {} 个代理，策略 {}",
+                pool.len(),
+                pool.strategy().as_str()
+            );
+        } else {
+            tracing::info!("代理池已关闭");
+        }
+
+        self.get_proxy_pool()
+    }
+
+    /// 测试代理池连通性
+    pub async fn test_proxy_pool(
+        &self,
+        req: TestProxyPoolRequest,
+    ) -> Result<ProxyTestResponse, AdminServiceError> {
+        let config = Config::load(&self.config_path)
+            .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+
+        let test_url_override = req
+            .test_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let test_url = test_url_override.unwrap_or_else(|| {
+            config
+                .proxy_pool
+                .as_ref()
+                .map(|p| p.effective_test_url().to_string())
+                .unwrap_or_else(|| ProxyPoolConfig::DEFAULT_TEST_URL.to_string())
+        });
+
+        let timeout = Duration::from_secs(req.timeout_secs.unwrap_or(10).clamp(3, 60));
+
+        let pool = self.token_manager.proxy_pool_snapshot();
+        let entries: Vec<ProxyConfig> = pool
+            .as_ref()
+            .map(|p| p.entries().to_vec())
+            .unwrap_or_default();
+
+        if entries.is_empty() {
+            return Ok(ProxyTestResponse {
+                total: 0,
+                success: 0,
+                failed: 0,
+                test_url,
+                results: Vec::new(),
+            });
+        }
+
+        let tls_backend = config.tls_backend;
+        let mut handles = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let url_owned = test_url.clone();
+            let entry_clone = entry.clone();
+            let handle = tokio::spawn(async move {
+                test_single_proxy(&entry_clone, &url_owned, timeout, tls_backend).await
+            });
+            handles.push(handle);
+        }
+
+        let mut results = Vec::with_capacity(handles.len());
+        let mut ok = 0usize;
+        for handle in handles {
+            match handle.await {
+                Ok(item) => {
+                    if item.success {
+                        ok += 1;
+                    }
+                    results.push(item);
+                }
+                Err(e) => {
+                    results.push(ProxyTestItem {
+                        url: "<unknown>".to_string(),
+                        success: false,
+                        duration_ms: 0,
+                        response_ip: None,
+                        error: Some(format!("任务失败: {}", e)),
+                    });
+                }
+            }
+        }
+
+        let total = results.len();
+        let failed = total - ok;
+
+        Ok(ProxyTestResponse {
+            total,
+            success: ok,
+            failed,
+            test_url,
+            results,
+        })
+    }
+
+    /// 更新凭据级代理配置
+    pub async fn update_credential_proxy(
+        &self,
+        id: u64,
+        req: UpdateCredentialProxyRequest,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .update_credential_proxy(id, req.proxy_url, req.proxy_username, req.proxy_password)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
     /// 删除 API Key
     pub fn delete_api_key(&self, id: &str) -> Result<(), AdminServiceError> {
         let mut config = Config::load(&self.config_path)
@@ -752,6 +975,181 @@ impl AdminService {
 
         Ok(())
     }
+}
+
+// ============ 代理池辅助函数 ============
+
+/// DTO -> Config
+fn dto_to_pool_config(dto: &ProxyPoolDto) -> ProxyPoolConfig {
+    let cleaned: Vec<String> = dto
+        .urls
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let urls = if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    };
+
+    let template = dto.template.as_ref().and_then(|t| {
+        let host = t.host.trim();
+        if host.is_empty() {
+            return None;
+        }
+        Some(ProxyPoolTemplate {
+            protocol: t.protocol.trim().to_string(),
+            host: host.to_string(),
+            port_start: t.port_start,
+            port_end: t.port_end,
+        })
+    });
+
+    let username = dto
+        .username
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let password = dto
+        .password
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let test_url = dto
+        .test_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    ProxyPoolConfig {
+        enabled: dto.enabled,
+        strategy: dto.strategy.trim().to_string(),
+        urls,
+        template,
+        username,
+        password,
+        test_url,
+        cooldown_secs: dto.cooldown_secs,
+    }
+}
+
+/// Config -> DTO
+fn pool_config_to_dto(cfg: &ProxyPoolConfig) -> ProxyPoolDto {
+    ProxyPoolDto {
+        enabled: cfg.enabled,
+        strategy: cfg.strategy.clone(),
+        urls: cfg.urls.clone(),
+        template: cfg.template.as_ref().map(|t| ProxyPoolTemplateDto {
+            protocol: t.protocol.clone(),
+            host: t.host.clone(),
+            port_start: t.port_start,
+            port_end: t.port_end,
+        }),
+        username: cfg.username.clone(),
+        password: cfg.password.clone(),
+        test_url: cfg.test_url.clone(),
+        cooldown_secs: cfg.cooldown_secs,
+    }
+}
+
+/// 测试单个代理
+async fn test_single_proxy(
+    entry: &ProxyConfig,
+    test_url: &str,
+    timeout: Duration,
+    tls_backend: crate::model::config::TlsBackend,
+) -> ProxyTestItem {
+    let start = Instant::now();
+    let timeout_secs = timeout.as_secs().max(1);
+    let client = match build_client(Some(entry), timeout_secs, tls_backend) {
+        Ok(c) => c,
+        Err(e) => {
+            return ProxyTestItem {
+                url: entry.url.clone(),
+                success: false,
+                duration_ms: start.elapsed().as_millis() as u64,
+                response_ip: None,
+                error: Some(format!("构建客户端失败: {}", e)),
+            };
+        }
+    };
+
+    let masked_url = mask_proxy_url(&entry.url);
+    match tokio::time::timeout(timeout, client.get(test_url).send()).await {
+        Ok(Ok(resp)) => {
+            let status = resp.status();
+            if !status.is_success() {
+                return ProxyTestItem {
+                    url: masked_url,
+                    success: false,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    response_ip: None,
+                    error: Some(format!("HTTP 状态码: {}", status.as_u16())),
+                };
+            }
+            let body = resp.text().await.unwrap_or_default();
+            let ip = extract_ip_from_json(&body);
+            ProxyTestItem {
+                url: masked_url,
+                success: true,
+                duration_ms: start.elapsed().as_millis() as u64,
+                response_ip: ip,
+                error: None,
+            }
+        }
+        Ok(Err(e)) => ProxyTestItem {
+            url: masked_url,
+            success: false,
+            duration_ms: start.elapsed().as_millis() as u64,
+            response_ip: None,
+            error: Some(e.to_string()),
+        },
+        Err(_) => ProxyTestItem {
+            url: masked_url,
+            success: false,
+            duration_ms: start.elapsed().as_millis() as u64,
+            response_ip: None,
+            error: Some(format!("超时（{}s）", timeout.as_secs())),
+        },
+    }
+}
+
+/// 屏蔽代理 URL 中的敏感信息（用户名保留，密码 mask）
+fn mask_proxy_url(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let prefix = &url[..scheme_end + 3];
+        let rest = &url[scheme_end + 3..];
+        if let Some(at_pos) = rest.find('@') {
+            let auth = &rest[..at_pos];
+            let host = &rest[at_pos + 1..];
+            // 保留用户名，屏蔽密码
+            if let Some(colon) = auth.find(':') {
+                let user = &auth[..colon];
+                return format!("{}{}:***@{}", prefix, user, host);
+            }
+            return format!("{}***@{}", prefix, host);
+        }
+    }
+    url.to_string()
+}
+
+/// 从响应 JSON 中尽力提取 IP 字段
+fn extract_ip_from_json(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    // 常见字段名
+    for key in ["ip", "query", "origin", "YourFuckingIPAddress"] {
+        if let Some(v) = value.get(key) {
+            if let Some(s) = v.as_str() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

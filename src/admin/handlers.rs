@@ -10,8 +10,8 @@ use super::{
     middleware::AdminState,
     types::{
         ActivityQuery, AddApiKeyRequest, AddCredentialRequest, GenerateApiKeyRequest, LogsQuery,
-        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
-        UpdateApiKeyRequest,
+        ProxyPoolDto, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
+        SuccessResponse, TestProxyPoolRequest, UpdateApiKeyRequest, UpdateCredentialProxyRequest,
     },
 };
 
@@ -248,6 +248,58 @@ pub async fn delete_api_key(
             }
             Json(SuccessResponse::new(format!("API Key {} 已删除", id))).into_response()
         }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+// ============ 代理池管理处理器 ============
+
+/// GET /api/admin/proxy-pool
+/// 获取当前代理池配置和运行时状态
+pub async fn get_proxy_pool(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_proxy_pool() {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/proxy-pool
+/// 更新代理池配置（持久化并热更新）
+pub async fn update_proxy_pool(
+    State(state): State<AdminState>,
+    Json(payload): Json<ProxyPoolDto>,
+) -> impl IntoResponse {
+    match state.service.update_proxy_pool(payload) {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxy-pool/test
+/// 测试代理池连通性
+pub async fn test_proxy_pool(
+    State(state): State<AdminState>,
+    Json(payload): Json<TestProxyPoolRequest>,
+) -> impl IntoResponse {
+    match state.service.test_proxy_pool(payload).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/credentials/:id/proxy
+/// 更新单个凭据的代理配置
+pub async fn update_credential_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<UpdateCredentialProxyRequest>,
+) -> impl IntoResponse {
+    match state.service.update_credential_proxy(id, payload).await {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} 代理已更新",
+            id
+        )))
+        .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

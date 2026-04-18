@@ -145,11 +145,22 @@ async fn main() {
         tracing::info!("已配置 HTTP 代理: {}", config.proxy_url.as_ref().unwrap());
     }
 
+    // 构建代理池（用于 IP 轮询）
+    let proxy_pool = config.build_proxy_pool().map(Arc::new);
+    if let Some(pool) = proxy_pool.as_ref() {
+        tracing::info!(
+            "已启用代理池：共 {} 个代理，策略 {}",
+            pool.len(),
+            pool.strategy().as_str()
+        );
+    }
+
     // 创建 MultiTokenManager 和 KiroProvider
     let token_manager = MultiTokenManager::new(
         config.clone(),
         credentials_list,
         proxy_config.clone(),
+        proxy_pool.clone(),
         Some(credentials_path.into()),
         is_multiple_format,
     )
@@ -158,7 +169,11 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
-    let kiro_provider = KiroProvider::with_proxy(token_manager.clone(), proxy_config.clone());
+    let kiro_provider = KiroProvider::with_proxy_and_pool(
+        token_manager.clone(),
+        proxy_config.clone(),
+        proxy_pool.clone(),
+    );
     let request_monitor = monitoring::RequestMonitor::new(500);
 
     // 初始化 count_tokens 配置
