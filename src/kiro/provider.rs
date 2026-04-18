@@ -12,10 +12,12 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 use crate::http_client::{ProxyConfig, build_client};
-use crate::kiro::endpoint::{EndpointRegistry, KiroEndpoint, RequestContext};
-use crate::kiro::machine_id;
+use crate::kiro::endpoint::RequestContext;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
+
+// 注：KiroProvider 本身不再直接持有 EndpointRegistry —— 重试循环通过 ctx.endpoint 访问。
+// TokenManager 单向持有 EndpointRegistry，并在 acquire_context* 构造 CallContext 时预解析。
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -39,21 +41,20 @@ pub struct KiroProvider {
     client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
-    /// 端点注册表（凭据 → 端点实现解析；默认端点也在内部记录）
-    endpoint_registry: Arc<EndpointRegistry>,
 }
 
 impl KiroProvider {
-    /// 创建带代理配置和端点注册表的 KiroProvider 实例
+    /// 创建带代理配置的 KiroProvider 实例
+    ///
+    /// 端点注册表通过 `TokenManager` 间接注入：Provider 的重试循环从 `ctx.endpoint`
+    /// 取端点实现，无需自身持有 `EndpointRegistry`。
     ///
     /// # Arguments
-    /// * `token_manager` - 多凭据 Token 管理器
+    /// * `token_manager` - 多凭据 Token 管理器（已持有 endpoint_registry）
     /// * `proxy` - 全局代理配置
-    /// * `endpoint_registry` - 端点注册表（main.rs 负责保证 default 与凭据声明均已校验）
     pub fn with_proxy(
         token_manager: Arc<MultiTokenManager>,
         proxy: Option<ProxyConfig>,
-        endpoint_registry: Arc<EndpointRegistry>,
     ) -> Self {
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client
@@ -67,7 +68,6 @@ impl KiroProvider {
             global_proxy: proxy,
             client_cache: Mutex::new(cache),
             tls_backend,
-            endpoint_registry,
         }
     }
 
@@ -81,14 +81,6 @@ impl KiroProvider {
         let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
         cache.insert(effective, client.clone());
         Ok(client)
-    }
-
-    /// 根据凭据选择 endpoint 实现
-    ///
-    /// 委托给 [`EndpointRegistry::resolve`]：未指定 endpoint / 指定但未注册均回退到默认端点。
-    /// 因此返回类型不再是 `Result`，调用方无需处理"端点解析失败"分支。
-    fn endpoint_for(&self, credentials: &KiroCredentials) -> Arc<dyn KiroEndpoint> {
-        self.endpoint_registry.resolve(credentials)
     }
 
     /// 发送非流式 API 请求
@@ -126,14 +118,12 @@ impl KiroProvider {
             };
 
             let config = self.token_manager.config();
-            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
-
-            let endpoint = self.endpoint_for(&ctx.credentials);
+            let endpoint = Arc::clone(&ctx.endpoint);
 
             let rctx = RequestContext {
                 credentials: &ctx.credentials,
                 token: &ctx.token,
-                machine_id: &machine_id,
+                machine_id: &ctx.machine_id,
                 config,
             };
 
@@ -276,14 +266,12 @@ impl KiroProvider {
             };
 
             let config = self.token_manager.config();
-            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
-
-            let endpoint = self.endpoint_for(&ctx.credentials);
+            let endpoint = Arc::clone(&ctx.endpoint);
 
             let rctx = RequestContext {
                 credentials: &ctx.credentials,
                 token: &ctx.token,
-                machine_id: &machine_id,
+                machine_id: &ctx.machine_id,
                 config,
             };
 

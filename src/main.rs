@@ -138,17 +138,14 @@ async fn main() {
         proxy_config.clone(),
         Some(credentials_path.into()),
         is_multiple_format,
+        Arc::clone(&endpoint_registry),
     )
     .unwrap_or_else(|e| {
         tracing::error!("创建 Token 管理器失败: {}", e);
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
-    let kiro_provider = KiroProvider::with_proxy(
-        token_manager.clone(),
-        proxy_config.clone(),
-        Arc::clone(&endpoint_registry),
-    );
+    let kiro_provider = KiroProvider::with_proxy(token_manager.clone(), proxy_config.clone());
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
