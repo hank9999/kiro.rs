@@ -8,14 +8,14 @@ RUN pnpm build
 
 FROM rust:1.92-alpine AS builder
 
-RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static
+RUN apk add --no-cache musl-dev
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
 COPY --from=frontend-builder /app/admin-ui/dist /app/admin-ui/dist
 
-RUN cargo build --release
+RUN cargo build --release --no-default-features
 
 FROM alpine:3.21
 

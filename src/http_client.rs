@@ -51,8 +51,20 @@ pub fn build_client(
 ) -> anyhow::Result<Client> {
     let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
 
-    if tls_backend == TlsBackend::Rustls {
-        builder = builder.use_rustls_tls();
+    match tls_backend {
+        TlsBackend::Rustls => {
+            builder = builder.use_rustls_tls();
+        }
+        TlsBackend::NativeTls => {
+            #[cfg(feature = "native-tls")]
+            {
+                builder = builder.use_native_tls();
+            }
+            #[cfg(not(feature = "native-tls"))]
+            {
+                anyhow::bail!("此构建版本未包含 native-tls 后端，请在配置中改用 rustls");
+            }
+        }
     }
 
     if let Some(proxy_config) = proxy {

@@ -120,7 +120,7 @@ jobs:
           sudo apt-get install -y musl-tools
 
       - name: Build app
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ contains(matrix.target, 'musl') && '--no-default-features' || '' }}
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
