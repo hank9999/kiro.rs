@@ -179,7 +179,13 @@ async fn refresh_social_token(
 
     let status = response.status();
     if !status.is_success() {
-        let body_text = response.text().await.unwrap_or_default();
+        let body_text = match response.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("读取响应 body 失败: {e}");
+                String::new()
+            }
+        };
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -276,7 +282,13 @@ async fn refresh_idc_token(
 
     let status = response.status();
     if !status.is_success() {
-        let body_text = response.text().await.unwrap_or_default();
+        let body_text = match response.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("读取响应 body 失败: {e}");
+                String::new()
+            }
+        };
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -353,7 +365,13 @@ pub(crate) async fn get_usage_limits(
 
     let status = response.status();
     if !status.is_success() {
-        let body_text = response.text().await.unwrap_or_default();
+        let body_text = match response.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("读取响应 body 失败: {e}");
+                String::new()
+            }
+        };
         let error_msg = match status.as_u16() {
             401 => "认证失败，Token 无效或已过期",
             403 => "权限不足，无法获取使用额度",

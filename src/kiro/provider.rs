@@ -205,7 +205,13 @@ impl KiroProvider {
             }
 
             // 失败响应：读取 body 用于日志/错误信息
-            let body = response.text().await.unwrap_or_default();
+            let body = match response.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("读取响应 body 失败: {e}");
+                    String::new()
+                }
+            };
 
             match endpoint.classify_error(status.as_u16(), &body) {
                 EndpointErrorKind::MonthlyQuotaExhausted => {
