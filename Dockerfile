@@ -8,7 +8,7 @@ RUN pnpm build
 
 FROM rust:1.92-alpine AS builder
 
-RUN apk add --no-cache musl-dev
+RUN apk add --no-cache musl-dev perl make
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
