@@ -419,6 +419,7 @@ async fn call_with_retry(
       pub machine_id: String,
   }
   ```
+  > **⚠️ 后续变更（阶段 7，2026-04-24）**：上述 `pub` 字段已在阶段 7 改为私有，通过 getter 暴露只读访问。详见阶段 7 说明。
 - **Verify**: `cargo build` 会报调用点错误（下一步修复）
 - **Complexity**: Small
 
@@ -665,6 +666,65 @@ async fn call_with_retry(
 **Out of Scope（评估后延后）**：
 - **合并 `ProbeEndpoint` / `NamedProbeEndpoint` 为单一 `TestEndpoint`**：独立的测试侧重构，避免本次 PR 范围扩散；若未来 trait 再加方法时再做。
 - **拆分 `build_request` 为模板方法（`url_for` / `decorate_headers` 等）**：YAGNI，当前只有 1 个 endpoint 实现，抽象收益是假想的，复杂度代价是真实的。待第 2 个 endpoint 落地、差异模式清晰后再评估。
+
+---
+
+### 阶段 7：CallContext 不变量硬化 + get_usage_limits_for 一致性修复（2026-04-24 追加）
+
+**触发**：code review 指出两个问题：
+1. `CallContext` 声称"确保 token/credentials/endpoint/machine_id 的一致性"，但字段全 `pub`，任何模块都能用 struct literal 构造不一致的实例——类型系统未守住声称的不变量。
+2. `get_usage_limits_for` 中 token 来自一次读取、credentials/endpoint/machine_id 来自另一次读取，存在并发刷新导致快照不一致的真实竞态窗口。
+
+**设计决策**：
+- `CallContext`：字段全私有 + `pub(crate)` getter，编译器保证只有 `token_manager.rs` 模块内的 `try_ensure_token` 能构造。
+- `RequestContext`：字段保持 `pub`——它是引用视图包，无独立不变量，一致性由上游 `CallContext` 保证；私有化会引入大量 getter churn（`ide.rs` 约 15 处直接访问 + 4 处测试构造）。
+- 新增 `CallContext::to_request_context(&self, config) -> RequestContext`，统一从 CallContext → RequestContext 的转换路径。
+- 不加 `CallContext::new()` 构造器——字段私有后 struct literal 仅模块内可用，`new()` 只是同模块内的搬运，零额外安全收益。
+
+**涉及文件**：
+- `src/kiro/token_manager.rs`
+- `src/kiro/provider.rs`
+
+#### Step 7.1：CallContext 字段私有化 + getter
+
+- **Files**: `src/kiro/token_manager.rs`
+- **Action**:
+  - struct 改为 `pub(crate)`，字段去掉 `pub`
+  - 新增 getter：`id() -> u64`、`credentials() -> &KiroCredentials`、`token() -> &str`、`endpoint() -> Arc<dyn KiroEndpoint>`（返回 cloned Arc）、`machine_id() -> &str`
+  - 新增 `to_request_context(&self, config) -> RequestContext`
+  - `acquire_context` 可见性收紧为 `pub(crate)`
+- **Verify**: `cargo build` 报 provider.rs 字段访问错误（下一步修复）
+- **Complexity**: Small
+
+#### Step 7.2：provider 消费侧迁移
+
+- **Files**: `src/kiro/provider.rs`
+- **Action**:
+  - 所有 `ctx.field` → `ctx.field()` getter 调用
+  - `RequestContext { ... }` 手写构造 → `ctx.to_request_context(config)`
+  - 401/403 分支提取 `let id = ctx.id();` 避免重复调用
+- **Verify**: `cargo build` + `cargo test` 通过
+- **Complexity**: Small
+
+#### Step 7.3：get_usage_limits_for 复用 try_ensure_token
+
+- **Files**: `src/kiro/token_manager.rs`
+- **Action**:
+  - 删除 `get_usage_limits_for` 内自行编写的 ~60 行 token 刷新逻辑（token 与 credentials 分两次从 entries 读取）
+  - 改为 `let ctx = self.try_ensure_token(id, &credentials).await?;`，后续所有参数从 `ctx` getter 提取
+  - 行为差异：`try_ensure_token` 成功后会重置 `refresh_failure_count`，原 `get_usage_limits_for` 未做此操作——这是改进（成功获取 token 应清零计数，不区分请求类型）
+- **Verify**: `cargo test token_manager` 通过
+- **Complexity**: Small
+
+#### Step 7.4：阶段 7 验收
+
+- **Verify**:
+  - `cargo check` 通过
+  - `cargo test`（229 测试全过）
+  - `CallContext` 字段仅在 `try_ensure_token` 的两个分支（API key / OAuth）中以 struct literal 构造
+  - `provider.rs` 无直接字段访问残留
+  - `get_usage_limits_for` 无二次 entries 读取残留
+- **回滚**：两文件改动，单个 commit `8af1386`，`git revert` 即可。
 
 ---
 
