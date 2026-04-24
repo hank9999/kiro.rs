@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
-use crate::kiro::endpoint::{EndpointRegistry, KiroEndpoint};
+use crate::kiro::endpoint::{EndpointRegistry, KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
@@ -347,7 +347,7 @@ pub(crate) async fn get_usage_limits(
     machine_id: &str,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<UsageLimitsResponse> {
-    use crate::kiro::endpoint::{KiroRequest, RequestContext};
+    use crate::kiro::endpoint::KiroRequest;
 
     tracing::debug!("正在获取使用额度信息...");
 
@@ -537,17 +537,48 @@ const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 /// `endpoint` 与 `machine_id` 在 `acquire_context*()` 构造阶段预解析，
 /// 使 Provider 重试循环与 `get_usage_limits_for` 可以无分支直接使用。
 #[derive(Clone)]
-pub struct CallContext {
+pub(crate) struct CallContext {
     /// 凭据 ID（用于 report_success/report_failure）
-    pub id: u64,
+    id: u64,
     /// 凭据信息（用于构建请求头）
-    pub credentials: KiroCredentials,
+    credentials: KiroCredentials,
     /// 访问 Token
-    pub token: String,
+    token: String,
     /// 凭据对应的端点实现
-    pub endpoint: Arc<dyn KiroEndpoint>,
+    endpoint: Arc<dyn KiroEndpoint>,
     /// 凭据对应的 machineId（由 generate_from_credentials 预计算一次）
-    pub machine_id: String,
+    machine_id: String,
+}
+
+impl CallContext {
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn credentials(&self) -> &KiroCredentials {
+        &self.credentials
+    }
+
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub(crate) fn endpoint(&self) -> Arc<dyn KiroEndpoint> {
+        Arc::clone(&self.endpoint)
+    }
+
+    pub(crate) fn machine_id(&self) -> &str {
+        &self.machine_id
+    }
+
+    pub(crate) fn to_request_context<'a>(&'a self, config: &'a Config) -> RequestContext<'a> {
+        RequestContext {
+            credentials: &self.credentials,
+            token: &self.token,
+            machine_id: &self.machine_id,
+            config,
+        }
+    }
 }
 
 impl MultiTokenManager {
@@ -757,7 +788,7 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+    pub(crate) async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -897,14 +928,12 @@ impl MultiTokenManager {
                 .kiro_api_key
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
-            let endpoint = self.endpoint_registry.resolve(credentials);
-            let machine_id = machine_id::generate_from_credentials(credentials, &self.config);
             return Ok(CallContext {
                 id,
                 credentials: credentials.clone(),
                 token,
-                endpoint,
-                machine_id,
+                endpoint: self.endpoint_registry.resolve(credentials),
+                machine_id: machine_id::generate_from_credentials(credentials, &self.config),
             });
         }
 
@@ -970,14 +999,12 @@ impl MultiTokenManager {
             }
         }
 
-        let endpoint = self.endpoint_registry.resolve(&creds);
-        let machine_id = machine_id::generate_from_credentials(&creds, &self.config);
         Ok(CallContext {
             id,
+            endpoint: self.endpoint_registry.resolve(&creds),
+            machine_id: machine_id::generate_from_credentials(&creds, &self.config),
             credentials: creds,
             token,
-            endpoint,
-            machine_id,
         })
     }
 
@@ -1553,76 +1580,15 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
-        // API Key 凭据直接使用 kiro_api_key，无需刷新
-        let token = if credentials.is_api_key_credential() {
-            credentials
-                .kiro_api_key
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
-        } else {
-            // 检查是否需要刷新 token
-            let needs_refresh =
-                is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
-
-            if needs_refresh {
-                let _guard = self.refresh_lock.lock().await;
-                let current_creds = {
-                    let entries = self.entries.lock();
-                    entries
-                        .iter()
-                        .find(|e| e.id == id)
-                        .map(|e| e.credentials.clone())
-                        .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-                };
-
-                if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                    let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
-                    let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
-                            .await?;
-                    {
-                        let mut entries = self.entries.lock();
-                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.credentials = new_creds.clone();
-                        }
-                    }
-                    // 持久化失败只记录警告，不影响本次请求
-                    if let Err(e) = self.persist_credentials() {
-                        tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
-                    }
-                    new_creds
-                        .access_token
-                        .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
-                } else {
-                    current_creds
-                        .access_token
-                        .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-                }
-            } else {
-                credentials
-                    .access_token
-                    .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-            }
-        };
-
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
-
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let endpoint = self.endpoint_registry.resolve(&credentials);
-        let machine_id = machine_id::generate_from_credentials(&credentials, &self.config);
+        let ctx = self.try_ensure_token(id, &credentials).await?;
+        let effective_proxy = ctx.credentials().effective_proxy(self.proxy.as_ref());
+        let endpoint = ctx.endpoint();
         let usage_limits = get_usage_limits(
             endpoint.as_ref(),
-            &credentials,
+            ctx.credentials(),
             &self.config,
-            &token,
-            &machine_id,
+            ctx.token(),
+            ctx.machine_id(),
             effective_proxy.as_ref(),
         )
         .await?;
@@ -2362,7 +2328,7 @@ mod tests {
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
         let ctx = manager.acquire_context(None).await.unwrap();
-        assert!(ctx.token == "t1" || ctx.token == "t2");
+        assert!(ctx.token() == "t1" || ctx.token() == "t2");
         assert_eq!(manager.available_count(), 2);
     }
 
@@ -2384,8 +2350,8 @@ mod tests {
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false, test_registry()).unwrap();
 
         let ctx = manager.acquire_context(None).await.unwrap();
-        assert_eq!(ctx.id, 2);
-        assert_eq!(ctx.token, "good-token");
+        assert_eq!(ctx.id(), 2);
+        assert_eq!(ctx.token(), "good-token");
     }
 
     #[test]
@@ -2646,10 +2612,10 @@ mod tests {
         )
         .unwrap();
         let ctx = manager.acquire_context(None).await.unwrap();
-        assert_eq!(ctx.endpoint.name(), "ide");
+        assert_eq!(ctx.endpoint().name(), "ide");
         // machine_id 与 generate_from_credentials 字节相等
-        let expected = machine_id::generate_from_credentials(&ctx.credentials, &config);
-        assert_eq!(ctx.machine_id, expected);
-        assert!(!ctx.machine_id.is_empty());
+        let expected = machine_id::generate_from_credentials(ctx.credentials(), &config);
+        assert_eq!(ctx.machine_id(), expected);
+        assert!(!ctx.machine_id().is_empty());
     }
 }

@@ -12,11 +12,11 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 use crate::http_client::{ProxyConfig, build_client};
-use crate::kiro::endpoint::{EndpointErrorKind, KiroRequest, RequestContext};
+use crate::kiro::endpoint::{EndpointErrorKind, KiroRequest};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 
-// 注：KiroProvider 本身不再直接持有 EndpointRegistry —— 重试循环通过 ctx.endpoint 访问。
+// 注：KiroProvider 本身不再直接持有 EndpointRegistry —— 重试循环通过 ctx.endpoint() 访问。
 // TokenManager 单向持有 EndpointRegistry，并在 acquire_context* 构造 CallContext 时预解析。
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
@@ -46,7 +46,7 @@ pub struct KiroProvider {
 impl KiroProvider {
     /// 创建带代理配置的 KiroProvider 实例
     ///
-    /// 端点注册表通过 `TokenManager` 间接注入：Provider 的重试循环从 `ctx.endpoint`
+    /// 端点注册表通过 `TokenManager` 间接注入：Provider 的重试循环从 `ctx.endpoint()`
     /// 取端点实现，无需自身持有 `EndpointRegistry`。
     ///
     /// # Arguments
@@ -166,16 +166,10 @@ impl KiroProvider {
             };
 
             let config = self.token_manager.config();
-            let endpoint = Arc::clone(&ctx.endpoint);
+            let endpoint = ctx.endpoint();
+            let rctx = ctx.to_request_context(config);
 
-            let rctx = RequestContext {
-                credentials: &ctx.credentials,
-                token: &ctx.token,
-                machine_id: &ctx.machine_id,
-                config,
-            };
-
-            let client = self.client_for(&ctx.credentials)?;
+            let client = self.client_for(ctx.credentials())?;
             let request = endpoint.build_request(&client, &rctx, req)?;
 
             let response = match request.send().await {
@@ -200,7 +194,7 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
-                self.token_manager.report_success(ctx.id);
+                self.token_manager.report_success(ctx.id());
                 return Ok(response);
             }
 
@@ -224,7 +218,7 @@ impl KiroProvider {
                         body
                     );
 
-                    let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                    let has_available = self.token_manager.report_quota_exhausted(ctx.id());
                     if !has_available {
                         anyhow::bail!(
                             "{}失败（所有凭据已用尽）: {} {}",
@@ -256,17 +250,18 @@ impl KiroProvider {
                     );
 
                     // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
-                    if !force_refreshed.contains(&ctx.id) {
-                        force_refreshed.insert(ctx.id);
-                        tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                        if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
-                            tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
+                    let id = ctx.id();
+                    if !force_refreshed.contains(&id) {
+                        force_refreshed.insert(id);
+                        tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", id);
+                        if self.token_manager.force_refresh_token_for(id).await.is_ok() {
+                            tracing::info!("凭据 #{} token 强制刷新成功，重试请求", id);
                             continue;
                         }
-                        tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
+                        tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", id);
                     }
 
-                    let has_available = self.token_manager.report_failure(ctx.id);
+                    let has_available = self.token_manager.report_failure(ctx.id());
                     if !has_available {
                         anyhow::bail!(
                             "{}失败（所有凭据已用尽）: {} {}",
@@ -297,7 +292,7 @@ impl KiroProvider {
                         body
                     );
 
-                    let has_available = self.token_manager.report_failure(ctx.id);
+                    let has_available = self.token_manager.report_failure(ctx.id());
                     if !has_available {
                         anyhow::bail!(
                             "{}失败（所有凭据已用尽）: {} {}",
