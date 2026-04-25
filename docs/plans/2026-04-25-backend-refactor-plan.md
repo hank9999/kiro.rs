@@ -1022,7 +1022,7 @@ src/
 - [x] Phase 2 complete (基础设施 + 拆 token_manager)
 - [x] Phase 3 complete (KiroClient)
 - [x] Phase 4 complete (Conversation 协议)
-- [ ] Phase 5 complete (interface/http – Anthropic)
+- [x] Phase 5 complete (interface/http – Anthropic)
 - [ ] Phase 6 complete (interface/http – Admin)
 - [ ] Phase 7 complete (装配 + 删除)
 - [ ] Phase 8 complete (手工冒烟 + 负载验证 + 最终静态检查)
