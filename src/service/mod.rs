@@ -5,3 +5,6 @@
 #![allow(dead_code)]
 
 pub mod credential_pool;
+pub mod kiro_client;
+
+pub use kiro_client::KiroClient;

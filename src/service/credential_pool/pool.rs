@@ -347,6 +347,33 @@ impl CredentialPool {
         }
     }
 
+    /// 强制刷新 token：调对应的 refresher，更新 store 中的凭据
+    ///
+    /// API Key 凭据视为 no-op（无需刷新）；其他凭据按 auth_method 分发到 social / idc。
+    pub async fn force_refresh(&self, id: u64) -> Result<(), RefreshError> {
+        let cred = self.store.get(id).ok_or(RefreshError::Unauthorized)?;
+        if cred.is_api_key_credential() {
+            return Ok(());
+        }
+        let outcome = match pick_refresher_kind(&cred) {
+            RefresherKind::Idc => self.refresher_idc.refresh(&cred).await,
+            RefresherKind::Social => self.refresher_social.refresh(&cred).await,
+        }?;
+        let mut updated = cred;
+        updated.access_token = Some(outcome.access_token);
+        if let Some(rt) = outcome.refresh_token {
+            updated.refresh_token = Some(rt);
+        }
+        if let Some(arn) = outcome.profile_arn {
+            updated.profile_arn = Some(arn);
+        }
+        if let Some(ea) = outcome.expires_at {
+            updated.expires_at = Some(ea);
+        }
+        let _ = self.store.replace(id, updated);
+        Ok(())
+    }
+
     /// 装载阶段使用：把 store 的所有 id 在 state 里建一条空 EntryState；issues 中的 id 同时设 InvalidConfig
     pub fn install_initial_states(
         &self,

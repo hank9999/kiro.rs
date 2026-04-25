@@ -1020,7 +1020,7 @@ src/
 - [x] Phase 0 complete (准备)
 - [x] Phase 1 complete (基建)
 - [x] Phase 2 complete (基础设施 + 拆 token_manager)
-- [ ] Phase 3 complete (KiroClient)
+- [x] Phase 3 complete (KiroClient)
 - [ ] Phase 4 complete (Conversation 协议)
 - [ ] Phase 5 complete (interface/http – Anthropic)
 - [ ] Phase 6 complete (interface/http – Admin)
