@@ -6,8 +6,10 @@ mod config;
 mod domain;
 mod error;
 mod http_client;
+mod infra;
 mod kiro;
 mod model;
+mod service;
 pub mod token;
 
 use std::collections::HashMap;
