@@ -196,6 +196,251 @@ pub struct SetLoadBalancingModeRequest {
     pub mode: String,
 }
 
+// ============ 查询参数 / 日志 ============
+
+/// 请求活动查询参数
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityQuery {
+    /// 返回的记录条数，默认 50，最大 200
+    pub limit: Option<usize>,
+}
+
+/// 日志查询参数
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogsQuery {
+    /// 返回的日志行数，默认 120，最大 500
+    pub lines: Option<usize>,
+}
+
+/// 最近日志响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogsResponse {
+    pub path: String,
+    pub available: bool,
+    pub fetched_at: String,
+    pub truncated: bool,
+    pub lines: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+// ============ API Key 管理 ============
+
+/// API Key 信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyInfo {
+    pub id: String,
+    pub key: String,
+    pub name: String,
+    pub enabled: bool,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
+    /// 是否为主Key（来自旧配置的 apiKey）
+    #[serde(default)]
+    pub is_primary: bool,
+}
+
+/// API Keys 列表响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeysListResponse {
+    pub api_keys: Vec<ApiKeyInfo>,
+    /// 主Key（如果存在）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_key: Option<ApiKeyInfo>,
+}
+
+/// 添加 API Key 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddApiKeyRequest {
+    pub key: String,
+    pub name: String,
+}
+
+/// 生成 API Key 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateApiKeyRequest {
+    pub name: String,
+    /// Key 长度（默认 32）
+    #[serde(default = "default_key_length")]
+    pub length: usize,
+}
+
+fn default_key_length() -> usize {
+    32
+}
+
+/// 生成 API Key 响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateApiKeyResponse {
+    pub key: String,
+    pub id: String,
+}
+
+/// 更新 API Key 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateApiKeyRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+// ============ 代理池管理 ============
+
+/// 代理池端口范围模板
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolTemplateDto {
+    #[serde(default = "default_template_protocol")]
+    pub protocol: String,
+    pub host: String,
+    pub port_start: u16,
+    pub port_end: u16,
+}
+
+fn default_template_protocol() -> String {
+    "socks5h".to_string()
+}
+
+/// 代理池配置（用于 GET/PUT）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolDto {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_pool_strategy_dto")]
+    pub strategy: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub urls: Option<Vec<String>>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<ProxyPoolTemplateDto>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_url: Option<String>,
+    /// 代理被标记为限流后的冷却时长（秒，默认 30）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_secs: Option<u64>,
+}
+
+fn default_pool_strategy_dto() -> String {
+    "round-robin".to_string()
+}
+
+impl Default for ProxyPoolDto {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            strategy: default_pool_strategy_dto(),
+            urls: None,
+            template: None,
+            username: None,
+            password: None,
+            test_url: None,
+            cooldown_secs: None,
+        }
+    }
+}
+
+/// 代理池状态（含池大小 / 策略 / 展开后的 URL 列表）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolStatusResponse {
+    /// 当前持久化配置
+    pub config: ProxyPoolDto,
+    /// 代理列表（含冷却状态）
+    pub proxies: Vec<ProxyPoolItemStatus>,
+    /// 展开后的代理 URL 列表（不含敏感认证信息，向后兼容字段）
+    pub resolved_urls: Vec<String>,
+    /// 代理池大小
+    pub size: usize,
+    /// 是否生效
+    pub active: bool,
+    /// 当前时间戳（毫秒，前端用于计算冷却剩余秒数）
+    pub server_time_ms: u64,
+    /// 默认冷却时长（秒）
+    pub default_cooldown_secs: u64,
+}
+
+/// 单个代理的状态
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolItemStatus {
+    /// 代理 URL（屏蔽密码）
+    pub url: String,
+    /// 冷却到期时间（毫秒时间戳），0 表示正常
+    pub cooldown_until_ms: u64,
+    /// 冷却剩余秒数（0 表示正常）
+    pub cooldown_remaining_secs: u64,
+}
+
+/// 代理池测试请求
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TestProxyPoolRequest {
+    /// 可选的测试 URL，留空使用配置中的 testUrl 或默认值
+    #[serde(default)]
+    pub test_url: Option<String>,
+    /// 超时秒数（默认 10）
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// 单个代理测试结果
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyTestItem {
+    pub url: String,
+    pub success: bool,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// 代理池测试响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyTestResponse {
+    pub total: usize,
+    pub success: usize,
+    pub failed: usize,
+    pub test_url: String,
+    pub results: Vec<ProxyTestItem>,
+}
+
+/// 更新凭据代理请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCredentialProxyRequest {
+    /// 代理 URL，传 `null` 或空串清空，传 "direct" 显式禁用
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    #[serde(default)]
+    pub proxy_username: Option<String>,
+    #[serde(default)]
+    pub proxy_password: Option<String>,
+}
+
 // ============ 通用响应 ============
 
 /// 操作成功响应

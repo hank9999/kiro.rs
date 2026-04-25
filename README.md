@@ -32,6 +32,8 @@
 ## 功能特性
 
 - **Anthropic API 兼容**: 完整支持 Anthropic Claude API 格式
+- **OpenAI Chat Completions 兼容**: 支持 `POST /v1/chat/completions`
+- **OpenAI Responses 兼容**: 支持 `POST /v1/responses`
 - **流式响应**: 支持 SSE (Server-Sent Events) 流式输出
 - **Token 自动刷新**: 自动管理和刷新 OAuth Token
 - **多凭据支持**: 支持配置多个凭据，按优先级自动故障转移
@@ -154,6 +156,36 @@ curl http://127.0.0.1:8990/v1/messages \
     ]
   }'
 ```
+
+OpenAI Chat Completions 兼容调用：
+
+```bash
+curl http://127.0.0.1:8990/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-kiro-rs-qazWSXedcRFV123456" \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "stream": true,
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "Hello!"}
+    ]
+  }'
+```
+
+> OpenAI 兼容层当前重点支持 `chat/completions`、`responses`、`stream`、`tools/tool_calls`、`tool` 角色和 data URL 图片输入。
+
+## 本地运维与同步
+
+如果你正在维护这个仓库的本地定制版本，包含 OpenAI 兼容层、Admin 监控页面、`systemd` 保活和上游同步约定，请先阅读：
+
+- [docs/MAINTENANCE.md](docs/MAINTENANCE.md)
+
+当前本地定制还额外包含：
+
+- Admin 页面实时调用记录
+- Admin 页面成功/失败统计
+- Admin 页面日志 tail 展示
 
 ### Docker
 
@@ -378,6 +410,8 @@ RUST_LOG=debug ./target/release/kiro-rs
 |------|------|------|
 | `/v1/models` | GET | 获取可用模型列表 |
 | `/v1/messages` | POST | 创建消息（对话） |
+| `/v1/chat/completions` | POST | OpenAI Chat Completions 兼容端点 |
+| `/v1/responses` | POST | OpenAI Responses 兼容端点 |
 | `/v1/messages/count_tokens` | POST | 估算 Token 数量 |
 
 ### Claude Code 兼容端点 (/cc/v1)

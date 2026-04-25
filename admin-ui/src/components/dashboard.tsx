@@ -6,12 +6,16 @@ import { storage } from '@/lib/storage'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
+import { ActivityMonitor } from '@/components/activity-monitor'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
+import { ApiKeyManagement } from '@/components/api-key-management'
+import { ProxySettings } from '@/components/proxy-settings'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
@@ -22,6 +26,7 @@ interface DashboardProps {
 }
 
 export function Dashboard({ onLogout }: DashboardProps) {
+  const [activeTab, setActiveTab] = useState<'credentials' | 'api-keys' | 'proxy'>('credentials')
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
@@ -569,68 +574,78 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
       {/* 主内容 */}
       <main className="container mx-auto px-4 md:px-8 py-6">
-        {/* 统计卡片 */}
-        <div className="grid gap-4 md:grid-cols-3 mb-6">
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                凭据总数
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{data?.total || 0}</div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                可用凭据
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold text-green-600">{data?.available || 0}</div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                当前活跃
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold flex items-center gap-2">
-                #{data?.currentId || '-'}
-                <Badge variant="success">活跃</Badge>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
+        <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as any)}>
+          <TabsList className="mb-6">
+            <TabsTrigger value="credentials">凭据管理</TabsTrigger>
+            <TabsTrigger value="api-keys">API Keys</TabsTrigger>
+            <TabsTrigger value="proxy">代理池</TabsTrigger>
+          </TabsList>
 
-        {/* 凭据列表 */}
-        <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <h2 className="text-xl font-semibold">凭据管理</h2>
-              {selectedIds.size > 0 && (
-                <div className="flex items-center gap-2">
-                  <Badge variant="secondary">已选择 {selectedIds.size} 个</Badge>
-                  <Button onClick={deselectAll} size="sm" variant="ghost">
-                    取消选择
-                  </Button>
-                </div>
-              )}
+          <TabsContent value="credentials" className="space-y-6">
+            {/* 统计卡片 */}
+            <div className="grid gap-4 md:grid-cols-3">
+              <Card>
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-sm font-medium text-muted-foreground">
+                    凭据总数
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="text-2xl font-bold">{data?.total || 0}</div>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-sm font-medium text-muted-foreground">
+                    可用凭据
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="text-2xl font-bold text-green-600">{data?.available || 0}</div>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-sm font-medium text-muted-foreground">
+                    当前活跃
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="text-2xl font-bold flex items-center gap-2">
+                    #{data?.currentId || '-'}
+                    <Badge variant="success">活跃</Badge>
+                  </div>
+                </CardContent>
+              </Card>
             </div>
-            <div className="flex gap-2">
-              {selectedIds.size > 0 && (
-                <>
-                  <Button onClick={handleBatchVerify} size="sm" variant="outline">
-                    <CheckCircle2 className="h-4 w-4 mr-2" />
-                    批量验活
-                  </Button>
-                  <Button
-                    onClick={handleBatchForceRefresh}
-                    size="sm"
-                    variant="outline"
+
+            <ActivityMonitor />
+
+            {/* 凭据列表 */}
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-4">
+                  <h2 className="text-xl font-semibold">凭据列表</h2>
+                  {selectedIds.size > 0 && (
+                    <div className="flex items-center gap-2">
+                      <Badge variant="secondary">已选择 {selectedIds.size} 个</Badge>
+                      <Button onClick={deselectAll} size="sm" variant="ghost">
+                        取消选择
+                      </Button>
+                    </div>
+                  )}
+                </div>
+                <div className="flex gap-2">
+                  {selectedIds.size > 0 && (
+                    <>
+                      <Button onClick={handleBatchVerify} size="sm" variant="outline">
+                        <CheckCircle2 className="h-4 w-4 mr-2" />
+                        批量验活
+                      </Button>
+                      <Button
+                        onClick={handleBatchForceRefresh}
+                        size="sm"
+                        variant="outline"
                     disabled={batchRefreshing}
                   >
                     <RefreshCw className={`h-4 w-4 mr-2 ${batchRefreshing ? 'animate-spin' : ''}`} />
@@ -745,6 +760,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </>
           )}
         </div>
+          </TabsContent>
+
+          <TabsContent value="api-keys">
+            <ApiKeyManagement />
+          </TabsContent>
+
+          <TabsContent value="proxy">
+            <ProxySettings />
+          </TabsContent>
+        </Tabs>
       </main>
 
       {/* 余额对话框 */}

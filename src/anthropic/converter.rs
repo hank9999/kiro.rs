@@ -21,45 +21,148 @@ use super::types::{ContentBlock, MessagesRequest};
 ///
 /// Claude Code / MCP 工具定义偶尔会出现 `required: null`、`properties: null` 等，
 /// 导致上游返回 400 "Improperly formed request"。
-fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
+pub fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
+    normalize_json_schema_inner(schema, true)
+}
+
+fn normalize_json_schema_inner(schema: serde_json::Value, is_root: bool) -> serde_json::Value {
     let serde_json::Value::Object(mut obj) = schema else {
-        return serde_json::json!({
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": true
-        });
+        return if is_root {
+            default_object_schema()
+        } else {
+            serde_json::json!({})
+        };
     };
 
-    // type（必须是字符串）
-    if !obj.get("type").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
-        obj.insert("type".to_string(), serde_json::Value::String("object".to_string()));
+    let object_like = is_root
+        || schema_type_is_object(obj.get("type"))
+        || obj.contains_key("properties")
+        || obj.contains_key("required")
+        || obj.contains_key("additionalProperties");
+
+    // items（允许 object 或 object 数组）
+    if let Some(items) = obj.remove("items") {
+        let normalized = match items {
+            serde_json::Value::Object(_) => normalize_json_schema_inner(items, false),
+            serde_json::Value::Array(arr) => serde_json::Value::Array(
+                arr.into_iter()
+                    .map(|value| normalize_json_schema_inner(value, false))
+                    .collect(),
+            ),
+            _ => serde_json::json!({}),
+        };
+        obj.insert("items".to_string(), normalized);
     }
 
-    // properties（必须是 object）
-    match obj.get("properties") {
-        Some(serde_json::Value::Object(_)) => {}
-        _ => { obj.insert("properties".to_string(), serde_json::Value::Object(serde_json::Map::new())); }
+    // 组合关键字中的每个元素都应该是 schema object
+    for key in ["allOf", "anyOf", "oneOf"] {
+        if let Some(serde_json::Value::Array(arr)) = obj.remove(key) {
+            obj.insert(
+                key.to_string(),
+                serde_json::Value::Array(
+                    arr.into_iter()
+                        .map(|value| normalize_json_schema_inner(value, false))
+                        .collect(),
+                ),
+            );
+        }
     }
 
-    // required（必须是 string 数组）
-    let required = match obj.remove("required") {
-        Some(serde_json::Value::Array(arr)) => serde_json::Value::Array(
-            arr.into_iter()
-                .filter_map(|v| v.as_str().map(|s| serde_json::Value::String(s.to_string())))
-                .collect(),
-        ),
-        _ => serde_json::Value::Array(Vec::new()),
-    };
-    obj.insert("required".to_string(), required);
+    // not / if / then / else 也是子 schema
+    for key in ["not", "if", "then", "else"] {
+        if let Some(value) = obj.remove(key) {
+            obj.insert(key.to_string(), normalize_json_schema_inner(value, false));
+        }
+    }
 
-    // additionalProperties（允许 bool 或 object，其他按 true 处理）
-    match obj.get("additionalProperties") {
-        Some(serde_json::Value::Bool(_)) | Some(serde_json::Value::Object(_)) => {}
-        _ => { obj.insert("additionalProperties".to_string(), serde_json::Value::Bool(true)); }
+    // definitions / $defs 的值是命名 schema map
+    for key in ["definitions", "$defs"] {
+        if let Some(value) = obj.remove(key) {
+            let normalized = match value {
+                serde_json::Value::Object(map) => serde_json::Value::Object(
+                    map.into_iter()
+                        .map(|(name, value)| (name, normalize_json_schema_inner(value, false)))
+                        .collect(),
+                ),
+                _ => serde_json::Value::Object(serde_json::Map::new()),
+            };
+            obj.insert(key.to_string(), normalized);
+        }
+    }
+
+    // type（必须是字符串或字符串数组；否则根 schema 默认为 object）
+    match obj.get("type") {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => {}
+        Some(serde_json::Value::Array(arr))
+            if arr
+                .iter()
+                .all(|v| v.as_str().is_some_and(|s| !s.is_empty())) => {}
+        _ if is_root => {
+            obj.insert(
+                "type".to_string(),
+                serde_json::Value::String("object".to_string()),
+            );
+        }
+        _ => {
+            obj.remove("type");
+        }
+    }
+
+    if object_like {
+        // properties（必须是 object），并递归规范化每个子 schema
+        let properties = match obj.remove("properties") {
+            Some(serde_json::Value::Object(map)) => serde_json::Value::Object(
+                map.into_iter()
+                    .map(|(key, value)| (key, normalize_json_schema_inner(value, false)))
+                    .collect(),
+            ),
+            _ => serde_json::Value::Object(serde_json::Map::new()),
+        };
+
+        // required（必须是 string 数组）
+        let required = match obj.remove("required") {
+            Some(serde_json::Value::Array(arr)) => serde_json::Value::Array(
+                arr.into_iter()
+                    .filter_map(|v| v.as_str().map(|s| serde_json::Value::String(s.to_string())))
+                    .collect(),
+            ),
+            _ => serde_json::Value::Array(Vec::new()),
+        };
+
+        // additionalProperties（允许 bool 或 object，object 时递归规范化）
+        let additional_properties = match obj.remove("additionalProperties") {
+            Some(serde_json::Value::Bool(value)) => serde_json::Value::Bool(value),
+            Some(value @ serde_json::Value::Object(_)) => normalize_json_schema_inner(value, false),
+            _ => serde_json::Value::Bool(true),
+        };
+
+        obj.insert("properties".to_string(), properties);
+        obj.insert("required".to_string(), required);
+        obj.insert("additionalProperties".to_string(), additional_properties);
+    } else {
+        obj.remove("properties");
+        obj.remove("required");
+        obj.remove("additionalProperties");
     }
 
     serde_json::Value::Object(obj)
+}
+
+fn default_object_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": true
+    })
+}
+
+fn schema_type_is_object(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::String(s)) => s == "object",
+        Some(serde_json::Value::Array(arr)) => arr.iter().any(|v| v.as_str() == Some("object")),
+        _ => false,
+    }
 }
 
 /// 追加到 Write 工具 description 末尾的内容
@@ -253,16 +356,29 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 4. 确定触发类型
     let chat_trigger_type = determine_chat_trigger_type(req);
 
-    // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
-    let last_message = messages.last().unwrap();
-    let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
+    // 5. 处理末尾连续 user 消息作为 current_message。
+    // OpenAI 兼容层会把同一轮 Anthropic user turn（tool_result + 文本）
+    // 拆成多条连续 user/tool 消息；如果只取最后一条，会把同一轮 tool_result
+    // 错误地拆到 history + currentMessage，两者之间还会插入假的 assistant "OK"，
+    // 触发 Kiro 400 Improperly formed request。
+    let current_start_index = messages
+        .iter()
+        .rposition(|m| m.role != "user")
+        .map_or(0, |idx| idx + 1);
+    let current_messages = &messages[current_start_index..];
+    let (text_content, images, tool_results) = merge_user_message_contents(current_messages)?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
     let mut tools = convert_tools(&req.tools, &mut tool_name_map);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
+    let mut history = build_history(
+        req,
+        &messages[..current_start_index],
+        &model_id,
+        &mut tool_name_map,
+    )?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
@@ -320,10 +436,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .with_history(history);
 
     if !tool_name_map.is_empty() {
-        tracing::info!(
-            "工具名称映射: {} 个超长名称已缩短",
-            tool_name_map.len()
-        );
+        tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
     }
 
     Ok(ConversionResult {
@@ -391,6 +504,29 @@ fn process_message_content(
             }
         }
         _ => {}
+    }
+
+    Ok((text_parts.join("\n"), images, tool_results))
+}
+
+/// 合并一组连续的 user 消息内容。
+///
+/// 用于构建 currentMessage：末尾连续的 user/tool 消息在 Anthropic 语义里
+/// 属于同一轮 user turn，必须整体保留，不能拆成多轮。
+fn merge_user_message_contents(
+    messages: &[super::types::Message],
+) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
+    let mut text_parts = Vec::new();
+    let mut images = Vec::new();
+    let mut tool_results = Vec::new();
+
+    for msg in messages {
+        let (content, msg_images, msg_tool_results) = process_message_content(&msg.content)?;
+        if !content.is_empty() {
+            text_parts.push(content);
+        }
+        images.extend(msg_images);
+        tool_results.extend(msg_tool_results);
     }
 
     Ok((text_parts.join("\n"), images, tool_results))
@@ -574,7 +710,10 @@ fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> Str
 }
 
 /// 转换工具定义
-fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut HashMap<String, String>) -> Vec<Tool> {
+fn convert_tools(
+    tools: &Option<Vec<super::types::Tool>>,
+    tool_name_map: &mut HashMap<String, String>,
+) -> Vec<Tool> {
     let Some(tools) = tools else {
         return Vec::new();
     };
@@ -605,7 +744,9 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
                 tool_specification: ToolSpecification {
                     name: map_tool_name(&t.name, tool_name_map),
                     description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(t.input_schema))),
+                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
+                        t.input_schema
+                    ))),
                 },
             }
         })
@@ -644,11 +785,16 @@ fn has_thinking_tags(content: &str) -> bool {
 ///
 /// # Arguments
 /// * `req` - 原始请求，用于读取 `system`、`thinking` 等配置字段
-/// * `messages` - 经过 prefill 预处理的消息切片，末尾必定是 user 消息。
-///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
-///   调用方应始终使用此参数而非 `req.messages`。
+/// * `messages` - 已排除 currentMessage 的历史消息切片。
+///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息，
+///   同时还会移除末尾连续的 user 当前轮消息），调用方应始终使用此参数而非 `req.messages`。
 /// * `model_id` - 已映射的 Kiro 模型 ID
-fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>) -> Result<Vec<Message>, ConversionError> {
+fn build_history(
+    req: &MessagesRequest,
+    messages: &[super::types::Message],
+    model_id: &str,
+    tool_name_map: &mut HashMap<String, String>,
+) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -694,17 +840,11 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     }
 
     // 2. 处理常规消息历史
-    // 最后一条消息作为 currentMessage，不加入历史
-    // 经过 prefill 预处理后，messages 末尾必定是 user，故直接截掉最后一条即可
-    let history_end_index = messages.len().saturating_sub(1);
-
-    // 收集并配对消息
+    // 调用方已经把 currentMessage 对应的末尾连续 user 消息剥离掉，这里直接处理全部 history。
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
     let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
 
-    for i in 0..history_end_index {
-        let msg = &messages[i];
-
+    for msg in messages {
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
@@ -716,8 +856,8 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
         } else if msg.role == "assistant" {
             // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
-                let merged_user = merge_user_messages(&user_buffer, model_id)?;
-                history.push(Message::User(merged_user));
+                let converted_users = convert_user_messages(&user_buffer, model_id)?;
+                history.extend(converted_users.into_iter().map(Message::User));
                 user_buffer.clear();
             }
             // 累积 assistant 消息（支持连续多条）
@@ -733,8 +873,8 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 
     // 处理结尾的孤立 user 消息
     if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id)?;
-        history.push(Message::User(merged_user));
+        let converted_users = convert_user_messages(&user_buffer, model_id)?;
+        history.extend(converted_users.into_iter().map(Message::User));
 
         // 自动配对一个 "OK" 的 assistant 响应
         let auto_assistant = HistoryAssistantMessage::new("OK");
@@ -744,41 +884,44 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     Ok(history)
 }
 
-/// 合并多个 user 消息
-fn merge_user_messages(
-    messages: &[&super::types::Message],
+/// 转换单条 user 消息。
+///
+/// 不能把连续的 user/tool 消息粗暴合并，否则会把 tool_result
+/// 和后续普通文本揉进同一条 Kiro userInputMessage，触发上游 400。
+fn convert_user_message(
+    msg: &super::types::Message,
     model_id: &str,
 ) -> Result<HistoryUserMessage, ConversionError> {
-    let mut content_parts = Vec::new();
-    let mut all_images = Vec::new();
-    let mut all_tool_results = Vec::new();
-
-    for msg in messages {
-        let (text, images, tool_results) = process_message_content(&msg.content)?;
-        if !text.is_empty() {
-            content_parts.push(text);
-        }
-        all_images.extend(images);
-        all_tool_results.extend(tool_results);
-    }
-
-    let content = content_parts.join("\n");
-    // 保留文本内容，即使有工具结果也不丢弃用户文本
+    let (content, images, tool_results) = process_message_content(&msg.content)?;
     let mut user_msg = UserMessage::new(&content, model_id);
 
-    if !all_images.is_empty() {
-        user_msg = user_msg.with_images(all_images);
+    if !images.is_empty() {
+        user_msg = user_msg.with_images(images);
     }
 
-    if !all_tool_results.is_empty() {
+    if !tool_results.is_empty() {
         let mut ctx = UserInputMessageContext::new();
-        ctx = ctx.with_tool_results(all_tool_results);
+        ctx = ctx.with_tool_results(tool_results);
         user_msg = user_msg.with_context(ctx);
     }
 
     Ok(HistoryUserMessage {
         user_input_message: user_msg,
     })
+}
+
+/// 转换连续的 user 消息。
+///
+/// 保持每条 user/tool 消息的边界，避免把多个 tool_result
+/// 或者 tool_result + 普通文本压成单条历史消息。
+fn convert_user_messages(
+    messages: &[&super::types::Message],
+    model_id: &str,
+) -> Result<Vec<HistoryUserMessage>, ConversionError> {
+    messages
+        .iter()
+        .map(|msg| convert_user_message(msg, model_id))
+        .collect()
 }
 
 /// 转换 assistant 消息
@@ -812,7 +955,8 @@ fn convert_assistant_message(
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
                                 let mapped_name = map_tool_name(&name, tool_name_map);
-                                tool_uses.push(ToolUseEntry::new(id, mapped_name).with_input(input));
+                                tool_uses
+                                    .push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
                         }
                         _ => {}
@@ -1021,13 +1165,18 @@ mod tests {
 
     #[test]
     fn test_shorten_tool_name_deterministic() {
-        let long_name = "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
+        let long_name =
+            "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
         assert!(long_name.len() > TOOL_NAME_MAX_LEN);
 
         let short1 = shorten_tool_name(long_name);
         let short2 = shorten_tool_name(long_name);
         assert_eq!(short1, short2, "相同输入应产生相同的短名称");
-        assert!(short1.len() <= TOOL_NAME_MAX_LEN, "短名称长度应 <= 63，实际 {}", short1.len());
+        assert!(
+            short1.len() <= TOOL_NAME_MAX_LEN,
+            "短名称长度应 <= 63，实际 {}",
+            short1.len()
+        );
     }
 
     #[test]
@@ -1060,7 +1209,8 @@ mod tests {
     fn test_tool_name_mapping_in_convert_request() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
         assert!(long_tool_name.len() > TOOL_NAME_MAX_LEN);
 
         let mut schema = std::collections::HashMap::new();
@@ -1070,12 +1220,10 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
-            messages: vec![
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: serde_json::json!("test"),
-                },
-            ],
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
             system: None,
             stream: false,
             tools: Some(vec![AnthropicTool {
@@ -1102,16 +1250,96 @@ mod tests {
         assert!(short.len() <= TOOL_NAME_MAX_LEN);
 
         // Kiro 请求中的工具名应该是短名称
-        let tools = &result.conversation_state.current_message.user_input_message
-            .user_input_message_context.tools;
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
         assert_eq!(tools[0].tool_specification.name, *short);
+    }
+
+    #[test]
+    fn test_normalize_json_schema_recursively() {
+        let normalized = normalize_json_schema(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "config": {
+                    "type": "object",
+                    "properties": null,
+                    "required": [null, "path"],
+                    "additionalProperties": {
+                        "type": "",
+                        "properties": null
+                    }
+                },
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "required": null
+                            }
+                        },
+                        "required": null
+                    }
+                }
+            },
+            "required": null,
+            "$defs": {
+                "entry": {
+                    "properties": null,
+                    "required": ["value", 1]
+                }
+            }
+        }));
+
+        assert_eq!(normalized["required"], serde_json::json!([]));
+        assert_eq!(
+            normalized["properties"]["config"]["properties"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            normalized["properties"]["config"]["required"],
+            serde_json::json!(["path"])
+        );
+        assert_eq!(
+            normalized["properties"]["config"]["additionalProperties"]["properties"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            normalized["properties"]["items"]["items"]["required"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            normalized["$defs"]["entry"]["required"],
+            serde_json::json!(["value"])
+        );
+    }
+
+    #[test]
+    fn test_normalize_json_schema_defaults_invalid_root() {
+        let normalized = normalize_json_schema(serde_json::Value::Null);
+
+        assert_eq!(
+            normalized,
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": true
+            })
+        );
     }
 
     #[test]
     fn test_tool_name_mapping_in_history() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
 
         let mut schema = std::collections::HashMap::new();
         schema.insert("type".to_string(), serde_json::json!("object"));
@@ -1706,9 +1934,15 @@ mod tests {
 
         let content = &result.assistant_response_message.content;
         assert!(content.contains("<thinking>"), "应包含 thinking 标签");
-        assert!(content.contains("Let me read that file"), "应包含第二条消息的 text 内容");
+        assert!(
+            content.contains("Let me read that file"),
+            "应包含第二条消息的 text 内容"
+        );
 
-        let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
+        let tool_uses = result
+            .assistant_response_message
+            .tool_uses
+            .expect("应有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
     }
@@ -1758,7 +1992,11 @@ mod tests {
         };
 
         let result = convert_request(&req);
-        assert!(result.is_ok(), "连续 assistant 消息场景不应报错: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "连续 assistant 消息场景不应报错: {:?}",
+            result.err()
+        );
 
         let state = result.unwrap().conversation_state;
         let mut found_tool_use = false;
@@ -1773,5 +2011,243 @@ mod tests {
             }
         }
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
+    }
+
+    #[test]
+    fn test_consecutive_user_tool_results_and_text_are_not_merged() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("start"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "toolu_01", "name": "web_search", "input": {"query": "a"}},
+                        {"type": "tool_use", "id": "toolu_02", "name": "web_fetch", "input": {"url": "https://example.com"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "toolu_01", "content": "result a"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "toolu_02", "content": "result b"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("please summarize"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("summary"),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("continue"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: Some(vec![
+                AnthropicTool {
+                    name: "web_search".to_string(),
+                    description: "search".to_string(),
+                    input_schema: std::collections::HashMap::from([
+                        ("type".to_string(), serde_json::json!("object")),
+                        ("properties".to_string(), serde_json::json!({})),
+                    ]),
+                    tool_type: None,
+                    max_uses: None,
+                },
+                AnthropicTool {
+                    name: "web_fetch".to_string(),
+                    description: "fetch".to_string(),
+                    input_schema: std::collections::HashMap::from([
+                        ("type".to_string(), serde_json::json!("object")),
+                        ("properties".to_string(), serde_json::json!({})),
+                    ]),
+                    tool_type: None,
+                    max_uses: None,
+                },
+            ]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("转换应成功");
+        let history = result.conversation_state.history;
+
+        let mixed_messages: Vec<_> = history
+            .iter()
+            .filter_map(|msg| match msg {
+                Message::User(user_msg) => {
+                    let content = &user_msg.user_input_message.content;
+                    let tool_results = &user_msg.user_input_message.user_input_message_context.tool_results;
+                    if !content.is_empty() && !tool_results.is_empty() {
+                        Some((content.clone(), tool_results.len()))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            mixed_messages.is_empty(),
+            "历史 user 消息不应同时包含文本和 tool_results: {:?}",
+            mixed_messages
+        );
+
+        let tool_result_only_count = history
+            .iter()
+            .filter_map(|msg| match msg {
+                Message::User(user_msg)
+                    if user_msg.user_input_message.content.is_empty()
+                        && !user_msg
+                            .user_input_message
+                            .user_input_message_context
+                            .tool_results
+                            .is_empty() =>
+                {
+                    Some(())
+                }
+                _ => None,
+            })
+            .count();
+
+        assert_eq!(
+            tool_result_only_count, 2,
+            "两个 tool_result 应保持为两条独立 user 消息"
+        );
+    }
+
+    #[test]
+    fn test_trailing_tool_results_are_merged_into_current_message() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("start"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "toolu_01", "name": "web_search", "input": {"query": "a"}},
+                        {"type": "tool_use", "id": "toolu_02", "name": "web_fetch", "input": {"url": "https://example.com"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "toolu_01", "content": "result a"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "toolu_02", "content": "result b"}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("转换应成功");
+        let state = result.conversation_state;
+
+        assert_eq!(state.history.len(), 2, "末尾 tool_result 不应残留在 history");
+
+        let current_tool_results = &state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+        assert_eq!(
+            current_tool_results.len(),
+            2,
+            "末尾连续 tool_result 应合并到同一个 currentMessage"
+        );
+    }
+
+    #[test]
+    fn test_trailing_tool_results_and_text_are_merged_into_current_message() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("start"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "toolu_01", "name": "web_search", "input": {"query": "a"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "toolu_01", "content": "result a"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("please summarize"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("转换应成功");
+        let state = result.conversation_state;
+
+        assert_eq!(state.history.len(), 2, "末尾 user 当前轮不应被拆进 history");
+        assert_eq!(
+            state.current_message.user_input_message.content,
+            "please summarize",
+            "当前消息应保留末尾文本"
+        );
+        assert_eq!(
+            state.current_message
+                .user_input_message
+                .user_input_message_context
+                .tool_results
+                .len(),
+            1,
+            "当前消息应携带末尾 tool_result"
+        );
     }
 }

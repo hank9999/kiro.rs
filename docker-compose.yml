@@ -1,9 +1,39 @@
 services:
+  goproxy:
+    image: ghcr.io/isboyjc/goproxy:latest
+    pull_policy: always
+    container_name: goproxy
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7777:7777"
+      - "127.0.0.1:7776:7776"
+      - "127.0.0.1:7778:7778"
+      - "127.0.0.1:7780:7780"
+    expose:
+      - "7777"
+      - "7779"
+    volumes:
+      - ./goproxy-data:/app/data
+    environment:
+      - TZ=Etc/UTC
+      - DATA_DIR=/app/data
+      - WEBUI_PASSWORD=goproxy-kiro-20260405
+      - PROXY_AUTH_ENABLED=false
+      - BLOCKED_COUNTRIES=CN,RU
+      - CUSTOM_PROXY_MODE=free_only
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:7778/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
   kiro-rs:
-    # 使用国内镜像
-    # image: ghcr.nju.edu.cn/${IMAGE_OWNER:-hank9999}/kiro-rs:${IMAGE_TAG:-latest}
-    image: ghcr.io/${IMAGE_OWNER:-hank9999}/kiro-rs:${IMAGE_TAG:-latest}
+    image: ghcr.io/siyuan-123/kiro-rs:beta
+    pull_policy: always
     container_name: kiro-rs
+    depends_on:
+      goproxy:
+        condition: service_healthy
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:

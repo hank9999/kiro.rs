@@ -5,5 +5,20 @@
   "tlsBackend": "rustls",
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
-  "defaultEndpoint": "ide"
+  "defaultEndpoint": "ide",
+  "proxyUrl": null,
+  "proxyPool": {
+    "enabled": false,
+    "strategy": "round-robin",
+    "template": {
+      "protocol": "socks5h",
+      "host": "dc.decodo.com",
+      "portStart": 10001,
+      "portEnd": 10010
+    },
+    "username": "user-sp3g0lqd2k-country-sg",
+    "password": "j_m47rkbJ7RnaZS5az",
+    "testUrl": "https://ip.decodo.com/json",
+    "cooldownSecs": 30
+  }
 }
