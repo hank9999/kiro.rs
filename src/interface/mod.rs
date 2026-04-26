@@ -2,4 +2,5 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod cli;
 pub mod http;

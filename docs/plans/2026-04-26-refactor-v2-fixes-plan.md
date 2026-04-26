@@ -383,10 +383,11 @@
 
 #### Phase C 检查点
 
-- [ ] `cargo test` 全绿（含新增 ~5 个测试）
-- [ ] `wc -l src/interface/http/anthropic/handlers.rs` < 600（从 955 → ~300，已删 100 行模型 + 合并 ~120 行重复 + 重写错误映射 -50 行）
-- [ ] `cargo run -- --help` 与 master 一致
-- [ ] curl 冒烟：`/v1/messages`（Live） + `/cc/v1/messages`（Buffered）SSE 帧顺序与 master 字节级对齐
+- [x] `cargo test` 全绿（基线 334 → 344，新增 10 个：models ×3、post_messages 503 ×2 + share_503 + dispatch_distinct、cli ×3）
+- [ ] `wc -l src/interface/http/anthropic/handlers.rs` < 600（当前 802：模型抽出 -100、双 handler 合并 -150；剩余 `create_sse_stream` + `create_buffered_sse_stream` + `handle_non_stream_request` 总计 ~430 行，待 Phase D 把流处理迁移到 `delivery.rs` 后才能 < 600）
+- [x] `cargo run -- --help` 与 master 一致
+- [x] `cargo clippy --all-targets -- -D warnings` 通过
+- [ ] curl 冒烟：`/v1/messages`（Live） + `/cc/v1/messages`（Buffered）SSE 帧顺序与 master 字节级对齐（待人工执行）
 
 ---
 
@@ -720,7 +721,7 @@
 - [x] Plan approved
 - [x] Phase A 完成（2026-04-26）
 - [x] Phase B 完成（2026-04-26）
-- [ ] Phase C 完成
+- [x] Phase C 完成（2026-04-26，handlers.rs 实际行数受限于 Phase D 流处理迁移，已记录在检查点）
 - [ ] Phase D 完成
 - [ ] Phase E 完成
 - [ ] Phase F 完成

@@ -23,10 +23,12 @@ use uuid::Uuid;
 
 use crate::interface::http::error::kiro_error_response;
 use crate::service::conversation::converter::{ConversionError, convert_request};
+use crate::service::conversation::delivery::DeliveryMode;
 use crate::service::conversation::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use crate::service::conversation::websearch;
-use super::dto::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::dto::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, ModelsResponse, OutputConfig, Thinking};
 use super::middleware::AppState;
+use super::models::supported_models;
 
 /// 将 ProviderError 包装为 KiroError 后委托给统一的错误响应映射。
 fn map_provider_error(err: ProviderError) -> Response {
@@ -39,120 +41,55 @@ fn map_provider_error(err: ProviderError) -> Response {
 /// 返回可用的模型列表
 pub async fn get_models() -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
-
-    let models = vec![
-        Model {
-            id: "claude-opus-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-    ];
-
     Json(ModelsResponse {
         object: "list".to_string(),
-        data: models,
+        data: supported_models(),
     })
 }
 
 /// POST /v1/messages
 ///
-/// 创建消息（对话）
+/// 创建消息（对话）。流式分支走 [`DeliveryMode::Live`]：每收到上游 chunk 立即推 SSE。
 pub async fn post_messages(
+    state: State<AppState>,
+    payload: JsonExtractor<MessagesRequest>,
+) -> Response {
+    post_messages_impl(state, payload, DeliveryMode::Live).await
+}
+
+/// POST /cc/v1/messages
+///
+/// Claude Code 兼容端点。流式分支走 [`DeliveryMode::Buffered`]：等流结束后再发 message_start，
+/// 用 contextUsageEvent 计算的 input_tokens 替代估算值。
+pub async fn post_messages_cc(
+    state: State<AppState>,
+    payload: JsonExtractor<MessagesRequest>,
+) -> Response {
+    post_messages_impl(state, payload, DeliveryMode::Buffered).await
+}
+
+/// 共用的 `/v1/messages` 与 `/cc/v1/messages` 实现：
+/// 仅在流式分支按 [`DeliveryMode`] 选择 SSE 推送策略，其它逻辑（鉴权前置、
+/// websearch 短路、请求转换、token 估算、非流式路径）完全相同。
+async fn post_messages_impl(
     State(state): State<AppState>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    mode: DeliveryMode,
 ) -> Response {
+    let endpoint = match mode {
+        DeliveryMode::Live => "/v1/messages",
+        DeliveryMode::Buffered => "/cc/v1/messages",
+    };
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
         message_count = %payload.messages.len(),
-        "Received POST /v1/messages request"
+        endpoint = endpoint,
+        "Received POST {} request",
+        endpoint
     );
+
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_client {
         Some(p) => p.clone(),
@@ -249,14 +186,15 @@ pub async fn post_messages(
     let tool_name_map = conversion_result.tool_name_map;
 
     if payload.stream {
-        // 流式响应
-        handle_stream_request(
+        // 流式响应：根据 mode 选择 Live / Buffered 推送
+        handle_stream_request_unified(
             provider,
             &request_body,
             &payload.model,
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            mode,
         )
         .await
     } else {
@@ -266,14 +204,19 @@ pub async fn post_messages(
     }
 }
 
-/// 处理流式请求
-async fn handle_stream_request(
+/// 处理流式请求（Live / Buffered 二合一）
+///
+/// - [`DeliveryMode::Live`]：上游每个 chunk 立即推 SSE，使用 [`StreamContext`]。
+/// - [`DeliveryMode::Buffered`]：等流结束后再统一推 SSE，使用 [`BufferedStreamContext`]
+///   以便用 contextUsageEvent 修正 message_start 的 input_tokens。
+async fn handle_stream_request_unified(
     provider: std::sync::Arc<crate::service::KiroClient>,
     request_body: &str,
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    mode: DeliveryMode,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body, Some(model)).await {
@@ -281,16 +224,27 @@ async fn handle_stream_request(
         Err(e) => return map_provider_error(e),
     };
 
-    // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    match mode {
+        DeliveryMode::Live => {
+            let mut ctx =
+                StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+            let initial_events = ctx.generate_initial_events();
+            let stream = create_sse_stream(response, ctx, initial_events);
+            build_sse_response(stream)
+        }
+        DeliveryMode::Buffered => {
+            let ctx = BufferedStreamContext::new(model, input_tokens, thinking_enabled, tool_name_map);
+            let stream = create_buffered_sse_stream(response, ctx);
+            build_sse_response(stream)
+        }
+    }
+}
 
-    // 生成初始事件
-    let initial_events = ctx.generate_initial_events();
-
-    // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events);
-
-    // 返回 SSE 响应
+/// 用 SSE 标准头封装一个字节流为 axum `Response`。
+fn build_sse_response<S>(stream: S) -> Response
+where
+    S: Stream<Item = Result<Bytes, Infallible>> + Send + 'static,
+{
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -649,170 +603,6 @@ pub async fn count_tokens(
     })
 }
 
-/// POST /cc/v1/messages
-///
-/// Claude Code 兼容端点，与 /v1/messages 的区别在于：
-/// - 流式响应会等待 kiro 端返回 contextUsageEvent 后再发送 message_start
-/// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
-pub async fn post_messages_cc(
-    State(state): State<AppState>,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
-) -> Response {
-    tracing::info!(
-        model = %payload.model,
-        max_tokens = %payload.max_tokens,
-        stream = %payload.stream,
-        message_count = %payload.messages.len(),
-        "Received POST /cc/v1/messages request"
-    );
-
-    // 检查 KiroProvider 是否可用
-    let provider = match &state.kiro_client {
-        Some(p) => p.clone(),
-        None => {
-            tracing::error!("KiroProvider 未配置");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse::new(
-                    "service_unavailable",
-                    "Kiro API provider not configured",
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
-
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
-        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        )
-        .await as i32;
-
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
-    }
-
-    // 转换请求
-    let conversion_result = match convert_request(&payload) {
-        Ok(result) => result,
-        Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-            };
-            tracing::warn!("请求转换失败: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
-        }
-    };
-
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
-    let kiro_request = KiroRequest {
-        conversation_state: conversion_result.conversation_state,
-        profile_arn: None,
-    };
-
-    let request_body = match serde_json::to_string(&kiro_request) {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "internal_error",
-                    format!("序列化请求失败: {}", e),
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    tracing::debug!("Kiro request body: {}", request_body);
-
-    // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(
-        payload.system,
-        payload.messages,
-        payload.tools,
-    )
-    .await as i32;
-
-    // 检查是否启用了thinking
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
-
-    let tool_name_map = conversion_result.tool_name_map;
-
-    if payload.stream {
-        // 流式响应（缓冲模式）
-        handle_stream_request_buffered(
-            provider,
-            &request_body,
-            &payload.model,
-            input_tokens,
-            thinking_enabled,
-            tool_name_map,
-        )
-        .await
-    } else {
-        // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
-    }
-}
-
-/// 处理流式请求（缓冲版本）
-///
-/// 与 `handle_stream_request` 不同，此函数会缓冲所有事件直到流结束，
-/// 然后用从 contextUsageEvent 计算的正确 input_tokens 生成 message_start 事件。
-async fn handle_stream_request_buffered(
-    provider: std::sync::Arc<crate::service::KiroClient>,
-    request_body: &str,
-    model: &str,
-    estimated_input_tokens: i32,
-    thinking_enabled: bool,
-    tool_name_map: std::collections::HashMap<String, String>,
-) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body, Some(model)).await {
-        Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
-    };
-
-    // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
-
-    // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx);
-
-    // 返回 SSE 响应
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
-}
-
 /// 创建缓冲 SSE 事件流
 ///
 /// 工作流程：
@@ -950,5 +740,63 @@ mod tests {
         let (status, json) = body_json(resp).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(json["error"]["type"], "api_error");
+    }
+
+    fn empty_request() -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-opus-4-6".into(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    /// 当 KiroClient 未配置时 `/v1/messages` 必须返回 503，且 body 携带
+    /// `service_unavailable` 错误类型。
+    #[tokio::test]
+    async fn post_messages_returns_503_when_kiro_client_missing() {
+        let state = AppState::new("test-key", false);
+        let resp = post_messages(State(state), JsonExtractor(empty_request())).await;
+        let (status, json) = body_json(resp).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["error"]["type"], "service_unavailable");
+    }
+
+    /// `/cc/v1/messages` 必须复用 `/v1/messages` 的 503 错误路径——证明
+    /// 双 handler 已收敛到同一 `post_messages_impl`，没有出现行为漂移。
+    #[tokio::test]
+    async fn post_messages_cc_returns_503_when_kiro_client_missing() {
+        let state = AppState::new("test-key", false);
+        let resp = post_messages_cc(State(state), JsonExtractor(empty_request())).await;
+        let (status, json) = body_json(resp).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["error"]["type"], "service_unavailable");
+    }
+
+    /// `/v1/messages` 与 `/cc/v1/messages` 共享 503 响应：状态码与错误 body
+    /// 完全一致——双 handler 合并未引入分歧。
+    #[tokio::test]
+    async fn post_messages_and_cc_share_503_body_when_provider_missing() {
+        let state_a = AppState::new("test-key", false);
+        let state_b = AppState::new("test-key", false);
+        let (status_a, body_a) =
+            body_json(post_messages(State(state_a), JsonExtractor(empty_request())).await).await;
+        let (status_b, body_b) =
+            body_json(post_messages_cc(State(state_b), JsonExtractor(empty_request())).await).await;
+        assert_eq!(status_a, status_b);
+        assert_eq!(body_a, body_b);
+    }
+
+    /// 防护测试：DeliveryMode 必须保持 Live ≠ Buffered；当未来 PartialEq
+    /// 被去掉或两个 mode 被误并时此测试失败，提示同步更新 dispatch。
+    #[test]
+    fn delivery_mode_dispatch_is_distinct() {
+        assert_ne!(DeliveryMode::Live, DeliveryMode::Buffered);
     }
 }

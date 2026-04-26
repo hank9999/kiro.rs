@@ -20,6 +20,7 @@ use crate::infra::http::executor::RequestExecutor;
 use crate::infra::http::retry::DefaultRetryPolicy;
 use crate::infra::machine_id::MachineIdResolver;
 use crate::infra::storage::{BalanceCacheStore, CredentialsFileStore, StatsFileStore};
+use crate::interface::cli::Args;
 use crate::interface::http::admin as http_admin;
 use crate::interface::http::anthropic as http_anthropic;
 use crate::interface::http::ui as http_ui;
@@ -30,19 +31,6 @@ use crate::service::credential_pool::{
 use crate::service::KiroClient;
 
 const DEFAULT_CREDENTIALS_PATH: &str = "credentials.json";
-
-/// Anthropic <-> Kiro API 客户端
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
-    /// 配置文件路径
-    #[arg(short, long)]
-    config: Option<String>,
-
-    /// 凭证文件路径
-    #[arg(long)]
-    credentials: Option<String>,
-}
 
 #[tokio::main]
 async fn main() {
