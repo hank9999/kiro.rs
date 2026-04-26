@@ -12,6 +12,15 @@ pub const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 单请求总重试次数上限
 pub const MAX_TOTAL_RETRIES: usize = 9;
 
+/// 上游 400 + 该子串 → 上下文窗口已满（不应重试）。
+const KIRO_BODY_CONTEXT_FULL: &str = "CONTENT_LENGTH_EXCEEDS_THRESHOLD";
+/// 上游 400 + 该子串 → 单次输入过长（不应重试）。
+const KIRO_BODY_INPUT_TOO_LONG: &str = "Input is too long";
+/// 上游 402 + 该子串 → 月度配额耗尽（永久禁用凭据）。
+const KIRO_BODY_QUOTA_EXCEEDED: &str = "MONTHLY_REQUEST_COUNT";
+/// 上游 401/403 + 该子串 → bearer token 失效（强制 refresh）。
+const KIRO_BODY_BEARER_INVALID: &str = "The bearer token included in the request is invalid";
+
 /// 指数退避：200ms × 2^attempt，上限 2s，± 25% jitter
 pub fn next_backoff(attempt: usize) -> Duration {
     const BASE_MS: u64 = 200;
@@ -41,14 +50,12 @@ impl RetryPolicy for DefaultRetryPolicy {
         }
 
         // 402 + MONTHLY_REQUEST_COUNT → 永久禁用（QuotaExceeded）
-        if s == 402 && body.contains("MONTHLY_REQUEST_COUNT") {
+        if s == 402 && body.contains(KIRO_BODY_QUOTA_EXCEEDED) {
             return RetryDecision::DisableCredential(DisabledReason::QuotaExceeded);
         }
 
         // 401/403 + bearer token invalid → 强制刷新（每凭据仅一次）
-        if matches!(s, 401 | 403)
-            && body.contains("The bearer token included in the request is invalid")
-        {
+        if matches!(s, 401 | 403) && body.contains(KIRO_BODY_BEARER_INVALID) {
             return RetryDecision::ForceRefresh;
         }
 
@@ -62,6 +69,15 @@ impl RetryPolicy for DefaultRetryPolicy {
             return RetryDecision::Retry {
                 backoff: next_backoff(attempt),
             };
+        }
+
+        // 400 + 上下文窗口已满 → 结构化错误（接口层映射为 invalid_request_error）
+        if s == 400 && body.contains(KIRO_BODY_CONTEXT_FULL) {
+            return RetryDecision::Fail(ProviderError::ContextWindowFull);
+        }
+        // 400 + 输入过长 → 结构化错误（接口层映射为 invalid_request_error）
+        if s == 400 && body.contains(KIRO_BODY_INPUT_TOO_LONG) {
+            return RetryDecision::Fail(ProviderError::InputTooLong);
         }
 
         // 其他 4xx（含 400）→ 直接失败
@@ -173,6 +189,39 @@ mod tests {
                 RetryDecision::Fail(_) => {}
                 other => panic!("status {s} 应返回 Fail，得到 {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn decide_400_with_content_length_exceeds_threshold_is_fail_context_window_full() {
+        let body = r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#;
+        let d = policy().decide(StatusCode::BAD_REQUEST, body, 0);
+        assert!(
+            matches!(d, RetryDecision::Fail(ProviderError::ContextWindowFull)),
+            "期望 Fail(ContextWindowFull)，得到 {d:?}"
+        );
+    }
+
+    #[test]
+    fn decide_400_with_input_is_too_long_is_fail_input_too_long() {
+        let body = r#"{"message":"Input is too long for requested model"}"#;
+        let d = policy().decide(StatusCode::BAD_REQUEST, body, 0);
+        assert!(
+            matches!(d, RetryDecision::Fail(ProviderError::InputTooLong)),
+            "期望 Fail(InputTooLong)，得到 {d:?}"
+        );
+    }
+
+    #[test]
+    fn decide_400_other_keeps_upstream_http() {
+        let body = "some other 400 error";
+        let d = policy().decide(StatusCode::BAD_REQUEST, body, 0);
+        match d {
+            RetryDecision::Fail(ProviderError::UpstreamHttp { status, body: b }) => {
+                assert_eq!(status, 400);
+                assert_eq!(b, "some other 400 error");
+            }
+            other => panic!("期望 Fail(UpstreamHttp)，得到 {other:?}"),
         }
     }
 

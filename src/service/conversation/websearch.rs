@@ -16,6 +16,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::stream::SseEvent;
+use crate::domain::error::ProviderError;
 use crate::interface::http::anthropic::dto::{ErrorResponse, MessagesRequest};
 
 /// MCP 请求
@@ -522,25 +523,43 @@ pub async fn handle_websearch_request(
 async fn call_mcp_api(
     provider: &crate::service::KiroClient,
     request: &McpRequest,
-) -> anyhow::Result<McpResponse> {
-    let request_body = serde_json::to_string(request)?;
+) -> Result<McpResponse, ProviderError> {
+    let request_body = serde_json::to_string(request)
+        .map_err(|e| ProviderError::BadRequest(format!("MCP serialize: {e}")))?;
 
     tracing::debug!("MCP request: {}", request_body);
 
-    let response = provider.call_mcp(&request_body, None).await
-        .map_err(|e| anyhow::anyhow!("MCP request failed: {e}"))?;
+    let response = provider.call_mcp(&request_body, None).await?;
 
-    let body = response.text().await?;
+    // status: 0 是 plan 指定的 sentinel，表示"上游连接成功但读取 body 失败"——
+    // 这种情况下没有真正的 HTTP status，但需要复用 ProviderError::UpstreamHttp
+    // 以便经过统一的 kiro_error_response 映射为 502。
+    let body = response.text().await.map_err(|e| ProviderError::UpstreamHttp {
+        status: 0,
+        body: format!("MCP read body: {e}"),
+    })?;
     tracing::debug!("MCP response: {}", body);
 
-    let mcp_response: McpResponse = serde_json::from_str(&body)?;
+    parse_mcp_response_body(&body)
+}
+
+/// 解析 MCP 响应体；malformed / 业务错误统一映射为 ProviderError。
+fn parse_mcp_response_body(body: &str) -> Result<McpResponse, ProviderError> {
+    let mcp_response: McpResponse =
+        serde_json::from_str(body).map_err(|e| ProviderError::UpstreamHttp {
+            status: 200,
+            body: format!("MCP malformed: {e}"),
+        })?;
 
     if let Some(ref error) = mcp_response.error {
-        anyhow::bail!(
-            "MCP error: {} - {}",
-            error.code.unwrap_or(-1),
-            error.message.as_deref().unwrap_or("Unknown error")
-        );
+        return Err(ProviderError::UpstreamHttp {
+            status: 200,
+            body: format!(
+                "MCP error code={} msg={}",
+                error.code.unwrap_or(-1),
+                error.message.as_deref().unwrap_or("Unknown error")
+            ),
+        });
     }
 
     Ok(mcp_response)
@@ -732,6 +751,52 @@ mod tests {
         let results = results.unwrap();
         assert_eq!(results.results.len(), 1);
         assert_eq!(results.results[0].title, "Test");
+    }
+
+    #[test]
+    fn parse_mcp_response_body_returns_provider_error_when_malformed_json() {
+        let body = "this is not json";
+        let result = parse_mcp_response_body(body);
+        match result {
+            Err(ProviderError::UpstreamHttp { status, body }) => {
+                assert_eq!(status, 200);
+                assert!(body.contains("malformed"), "got body: {body}");
+            }
+            other => panic!("期望 Err(UpstreamHttp)，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_mcp_response_body_returns_provider_error_when_response_contains_mcp_error() {
+        let body = r#"{
+            "jsonrpc":"2.0",
+            "id":"test",
+            "error":{"code":-32600,"message":"Invalid Request"},
+            "result":null
+        }"#;
+        let result = parse_mcp_response_body(body);
+        match result {
+            Err(ProviderError::UpstreamHttp { status, body }) => {
+                assert_eq!(status, 200);
+                assert!(
+                    body.contains("-32600") && body.contains("Invalid Request"),
+                    "got body: {body}"
+                );
+            }
+            other => panic!("期望 Err(UpstreamHttp)，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_mcp_response_body_returns_ok_when_valid_response() {
+        let body = r#"{
+            "jsonrpc":"2.0",
+            "id":"test",
+            "error":null,
+            "result":{"content":[{"type":"text","text":"hello"}],"isError":false}
+        }"#;
+        let result = parse_mcp_response_body(body);
+        assert!(result.is_ok(), "期望 Ok，得到 {result:?}");
     }
 
     #[test]

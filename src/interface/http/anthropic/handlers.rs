@@ -2,8 +2,7 @@
 
 use std::convert::Infallible;
 
-use anyhow::Error;
-use crate::domain::error::ProviderError;
+use crate::domain::error::{KiroError, ProviderError};
 use crate::domain::event::Event;
 use crate::domain::request::kiro::KiroRequest;
 use crate::infra::parser::decoder::EventStreamDecoder;
@@ -22,66 +21,17 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
+use crate::interface::http::error::kiro_error_response;
 use crate::service::conversation::converter::{ConversionError, convert_request};
 use crate::service::conversation::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use crate::service::conversation::websearch;
 use super::dto::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::middleware::AppState;
 
-/// 将新 ProviderError 映射为 HTTP 响应
+/// 将 ProviderError 包装为 KiroError 后委托给统一的错误响应映射。
 fn map_provider_error(err: ProviderError) -> Response {
-    map_provider_error_inner(&err.to_string())
-}
-
-/// 内部错误字符串映射（保留 anyhow 兼容路径供 websearch 等仍走 anyhow 的旁路使用）
-fn map_provider_error_anyhow(err: Error) -> Response {
-    map_provider_error_inner(&err.to_string())
-}
-
-/// 旧接口已重命名；保留作为字符串映射核心
-fn map_provider_error_inner(err_str: &str) -> Response {
-    let err = anyhow::anyhow!(err_str.to_string());
-    map_provider_error_legacy(err)
-}
-
-#[allow(dead_code)]
-fn map_provider_error_legacy(err: Error) -> Response {
-    let err_str = err.to_string();
-
-    // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
-    if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
-        tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Context window is full. Reduce conversation history, system prompt, or tools.",
-            )),
-        )
-            .into_response();
-    }
-
-    // 单次输入太长（请求体本身超出上游限制）
-    if err_str.contains("Input is too long") {
-        tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Input is too long. Reduce the size of your messages.",
-            )),
-        )
-            .into_response();
-    }
-    tracing::error!("Kiro API 调用失败: {}", err);
-    (
-        StatusCode::BAD_GATEWAY,
-        Json(ErrorResponse::new(
-            "api_error",
-            format!("上游 API 调用失败: {}", err),
-        )),
-    )
-        .into_response()
+    let kiro: KiroError = err.into();
+    kiro_error_response(&kiro)
 }
 
 /// GET /v1/models
@@ -952,4 +902,53 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use serde_json::Value;
+
+    async fn body_json(resp: Response) -> (StatusCode, Value) {
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn map_provider_error_returns_400_for_context_window_full() {
+        let resp = map_provider_error(ProviderError::ContextWindowFull);
+        let (status, json) = body_json(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn map_provider_error_returns_400_for_input_too_long() {
+        let resp = map_provider_error(ProviderError::InputTooLong);
+        let (status, json) = body_json(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn map_provider_error_returns_503_for_endpoint_resolution() {
+        let resp = map_provider_error(ProviderError::EndpointResolution("ide endpoint missing".into()));
+        let (status, json) = body_json(resp).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["error"]["type"], "api_error");
+    }
+
+    #[tokio::test]
+    async fn map_provider_error_returns_502_for_upstream_http() {
+        let resp = map_provider_error(ProviderError::UpstreamHttp {
+            status: 503,
+            body: "upstream is down".into(),
+        });
+        let (status, json) = body_json(resp).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(json["error"]["type"], "api_error");
+    }
 }
