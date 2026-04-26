@@ -32,11 +32,12 @@ use crate::infra::http::client::{ProxyConfig, build_client};
 use crate::infra::machine_id::MachineIdResolver;
 use crate::infra::refresher::{ApiKeyRefresher, IdcRefresher, SocialRefresher};
 use crate::infra::selector::{BalancedSelector, PrioritySelector};
-use crate::infra::storage::{StatsEntry, StatsFileStore};
+use crate::infra::storage::StatsFileStore;
 
 use super::admin::{AdminEntrySnapshot, AdminPoolError, AdminSnapshot};
 use super::state::{CredentialState, EntryState};
 use super::stats::{CredentialStats, EntryStats};
+use super::stats_persister::StatsPersister;
 use super::store::CredentialStore;
 
 pub const MODE_PRIORITY: &str = "priority";
@@ -55,7 +56,7 @@ pub struct CredentialPool {
     store: Arc<CredentialStore>,
     state: Arc<CredentialState>,
     stats: Arc<CredentialStats>,
-    stats_store: Option<Arc<StatsFileStore>>,
+    stats_persister: Option<Arc<StatsPersister>>,
     config: Arc<Config>,
     resolver: Arc<MachineIdResolver>,
     refresher_social: Arc<dyn DynTokenSource>,
@@ -111,11 +112,13 @@ impl CredentialPool {
         refresher_api_key: Arc<dyn DynTokenSource>,
     ) -> Self {
         let mode = config.features.load_balancing_mode.clone();
+        let stats_persister = stats_store
+            .map(|store| Arc::new(StatsPersister::new(stats.clone(), store)));
         Self {
             store,
             state,
             stats,
-            stats_store,
+            stats_persister,
             config,
             resolver,
             refresher_social,
@@ -171,8 +174,9 @@ impl CredentialPool {
 
     /// 切换负载均衡模式（仅接受 "priority" / "balanced"，其他保留旧值）
     ///
-    /// 内存生效后回写 config.json；持久化失败会回滚内存值。单次加锁完成"先读后写"，
-    /// 避免双 lock() 之间的竞争窗口。
+    /// 持锁完成"读 → 写 → 持久化 → 失败回滚"全过程，避免双 lock 期间的中间态泄漏。
+    /// 持锁期间会做磁盘 I/O（Config::load + Config::save），但 admin 写路径调用频率低，
+    /// 与 get_load_balancing_mode 的读冲突可忽略。
     pub fn set_load_balancing_mode(&self, mode: &str) -> Result<(), ProviderError> {
         let normalized = match mode {
             MODE_PRIORITY | MODE_BALANCED => mode.to_string(),
@@ -183,16 +187,14 @@ impl CredentialPool {
             }
         };
 
-        let previous = {
-            let mut guard = self.load_balancing_mode.lock();
-            if *guard == normalized {
-                return Ok(());
-            }
-            std::mem::replace(&mut *guard, normalized.clone())
-        };
+        let mut guard = self.load_balancing_mode.lock();
+        if *guard == normalized {
+            return Ok(());
+        }
+        let previous = std::mem::replace(&mut *guard, normalized.clone());
 
         if let Err(e) = self.persist_load_balancing_mode(&normalized) {
-            *self.load_balancing_mode.lock() = previous;
+            *guard = previous;
             return Err(ProviderError::BadRequest(format!(
                 "持久化负载均衡模式失败: {e}"
             )));
@@ -427,10 +429,23 @@ impl CredentialPool {
     }
 
     fn maybe_persist_stats(&self, _id: u64) {
-        // Phase 2: 简化为每次落盘（无 debounce）；Phase 7 接入完整 debounce
-        if let Some(store) = &self.stats_store {
-            let map: HashMap<u64, StatsEntry> = self.stats.to_storage_map();
-            let _ = store.save(&map);
+        if let Some(p) = &self.stats_persister {
+            p.record();
+        }
+    }
+
+    /// 同步立即落盘 stats（delete_credential / shutdown 用）；幂等。
+    pub fn flush_stats(&self) {
+        if let Some(p) = &self.stats_persister {
+            p.flush();
+        }
+    }
+
+    /// 仅测试用：调整 stats 持久化的去抖时长。
+    #[cfg(test)]
+    pub(crate) fn set_stats_debounce_for_test(&self, d: std::time::Duration) {
+        if let Some(p) = &self.stats_persister {
+            p.set_debounce(d);
         }
     }
 
@@ -639,7 +654,8 @@ impl CredentialPool {
                 Some(**id) != current
                     && !state_map.get(id).map(|s| s.disabled).unwrap_or(false)
             })
-            .min_by_key(|(_, c)| c.priority);
+            // priority 平局按 id 升序，结果稳定
+            .min_by_key(|(id, c)| (c.priority, **id));
 
         if let Some((next_id, cred)) = next {
             tracing::info!(
@@ -666,7 +682,8 @@ impl CredentialPool {
         let best = store_map
             .iter()
             .filter(|(id, _)| !state_map.get(id).map(|s| s.disabled).unwrap_or(false))
-            .min_by_key(|(_, c)| c.priority);
+            // priority 平局按 id 升序，结果稳定
+            .min_by_key(|(id, c)| (c.priority, **id));
 
         if let Some((new_id, cred)) = best {
             let mut current = self.current_id.lock();
@@ -777,9 +794,7 @@ impl CredentialPool {
         }
 
         // 立即落盘 stats，清除已删凭据残留
-        if let Some(store) = &self.stats_store {
-            let _ = store.save(&self.stats.to_storage_map());
-        }
+        self.flush_stats();
 
         tracing::info!("已删除凭据 #{}", id);
         Ok(())
@@ -1315,6 +1330,147 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    /// 构造带 stats_store 的 pool，用于测试 stats 持久化路径。
+    fn pool_with_stats_store(n: usize, mode: &str, stats_path: &std::path::Path) -> (CredentialPool, PathBuf) {
+        let creds_path = tmp_path("pool-with-stats");
+        let mut creds_json = Vec::new();
+        for i in 0..n {
+            creds_json.push(serde_json::json!({
+                "refreshToken": format!("rt-{i}"),
+                "accessToken": format!("at-{i}"),
+                "expiresAt": far_future_expires_at(),
+                "authMethod": "social",
+                "priority": i,
+            }));
+        }
+        let arr = serde_json::Value::Array(creds_json);
+        fs::write(&creds_path, serde_json::to_string_pretty(&arr).unwrap()).unwrap();
+
+        let file = Arc::new(CredentialsFileStore::new(Some(creds_path.clone())));
+        let mut config = Config::default();
+        config.features.load_balancing_mode = mode.to_string();
+        let config = Arc::new(config);
+        let resolver = Arc::new(MachineIdResolver::new());
+        let (store, _) = CredentialStore::load(file, config.clone(), resolver.clone()).unwrap();
+        let store = Arc::new(store);
+        let state = Arc::new(CredentialState::new());
+        let stats = Arc::new(CredentialStats::new());
+        let stats_file = Arc::new(StatsFileStore::new(Some(stats_path.to_path_buf())));
+        let pool = CredentialPool::new(
+            store,
+            state,
+            stats,
+            Some(stats_file),
+            config,
+            resolver,
+        );
+        let invalid: HashSet<u64> = HashSet::new();
+        let initial_disabled: HashSet<u64> = HashSet::new();
+        pool.install_initial_states(&invalid, &initial_disabled);
+        (pool, creds_path)
+    }
+
+    #[tokio::test]
+    async fn report_success_triggers_debounced_stats_persist() {
+        let stats_path = tmp_path("debounce-pool");
+        let (pool, creds_path) = pool_with_stats_store(1, MODE_PRIORITY, &stats_path);
+        pool.set_stats_debounce_for_test(std::time::Duration::from_millis(150));
+        let id = pool.store.ids()[0];
+
+        for _ in 0..5 {
+            pool.report_success(id);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert!(!stats_path.exists(), "debounce 内不应落盘");
+
+        tokio::time::sleep(std::time::Duration::from_millis(220)).await;
+        assert!(stats_path.exists(), "debounce 后定时器应触发落盘");
+
+        let _ = fs::remove_file(&creds_path);
+        let _ = fs::remove_file(&stats_path);
+    }
+
+    /// 构造 N 条凭据但 priority 全部相同，用来测试 tie-breaking 稳定性。
+    fn pool_with_tied_priorities(n: usize, mode: &str, priority: u32) -> (CredentialPool, PathBuf) {
+        let path = tmp_path("pool-tied");
+        let mut creds_json = Vec::new();
+        for i in 0..n {
+            creds_json.push(serde_json::json!({
+                "refreshToken": format!("rt-{i}"),
+                "accessToken": format!("at-{i}"),
+                "expiresAt": far_future_expires_at(),
+                "authMethod": "social",
+                "priority": priority,
+            }));
+        }
+        let arr = serde_json::Value::Array(creds_json);
+        fs::write(&path, serde_json::to_string_pretty(&arr).unwrap()).unwrap();
+
+        let file = Arc::new(CredentialsFileStore::new(Some(path.clone())));
+        let mut config = Config::default();
+        config.features.load_balancing_mode = mode.to_string();
+        let config = Arc::new(config);
+        let resolver = Arc::new(MachineIdResolver::new());
+        let (store, _) = CredentialStore::load(file, config.clone(), resolver.clone()).unwrap();
+        let store = Arc::new(store);
+        let state = Arc::new(CredentialState::new());
+        let stats = Arc::new(CredentialStats::new());
+        let pool = CredentialPool::new(store, state, stats, None, config, resolver);
+        let invalid: HashSet<u64> = HashSet::new();
+        let initial_disabled: HashSet<u64> = HashSet::new();
+        pool.install_initial_states(&invalid, &initial_disabled);
+        (pool, path)
+    }
+
+    #[tokio::test]
+    async fn priority_with_tied_priorities_consumes_in_id_order() {
+        let (pool, path) = pool_with_tied_priorities(3, MODE_PRIORITY, 0);
+
+        let id1 = pool.acquire(None).await.unwrap().id;
+        assert_eq!(id1, 1, "首次 acquire 应选最低 id（priority 平局时按 id 升序）");
+
+        pool.set_disabled(id1, true).unwrap();
+        let id2 = pool.acquire(None).await.unwrap().id;
+        assert_eq!(id2, 2, "禁用 id=1 后应选剩余最低 id=2");
+
+        pool.set_disabled(id2, true).unwrap();
+        let id3 = pool.acquire(None).await.unwrap().id;
+        assert_eq!(id3, 3, "禁用 id=2 后应选剩余最低 id=3");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn switch_to_next_picks_lowest_id_among_tied_priorities() {
+        let (pool, path) = pool_with_tied_priorities(3, MODE_PRIORITY, 0);
+        // 让 current_id 设为 id=1（acquire 触发 fast-path 后写入）
+        let _ = pool.acquire(None).await.unwrap();
+        // 禁用 current id=1，switch_to_next 应稳定切到 id=2 而非任意一个
+        pool.set_disabled(1, true).unwrap();
+        let switched = pool.switch_to_next();
+        assert!(switched);
+        let snap = pool.admin_snapshot();
+        assert_eq!(snap.current_id, 2, "tie 时 switch_to_next 应按 id 升序选择");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn flush_stats_persists_immediately_within_debounce_window() {
+        let stats_path = tmp_path("flush-pool");
+        let (pool, creds_path) = pool_with_stats_store(1, MODE_PRIORITY, &stats_path);
+        pool.set_stats_debounce_for_test(std::time::Duration::from_secs(60));
+        let id = pool.store.ids()[0];
+
+        pool.report_success(id);
+        assert!(!stats_path.exists(), "60s 内不应自动落盘");
+
+        pool.flush_stats();
+        assert!(stats_path.exists(), "flush_stats 应立即落盘");
+
+        let _ = fs::remove_file(&creds_path);
+        let _ = fs::remove_file(&stats_path);
+    }
+
     /// 构造一个含 N 条 social 凭据的 pool；每条都已带 access_token + 远期 expires_at。
     fn pool_with_n_credentials(n: usize, mode: &str) -> (CredentialPool, PathBuf) {
         let path = tmp_path("pool");
@@ -1504,6 +1660,95 @@ mod tests {
         // 失败时保留旧值
         assert_eq!(pool.get_load_balancing_mode(), "priority");
         let _ = fs::remove_file(&path);
+    }
+
+    /// 构造 pool，但 config_path 指向不存在的父目录，使 Config::save 总是失败。
+    fn pool_with_failing_persist() -> (CredentialPool, PathBuf) {
+        let creds_path = tmp_path("rollback-creds");
+        fs::write(&creds_path, "[]").unwrap();
+        let invalid_cfg_path = std::env::temp_dir()
+            .join(format!("kiro-rs-pool-rollback-{}/missing-dir/cfg.json", Uuid::new_v4()));
+        // Config::load：path 不存在但允许，返回默认 Config + config_path 设为该路径；
+        // 之后 Config::save 在不存在的父目录上调 fs::write 必然失败
+        let mut config = Config::load(&invalid_cfg_path).unwrap();
+        config.features.load_balancing_mode = MODE_PRIORITY.to_string();
+        let config = Arc::new(config);
+
+        let file = Arc::new(CredentialsFileStore::new(Some(creds_path.clone())));
+        let resolver = Arc::new(MachineIdResolver::new());
+        let (store, _) = CredentialStore::load(file, config.clone(), resolver.clone()).unwrap();
+        let store = Arc::new(store);
+        let state = Arc::new(CredentialState::new());
+        let stats = Arc::new(CredentialStats::new());
+        let pool = CredentialPool::new(store, state, stats, None, config, resolver);
+        let invalid: HashSet<u64> = HashSet::new();
+        let initial_disabled: HashSet<u64> = HashSet::new();
+        pool.install_initial_states(&invalid, &initial_disabled);
+        (pool, creds_path)
+    }
+
+    #[test]
+    fn set_load_balancing_mode_rollback_preserves_previous_when_persist_fails() {
+        let (pool, creds_path) = pool_with_failing_persist();
+        assert_eq!(pool.get_load_balancing_mode(), MODE_PRIORITY);
+
+        // persist 必失败 → 应回滚到 priority
+        let err = pool.set_load_balancing_mode(MODE_BALANCED).unwrap_err();
+        assert!(matches!(err, ProviderError::BadRequest(_)));
+        assert_eq!(
+            pool.get_load_balancing_mode(),
+            MODE_PRIORITY,
+            "持久化失败后应回滚到原值"
+        );
+
+        // 重复多次仍稳定
+        for _ in 0..50 {
+            let _ = pool.set_load_balancing_mode(MODE_BALANCED);
+            assert_eq!(pool.get_load_balancing_mode(), MODE_PRIORITY);
+        }
+
+        let _ = fs::remove_file(&creds_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn set_load_balancing_mode_concurrent_readers_never_observe_intermediate() {
+        let (pool, creds_path) = pool_with_failing_persist();
+        let pool = Arc::new(pool);
+        let initial = pool.get_load_balancing_mode();
+
+        let setters: Vec<_> = (0..16)
+            .map(|_| {
+                let p = pool.clone();
+                tokio::spawn(async move {
+                    for _ in 0..20 {
+                        let _ = p.set_load_balancing_mode(MODE_BALANCED);
+                    }
+                })
+            })
+            .collect();
+
+        let getters: Vec<_> = (0..8)
+            .map(|_| {
+                let p = pool.clone();
+                let initial = initial.clone();
+                tokio::spawn(async move {
+                    for _ in 0..200 {
+                        let v = p.get_load_balancing_mode();
+                        assert_eq!(v, initial, "持锁回滚期间不应泄漏中间值");
+                    }
+                })
+            })
+            .collect();
+
+        for s in setters {
+            s.await.unwrap();
+        }
+        for g in getters {
+            g.await.unwrap();
+        }
+
+        assert_eq!(pool.get_load_balancing_mode(), initial);
+        let _ = fs::remove_file(&creds_path);
     }
 
     #[test]

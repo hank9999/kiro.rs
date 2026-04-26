@@ -8,6 +8,7 @@ pub mod admin;
 pub mod pool;
 pub mod state;
 pub mod stats;
+pub mod stats_persister;
 pub mod store;
 
 pub use admin::AdminPoolError;

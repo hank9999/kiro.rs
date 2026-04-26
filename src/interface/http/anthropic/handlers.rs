@@ -220,7 +220,7 @@ async fn handle_stream_request_unified(
     mode: DeliveryMode,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body, Some(model)).await {
+    let response = match provider.call_api(request_body, Some(model)).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };

@@ -39,26 +39,8 @@ impl KiroClient {
         self.endpoints.clone()
     }
 
-    /// 非流式 API
+    /// API 请求（流式与非流式共享：差异仅在 caller 是否缓冲响应）
     pub async fn call_api(
-        &self,
-        body: &str,
-        model: Option<&str>,
-    ) -> Result<reqwest::Response, ProviderError> {
-        self.executor
-            .execute(
-                EndpointKind::Api,
-                body,
-                model,
-                &self.pool,
-                &self.endpoints,
-                &*self.policy,
-            )
-            .await
-    }
-
-    /// 流式 API（与 call_api 共享 executor，差异仅在 caller 不缓冲响应）
-    pub async fn call_api_stream(
         &self,
         body: &str,
         model: Option<&str>,

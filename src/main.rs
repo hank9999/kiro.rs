@@ -236,7 +236,12 @@ async fn main() {
     // ====== 启动 HTTP ======
     let addr = format!("{}:{}", config.net.host, config.net.port);
     tracing::info!("启动 Anthropic API 端点: {}", addr);
-    tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
+    // 仅打印前 4 字符 + 长度，避免日志泄露半个 API Key
+    tracing::info!(
+        "API Key: {}***（长度 {}）",
+        &api_key[..api_key.len().min(4)],
+        api_key.len()
+    );
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");
@@ -260,5 +265,41 @@ async fn main() {
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let pool_for_shutdown = pool.clone();
+    // graceful shutdown：信号触发后等所有连接关闭再返回；用 timeout 兜底防止
+    // 长 SSE 连接卡住 flush_stats（30s 上限）
+    let serve = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+    match tokio::time::timeout(std::time::Duration::from_secs(30), serve).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!("HTTP 服务异常退出: {}", e),
+        Err(_) => tracing::warn!("graceful shutdown 超时 30s，强制退出（仍会 flush_stats）"),
+    }
+
+    // 进程退出前显式 flush stats，避免最后一窗口的统计因未到 30s debounce 丢失
+    pool_for_shutdown.flush_stats();
+    tracing::info!("stats 已落盘，进程退出");
+}
+
+async fn shutdown_signal() {
+    use tokio::signal;
+    let ctrl_c = async {
+        let _ = signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::info!("收到关停信号，准备 graceful shutdown");
 }

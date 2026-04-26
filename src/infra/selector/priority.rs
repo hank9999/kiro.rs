@@ -21,7 +21,8 @@ impl CredentialSelector for PrioritySelector {
         candidates
             .iter()
             .filter(|v| !needs_opus || v.credential.supports_opus())
-            .min_by_key(|v| v.credential.priority)
+            // priority 平局时按 id 升序，避免 HashMap 顺序导致候选不稳定
+            .min_by_key(|v| (v.credential.priority, v.id))
             .map(|v| v.id)
     }
 }
@@ -99,15 +100,25 @@ mod tests {
     }
 
     #[test]
-    fn select_returns_first_in_tie() {
+    fn select_with_tied_priorities_picks_lowest_id_regardless_of_input_order() {
         let selector = PrioritySelector::new();
-        let c1 = Credential { priority: 1, ..Default::default() };
-        let c2 = Credential { priority: 1, ..Default::default() };
+        let c = Credential { priority: 1, ..Default::default() };
         let s = enabled();
         let st = stats(0);
-        let candidates = vec![view(10, &c1, &s, &st), view(20, &c2, &s, &st)];
-        // min_by_key 平局返回最先出现的
-        assert_eq!(selector.select(&candidates, None), Some(10));
+
+        // 三种不同输入顺序，期望 id=10 始终被选（最低 id 优先）
+        let permutations = [
+            vec![view(10, &c, &s, &st), view(20, &c, &s, &st), view(30, &c, &s, &st)],
+            vec![view(30, &c, &s, &st), view(10, &c, &s, &st), view(20, &c, &s, &st)],
+            vec![view(20, &c, &s, &st), view(30, &c, &s, &st), view(10, &c, &s, &st)],
+        ];
+        for cands in permutations {
+            assert_eq!(
+                selector.select(&cands, None),
+                Some(10),
+                "priority 平局时应稳定选最低 id"
+            );
+        }
     }
 
     #[test]
