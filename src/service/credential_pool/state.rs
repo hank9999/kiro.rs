@@ -98,14 +98,17 @@ impl CredentialState {
         true
     }
 
-    /// 报告一次 refresh 失败；累计达到 MAX 时禁用
+    /// 报告一次 refresh 失败；累计达到 MAX 时禁用为 [`DisabledReason::TooManyRefreshFailures`]
+    ///
+    /// 与 [`Self::report_failure`]（API 失败 → `TooManyFailures`）区分；refresh 失败
+    /// 是确定性失败（refresh_token 服务故障 / 凭据无效），不参与自愈。
     pub fn report_refresh_failure(&self, id: u64) -> bool {
         let mut entries = self.entries.lock();
         let entry = entries.entry(id).or_default();
         entry.refresh_failure_count = entry.refresh_failure_count.saturating_add(1);
         if entry.refresh_failure_count >= MAX_FAILURES_PER_CREDENTIAL && !entry.disabled {
             entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::TooManyFailures);
+            entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
         }
         entry.disabled
     }
@@ -121,12 +124,14 @@ impl CredentialState {
 
     /// 用户手动启用/禁用
     ///
-    /// 启用时清空 disabled_reason 与 failure_count；禁用时不指定具体 reason。
+    /// 禁用时设 `disabled_reason = Manual`；启用时清空 disabled_reason 与失败计数。
     pub fn set_disabled(&self, id: u64, disabled: bool) {
         let mut entries = self.entries.lock();
         let entry = entries.entry(id).or_default();
         entry.disabled = disabled;
-        if !disabled {
+        if disabled {
+            entry.disabled_reason = Some(DisabledReason::Manual);
+        } else {
             entry.disabled_reason = None;
             entry.failure_count = 0;
             entry.refresh_failure_count = 0;
@@ -286,5 +291,56 @@ mod tests {
         let healed = state.heal_too_many_failures();
         assert!(!healed);
         assert!(state.get(1).unwrap().disabled);
+    }
+
+    #[test]
+    fn set_disabled_true_assigns_manual_reason() {
+        let state = CredentialState::new();
+        ensure_entry(&state, 1);
+        state.set_disabled(1, true);
+        let s = state.get(1).unwrap();
+        assert!(s.disabled);
+        assert_eq!(s.disabled_reason, Some(DisabledReason::Manual));
+    }
+
+    #[test]
+    fn set_disabled_false_clears_manual_reason() {
+        let state = CredentialState::new();
+        ensure_entry(&state, 1);
+        state.set_disabled(1, true);
+        state.set_disabled(1, false);
+        let s = state.get(1).unwrap();
+        assert!(!s.disabled);
+        assert!(s.disabled_reason.is_none());
+    }
+
+    #[test]
+    fn report_refresh_failure_after_threshold_uses_too_many_refresh_failures() {
+        let state = CredentialState::new();
+        ensure_entry(&state, 1);
+        for _ in 0..3 {
+            state.report_refresh_failure(1);
+        }
+        let s = state.get(1).unwrap();
+        assert!(s.disabled);
+        assert_eq!(
+            s.disabled_reason,
+            Some(DisabledReason::TooManyRefreshFailures),
+            "refresh 失败应使用 TooManyRefreshFailures 区别于 API 失败"
+        );
+    }
+
+    #[test]
+    fn heal_too_many_failures_does_not_heal_too_many_refresh_failures() {
+        let state = CredentialState::new();
+        ensure_entry(&state, 1);
+        for _ in 0..3 {
+            state.report_refresh_failure(1);
+        }
+        let healed = state.heal_too_many_failures();
+        assert!(!healed, "TooManyRefreshFailures 不参与自愈");
+        let s = state.get(1).unwrap();
+        assert!(s.disabled);
+        assert_eq!(s.disabled_reason, Some(DisabledReason::TooManyRefreshFailures));
     }
 }

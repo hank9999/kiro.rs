@@ -26,7 +26,7 @@ use crate::domain::retry::DisabledReason;
 use crate::domain::selector::{
     CredentialSelector, CredentialStateView, CredentialStatsView, CredentialView,
 };
-use crate::domain::token::TokenSource;
+use crate::domain::token::DynTokenSource;
 use crate::domain::usage::UsageLimitsResponse;
 use crate::infra::http::client::{ProxyConfig, build_client};
 use crate::infra::machine_id::MachineIdResolver;
@@ -58,11 +58,13 @@ pub struct CredentialPool {
     stats_store: Option<Arc<StatsFileStore>>,
     config: Arc<Config>,
     resolver: Arc<MachineIdResolver>,
-    refresher_social: Arc<SocialRefresher>,
-    refresher_idc: Arc<IdcRefresher>,
-    refresher_api_key: Arc<ApiKeyRefresher>,
+    refresher_social: Arc<dyn DynTokenSource>,
+    refresher_idc: Arc<dyn DynTokenSource>,
+    refresher_api_key: Arc<dyn DynTokenSource>,
     load_balancing_mode: Mutex<String>,
     current_id: Mutex<Option<u64>>,
+    /// 按凭据 id 维护的 refresh 单点串行锁；avoid 同一凭据并发 refresh 浪费 refresh_token
+    refresh_locks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl CredentialPool {
@@ -77,10 +79,38 @@ impl CredentialPool {
         config: Arc<Config>,
         resolver: Arc<MachineIdResolver>,
     ) -> Self {
+        let refresher_social: Arc<dyn DynTokenSource> =
+            Arc::new(SocialRefresher::new(config.clone(), resolver.clone()));
+        let refresher_idc: Arc<dyn DynTokenSource> =
+            Arc::new(IdcRefresher::new(config.clone(), resolver.clone()));
+        let refresher_api_key: Arc<dyn DynTokenSource> = Arc::new(ApiKeyRefresher::new());
+        Self::new_with_refreshers(
+            store,
+            state,
+            stats,
+            stats_store,
+            config,
+            resolver,
+            refresher_social,
+            refresher_idc,
+            refresher_api_key,
+        )
+    }
+
+    /// 构造（注入 refresher）；测试可替换为 mock。
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_refreshers(
+        store: Arc<CredentialStore>,
+        state: Arc<CredentialState>,
+        stats: Arc<CredentialStats>,
+        stats_store: Option<Arc<StatsFileStore>>,
+        config: Arc<Config>,
+        resolver: Arc<MachineIdResolver>,
+        refresher_social: Arc<dyn DynTokenSource>,
+        refresher_idc: Arc<dyn DynTokenSource>,
+        refresher_api_key: Arc<dyn DynTokenSource>,
+    ) -> Self {
         let mode = config.features.load_balancing_mode.clone();
-        let refresher_social = Arc::new(SocialRefresher::new(config.clone(), resolver.clone()));
-        let refresher_idc = Arc::new(IdcRefresher::new(config.clone(), resolver.clone()));
-        let refresher_api_key = Arc::new(ApiKeyRefresher::new());
         Self {
             store,
             state,
@@ -93,7 +123,17 @@ impl CredentialPool {
             refresher_api_key,
             load_balancing_mode: Mutex::new(mode),
             current_id: Mutex::new(None),
+            refresh_locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// 取得（或惰性创建）指定 id 的 refresh 串行锁
+    fn refresh_guard_for(&self, id: u64) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.refresh_locks.lock();
+        locks
+            .entry(id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     pub fn store(&self) -> &CredentialStore {
@@ -311,6 +351,8 @@ impl CredentialPool {
     /// 准备 token：未过期直接用 access_token；过期则触发 refresh
     ///
     /// API Key 凭据走 ApiKeyRefresher passthrough。
+    /// 同一凭据的并发 refresh 通过 [`refresh_guard_for`] 串行化，
+    /// 持锁后二次检查 store 中的最新 token，避免重复刷新。
     async fn prepare_token(
         &self,
         id: u64,
@@ -322,30 +364,42 @@ impl CredentialPool {
         }
 
         if let Some(token) = cred.access_token.clone()
-            && !is_token_expired(cred) {
-                return Ok((token, cred.clone()));
-            }
+            && !is_token_expired(cred)
+        {
+            return Ok((token, cred.clone()));
+        }
+
+        // single-flight：同一 id 的并发 refresh 串行化
+        let guard = self.refresh_guard_for(id);
+        let _lock = guard.lock().await;
+
+        // 二次检查：拿到锁后重读 store，可能并发的前一个任务已刷新
+        let fresh = self.store.get(id).unwrap_or_else(|| cred.clone());
+        if let Some(token) = fresh.access_token.clone()
+            && !is_token_expired(&fresh)
+        {
+            return Ok((token, fresh));
+        }
 
         // 触发 refresh
-        let refresher_choice = pick_refresher_kind(cred);
+        let refresher_choice = pick_refresher_kind(&fresh);
         let outcome = match refresher_choice {
-            RefresherKind::Idc => self.refresher_idc.refresh(cred).await,
-            RefresherKind::Social => self.refresher_social.refresh(cred).await,
+            RefresherKind::Idc => self.refresher_idc.refresh(&fresh).await,
+            RefresherKind::Social => self.refresher_social.refresh(&fresh).await,
         }?;
 
-        // 写回 store
-        let mut updated = cred.clone();
-        updated.access_token = Some(outcome.access_token.clone());
-        if let Some(rt) = outcome.refresh_token {
-            updated.refresh_token = Some(rt);
+        // 写回 store；持久化失败仅 log，请求路径不因磁盘抖动失败
+        let mut updated = fresh;
+        updated.apply_refresh(&outcome);
+        match self.store.replace(id, updated.clone()) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(id, "刷新成功但凭据已被删除，token 仅本次请求有效");
+            }
+            Err(e) => {
+                tracing::error!(?e, id, "刷新成功但持久化失败，凭据已更新到内存");
+            }
         }
-        if let Some(arn) = outcome.profile_arn {
-            updated.profile_arn = Some(arn);
-        }
-        if let Some(ea) = outcome.expires_at {
-            updated.expires_at = Some(ea);
-        }
-        let _ = self.store.replace(id, updated.clone());
         Ok((outcome.access_token, updated))
     }
 
@@ -383,31 +437,50 @@ impl CredentialPool {
     /// 强制刷新 token：调对应的 refresher，更新 store 中的凭据
     ///
     /// API Key 凭据视为 no-op（无需刷新）；其他凭据按 auth_method 分发到 social / idc。
+    /// 与 [`prepare_token`] 共享 single-flight 锁，避免与并发 acquire 重复刷新。
+    ///
+    /// 调用语义：上游返回 401/403 触发，server 已吊销当前 token。即便 access_token 在
+    /// 客户端时钟上未过期，也必须刷新——除非二次检查发现 store 中的 token 值已被
+    /// 并发 refresh 替换（说明上一个并发任务已为我们刷新好），方可跳过。
     pub async fn force_refresh(&self, id: u64) -> Result<(), RefreshError> {
         let cred = self.store.get(id).ok_or(RefreshError::Unauthorized)?;
         if cred.is_api_key_credential() {
             return Ok(());
         }
-        let outcome = match pick_refresher_kind(&cred) {
-            RefresherKind::Idc => self.refresher_idc.refresh(&cred).await,
-            RefresherKind::Social => self.refresher_social.refresh(&cred).await,
+        let token_before = cred.access_token.clone();
+        let guard = self.refresh_guard_for(id);
+        let _lock = guard.lock().await;
+        // 二次检查：仅当 token 值相对入锁前发生变化（即并发 refresh 已成功写回）时才跳过；
+        // 否则即便未到期也必须刷新（caller 因 401/403 触发，token 已被服务端拒绝）
+        let fresh = self.store.get(id).unwrap_or(cred);
+        if fresh.access_token != token_before
+            && fresh.access_token.is_some()
+            && !is_token_expired(&fresh)
+        {
+            return Ok(());
+        }
+        let outcome = match pick_refresher_kind(&fresh) {
+            RefresherKind::Idc => self.refresher_idc.refresh(&fresh).await,
+            RefresherKind::Social => self.refresher_social.refresh(&fresh).await,
         }?;
-        let mut updated = cred;
-        updated.access_token = Some(outcome.access_token);
-        if let Some(rt) = outcome.refresh_token {
-            updated.refresh_token = Some(rt);
+        let mut updated = fresh;
+        updated.apply_refresh(&outcome);
+        match self.store.replace(id, updated) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(id, "刷新成功但凭据已被删除，token 仅本次请求有效");
+            }
+            Err(e) => {
+                tracing::error!(?e, id, "刷新成功但持久化失败，凭据已更新到内存");
+            }
         }
-        if let Some(arn) = outcome.profile_arn {
-            updated.profile_arn = Some(arn);
-        }
-        if let Some(ea) = outcome.expires_at {
-            updated.expires_at = Some(ea);
-        }
-        let _ = self.store.replace(id, updated);
         Ok(())
     }
 
     /// 装载阶段使用：把 store 的所有 id 在 state 里建一条空 EntryState；issues 中的 id 同时设 InvalidConfig
+    ///
+    /// priority 模式下完成后会立即把 current_id 选到最低 priority 的可用凭据，
+    /// 避免首请求前 current_id 为 None 导致 admin_snapshot 显示 0。
     pub fn install_initial_states(
         &self,
         invalid_config_ids: &HashSet<u64>,
@@ -427,6 +500,7 @@ impl CredentialPool {
             };
             self.state.upsert(id, entry);
         }
+        self.select_highest_priority();
     }
 
     /// 装载阶段使用：把 stats_store 加载的统计回填到 stats
@@ -663,16 +737,7 @@ impl CredentialPool {
                 RefresherKind::Idc => self.refresher_idc.refresh(&new_cred).await,
                 RefresherKind::Social => self.refresher_social.refresh(&new_cred).await,
             }?;
-            new_cred.access_token = Some(outcome.access_token);
-            if let Some(rt) = outcome.refresh_token {
-                new_cred.refresh_token = Some(rt);
-            }
-            if let Some(arn) = outcome.profile_arn {
-                new_cred.profile_arn = Some(arn);
-            }
-            if let Some(ea) = outcome.expires_at {
-                new_cred.expires_at = Some(ea);
-            }
+            new_cred.apply_refresh(&outcome);
         }
 
         // 4. 写入 store（自动分配 id + 持久化）
@@ -703,6 +768,8 @@ impl CredentialPool {
         let _ = self.store.remove(id)?;
         self.state.remove(id);
         self.stats.remove(id);
+        // 移除该 id 的 refresh 锁，避免重复禁用同 id 后内存泄漏
+        self.refresh_locks.lock().remove(&id);
 
         if was_current {
             *self.current_id.lock() = None;
@@ -719,26 +786,25 @@ impl CredentialPool {
     }
 
     /// 强制刷新指定凭据 token（不论是否过期）
+    ///
+    /// admin 显式触发，因此即便并发的 prepare_token 已刷新，也仍执行一次 refresh
+    /// 以满足"强制"语义；single-flight 锁仅用于串行化。
     pub async fn force_refresh_token_for(&self, id: u64) -> Result<(), AdminPoolError> {
         let cred = self.store.get(id).ok_or(AdminPoolError::NotFound(id))?;
         if cred.is_api_key_credential() {
             return Err(AdminPoolError::ApiKeyNotRefreshable);
         }
-        let outcome = match pick_refresher_kind(&cred) {
-            RefresherKind::Idc => self.refresher_idc.refresh(&cred).await,
-            RefresherKind::Social => self.refresher_social.refresh(&cred).await,
+        let guard = self.refresh_guard_for(id);
+        let _lock = guard.lock().await;
+        // 拿锁后重读，使用最新 refresh_token 发起 refresh
+        let fresh = self.store.get(id).unwrap_or(cred);
+        let outcome = match pick_refresher_kind(&fresh) {
+            RefresherKind::Idc => self.refresher_idc.refresh(&fresh).await,
+            RefresherKind::Social => self.refresher_social.refresh(&fresh).await,
         }?;
-        let mut updated = cred;
-        updated.access_token = Some(outcome.access_token);
-        if let Some(rt) = outcome.refresh_token {
-            updated.refresh_token = Some(rt);
-        }
-        if let Some(arn) = outcome.profile_arn {
-            updated.profile_arn = Some(arn);
-        }
-        if let Some(ea) = outcome.expires_at {
-            updated.expires_at = Some(ea);
-        }
+        let mut updated = fresh;
+        updated.apply_refresh(&outcome);
+        // admin 路径：持久化失败应反馈给调用方
         let _ = self.store.replace(id, updated)?;
         self.state.report_success(id);
         tracing::info!("凭据 #{} Token 已强制刷新", id);
@@ -765,6 +831,8 @@ impl CredentialPool {
     }
 
     /// admin 路径专用 prepare_token：API Key 直用；OAuth 必要时刷新并写回
+    ///
+    /// 与请求路径共享 single-flight 锁，避免 admin 操作与并发 acquire 重复刷新。
     async fn prepare_token_for_admin(
         &self,
         id: u64,
@@ -778,25 +846,33 @@ impl CredentialPool {
             return Ok((token, cred.clone()));
         }
         if let Some(token) = cred.access_token.clone()
-            && !is_token_expired(cred) {
-                return Ok((token, cred.clone()));
-            }
-        let outcome = match pick_refresher_kind(cred) {
-            RefresherKind::Idc => self.refresher_idc.refresh(cred).await,
-            RefresherKind::Social => self.refresher_social.refresh(cred).await,
+            && !is_token_expired(cred)
+        {
+            return Ok((token, cred.clone()));
+        }
+        let guard = self.refresh_guard_for(id);
+        let _lock = guard.lock().await;
+        let fresh = self.store.get(id).unwrap_or_else(|| cred.clone());
+        if let Some(token) = fresh.access_token.clone()
+            && !is_token_expired(&fresh)
+        {
+            return Ok((token, fresh));
+        }
+        let outcome = match pick_refresher_kind(&fresh) {
+            RefresherKind::Idc => self.refresher_idc.refresh(&fresh).await,
+            RefresherKind::Social => self.refresher_social.refresh(&fresh).await,
         }?;
-        let mut updated = cred.clone();
-        updated.access_token = Some(outcome.access_token.clone());
-        if let Some(rt) = outcome.refresh_token {
-            updated.refresh_token = Some(rt);
+        let mut updated = fresh;
+        updated.apply_refresh(&outcome);
+        match self.store.replace(id, updated.clone()) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(id, "刷新成功但凭据已被删除，token 仅本次请求有效");
+            }
+            Err(e) => {
+                tracing::error!(?e, id, "刷新成功但持久化失败，凭据已更新到内存");
+            }
         }
-        if let Some(arn) = outcome.profile_arn {
-            updated.profile_arn = Some(arn);
-        }
-        if let Some(ea) = outcome.expires_at {
-            updated.expires_at = Some(ea);
-        }
-        let _ = self.store.replace(id, updated.clone());
         Ok((outcome.access_token, updated))
     }
 
@@ -888,7 +964,9 @@ fn mask_api_key(key: &str) -> String {
 
 fn disabled_reason_to_str(reason: DisabledReason) -> &'static str {
     match reason {
+        DisabledReason::Manual => "Manual",
         DisabledReason::TooManyFailures => "TooManyFailures",
+        DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
         DisabledReason::QuotaExceeded => "QuotaExceeded",
         DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
         DisabledReason::InvalidConfig => "InvalidConfig",
@@ -975,9 +1053,11 @@ fn is_token_expired(cred: &Credential) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::token::{RefreshOutcome, TokenSource};
     use crate::infra::storage::CredentialsFileStore;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use uuid::Uuid;
 
     fn tmp_path(tag: &str) -> PathBuf {
@@ -987,6 +1067,252 @@ mod tests {
 
     fn far_future_expires_at() -> String {
         (Utc::now() + Duration::days(7)).to_rfc3339()
+    }
+
+    /// 测试用 refresher：计数自增；可设置 sleep 模拟延迟
+    #[derive(Debug)]
+    struct MockRefresher {
+        count: AtomicUsize,
+        delay_ms: u64,
+    }
+
+    impl MockRefresher {
+        fn new(delay_ms: u64) -> Self {
+            Self {
+                count: AtomicUsize::new(0),
+                delay_ms,
+            }
+        }
+        fn calls(&self) -> usize {
+            self.count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl TokenSource for MockRefresher {
+        async fn refresh(
+            &self,
+            _cred: &Credential,
+        ) -> Result<RefreshOutcome, crate::domain::error::RefreshError> {
+            // 计数在 sleep 之前递增：未受 single-flight 保护时双方都会推到 2，
+            // 测试断言 == 1 即可捕获锁失效（不依赖 sleep 串行化掩盖 bug）
+            let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            }
+            Ok(RefreshOutcome {
+                access_token: format!("mock-at-{n}"),
+                refresh_token: None,
+                profile_arn: None,
+                expires_at: Some(far_future_expires_at()),
+            })
+        }
+    }
+
+    /// 构造一个使用 mock refresher 的 pool（凭据无 access_token，强制走 refresh 路径）
+    fn pool_with_mock_refresher(
+        n: usize,
+        mode: &str,
+        mock: Arc<dyn DynTokenSource>,
+    ) -> (CredentialPool, PathBuf) {
+        let path = tmp_path("mock-pool");
+        let mut creds_json = Vec::new();
+        for i in 0..n {
+            creds_json.push(serde_json::json!({
+                "refreshToken": format!("rt-{i}"),
+                "authMethod": "social",
+                "priority": i,
+            }));
+        }
+        let arr = serde_json::Value::Array(creds_json);
+        fs::write(&path, serde_json::to_string_pretty(&arr).unwrap()).unwrap();
+
+        let file = Arc::new(CredentialsFileStore::new(Some(path.clone())));
+        let mut config = Config::default();
+        config.features.load_balancing_mode = mode.to_string();
+        let config = Arc::new(config);
+        let resolver = Arc::new(MachineIdResolver::new());
+        let (store, _) = CredentialStore::load(file, config.clone(), resolver.clone()).unwrap();
+        let store = Arc::new(store);
+        let state = Arc::new(CredentialState::new());
+        let stats = Arc::new(CredentialStats::new());
+        let pool = CredentialPool::new_with_refreshers(
+            store,
+            state,
+            stats,
+            None,
+            config,
+            resolver,
+            mock.clone(),
+            mock.clone(),
+            mock,
+        );
+        let invalid: HashSet<u64> = HashSet::new();
+        let initial_disabled: HashSet<u64> = HashSet::new();
+        pool.install_initial_states(&invalid, &initial_disabled);
+        (pool, path)
+    }
+
+    #[test]
+    fn refresh_guard_for_returns_same_arc_for_same_id() {
+        let (pool, path) = pool_with_n_credentials(1, MODE_PRIORITY);
+        let g1 = pool.refresh_guard_for(1);
+        let g2 = pool.refresh_guard_for(1);
+        assert!(Arc::ptr_eq(&g1, &g2));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn refresh_guard_for_returns_distinct_arc_for_distinct_ids() {
+        let (pool, path) = pool_with_n_credentials(2, MODE_PRIORITY);
+        let g1 = pool.refresh_guard_for(1);
+        let g2 = pool.refresh_guard_for(2);
+        assert!(!Arc::ptr_eq(&g1, &g2));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn prepare_token_serializes_concurrent_refresh_for_same_credential() {
+        let mock = Arc::new(MockRefresher::new(50));
+        let mock_dyn: Arc<dyn DynTokenSource> = mock.clone();
+        let (pool, path) = pool_with_mock_refresher(1, MODE_PRIORITY, mock_dyn);
+        let pool = Arc::new(pool);
+
+        let p1 = pool.clone();
+        let p2 = pool.clone();
+        let (r1, r2) = tokio::join!(p1.acquire(None), p2.acquire(None));
+        let ctx1 = r1.expect("acquire 1");
+        let ctx2 = r2.expect("acquire 2");
+
+        assert_eq!(
+            mock.calls(),
+            1,
+            "single-flight：同一凭据并发 acquire 仅刷新 1 次"
+        );
+        assert_eq!(ctx1.token, ctx2.token, "两个并发 acquire 应拿到同一 access_token");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn force_refresh_concurrent_calls_serialize_to_one_refresh() {
+        let mock = Arc::new(MockRefresher::new(50));
+        let mock_dyn: Arc<dyn DynTokenSource> = mock.clone();
+        let (pool, path) = pool_with_mock_refresher(1, MODE_PRIORITY, mock_dyn);
+        let pool = Arc::new(pool);
+
+        let p1 = pool.clone();
+        let p2 = pool.clone();
+        let (r1, r2) = tokio::join!(p1.force_refresh(1), p2.force_refresh(1));
+        r1.expect("force_refresh #1");
+        r2.expect("force_refresh #2");
+
+        assert_eq!(
+            mock.calls(),
+            1,
+            "并发 force_refresh 应通过 single-flight 串行化为单次刷新"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn force_refresh_revoked_but_clock_valid_token_still_refreshes() {
+        // server 已吊销 token（401/403 触发 force_refresh），但客户端时钟显示未过期：
+        // 必须刷新，否则会循环复用同一个被拒绝的 token
+        let mock = Arc::new(MockRefresher::new(0));
+        let mock_dyn: Arc<dyn DynTokenSource> = mock.clone();
+
+        let path = tmp_path("revoked-token");
+        let arr = serde_json::json!([{
+            "refreshToken": "rt-0",
+            "accessToken": "old-at",
+            "expiresAt": far_future_expires_at(),
+            "authMethod": "social",
+            "priority": 0,
+        }]);
+        fs::write(&path, serde_json::to_string_pretty(&arr).unwrap()).unwrap();
+
+        let file = Arc::new(CredentialsFileStore::new(Some(path.clone())));
+        let mut config = Config::default();
+        config.features.load_balancing_mode = MODE_PRIORITY.to_string();
+        let config = Arc::new(config);
+        let resolver = Arc::new(MachineIdResolver::new());
+        let (store, _) = CredentialStore::load(file, config.clone(), resolver.clone()).unwrap();
+        let store = Arc::new(store);
+        let state = Arc::new(CredentialState::new());
+        let stats = Arc::new(CredentialStats::new());
+        let pool = CredentialPool::new_with_refreshers(
+            store,
+            state,
+            stats,
+            None,
+            config,
+            resolver,
+            mock_dyn.clone(),
+            mock_dyn.clone(),
+            mock_dyn,
+        );
+        let invalid: HashSet<u64> = HashSet::new();
+        let initial_disabled: HashSet<u64> = HashSet::new();
+        pool.install_initial_states(&invalid, &initial_disabled);
+
+        pool.force_refresh(1).await.expect("force_refresh");
+        assert_eq!(
+            mock.calls(),
+            1,
+            "force_refresh 必须无视客户端时钟刷新一次（除非并发 refresh 已替换 token）"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn force_refresh_token_for_different_ids_runs_in_parallel() {
+        let mock = Arc::new(MockRefresher::new(80));
+        let mock_dyn: Arc<dyn DynTokenSource> = mock.clone();
+        let (pool, path) = pool_with_mock_refresher(2, MODE_BALANCED, mock_dyn);
+        let pool = Arc::new(pool);
+
+        let start = std::time::Instant::now();
+        let p1 = pool.clone();
+        let p2 = pool.clone();
+        let (r1, r2) = tokio::join!(
+            p1.force_refresh_token_for(1),
+            p2.force_refresh_token_for(2),
+        );
+        let elapsed = start.elapsed();
+        r1.expect("refresh id=1");
+        r2.expect("refresh id=2");
+
+        assert_eq!(mock.calls(), 2, "不同 id 各自独立 refresh");
+        assert!(
+            elapsed < std::time::Duration::from_millis(150),
+            "不同 id 应并行执行 (~80ms)，实际耗时 {elapsed:?}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn admin_snapshot_serializes_manual_reason() {
+        let (pool, path) = pool_with_n_credentials(1, MODE_PRIORITY);
+        let id = pool.store.ids()[0];
+        pool.set_disabled(id, true).unwrap();
+        let snap = pool.admin_snapshot();
+        let entry = snap.entries.iter().find(|e| e.id == id).expect("entry exists");
+        assert!(entry.disabled);
+        assert_eq!(entry.disabled_reason.as_deref(), Some("Manual"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn delete_credential_removes_refresh_lock_entry() {
+        let (pool, path) = pool_with_n_credentials(1, MODE_PRIORITY);
+        let id = pool.store.ids()[0];
+        // 触发懒创建
+        let _g = pool.refresh_guard_for(id);
+        assert!(pool.refresh_locks.lock().contains_key(&id));
+        // 必须先禁用才能删除
+        pool.set_disabled(id, true).unwrap();
+        pool.delete_credential(id).unwrap();
+        assert!(!pool.refresh_locks.lock().contains_key(&id));
+        let _ = fs::remove_file(&path);
     }
 
     /// 构造一个含 N 条 social 凭据的 pool；每条都已带 access_token + 远期 expires_at。
@@ -1027,6 +1353,50 @@ mod tests {
         let initial_disabled: HashSet<u64> = HashSet::new();
         pool.install_initial_states(&invalid, &initial_disabled);
         (pool, path)
+    }
+
+    #[test]
+    fn current_id_initialized_to_lowest_priority_after_install_initial_states() {
+        let (pool, path) = pool_with_n_credentials(3, MODE_PRIORITY);
+        // priority=0 凭据是 store.load 排序后的第一个，id=1
+        let snap = pool.admin_snapshot();
+        assert_eq!(snap.current_id, 1, "current_id 应在装载后初始化为最低 priority 的 id");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn current_id_zero_when_all_disabled_at_install() {
+        let path = tmp_path("all-disabled");
+        let arr = serde_json::json!([
+            {"refreshToken":"rt-0","accessToken":"at-0","expiresAt":far_future_expires_at(),"authMethod":"social","priority":0},
+            {"refreshToken":"rt-1","accessToken":"at-1","expiresAt":far_future_expires_at(),"authMethod":"social","priority":1},
+        ]);
+        fs::write(&path, serde_json::to_string_pretty(&arr).unwrap()).unwrap();
+        let file = Arc::new(crate::infra::storage::CredentialsFileStore::new(Some(path.clone())));
+        let mut config = Config::default();
+        config.features.load_balancing_mode = MODE_PRIORITY.to_string();
+        let config = Arc::new(config);
+        let resolver = Arc::new(MachineIdResolver::new());
+        let (store, _) = CredentialStore::load(file, config.clone(), resolver.clone()).unwrap();
+        let store = Arc::new(store);
+        let state = Arc::new(CredentialState::new());
+        let stats = Arc::new(CredentialStats::new());
+        let pool = CredentialPool::new(store, state, stats, None, config, resolver);
+        let invalid: HashSet<u64> = HashSet::new();
+        // 所有 id 初始即禁用
+        let initial_disabled: HashSet<u64> = pool.store.ids().into_iter().collect();
+        pool.install_initial_states(&invalid, &initial_disabled);
+        let snap = pool.admin_snapshot();
+        assert_eq!(snap.current_id, 0, "无可用凭据时 current_id 保持 0");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn current_id_zero_in_balanced_mode_after_install() {
+        let (pool, path) = pool_with_n_credentials(3, MODE_BALANCED);
+        let snap = pool.admin_snapshot();
+        assert_eq!(snap.current_id, 0, "balanced 模式不维护 current_id");
+        let _ = fs::remove_file(&path);
     }
 
     #[tokio::test]

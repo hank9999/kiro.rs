@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::domain::error::ConfigError;
+use crate::domain::token::RefreshOutcome;
 use crate::infra::http::client::ProxyConfig;
 
 /// Kiro 凭据
@@ -202,6 +203,23 @@ impl Credential {
                 .as_deref()
                 .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
                 .unwrap_or(false)
+    }
+
+    /// 把 [`RefreshOutcome`] 写回凭据。
+    ///
+    /// `access_token` 永远更新；其余字段仅在 outcome 中存在时覆盖
+    /// （`None` 表示上游未返回该字段，原值保留，避免误清 `profile_arn` 等）。
+    pub fn apply_refresh(&mut self, outcome: &RefreshOutcome) {
+        self.access_token = Some(outcome.access_token.clone());
+        if let Some(rt) = &outcome.refresh_token {
+            self.refresh_token = Some(rt.clone());
+        }
+        if let Some(arn) = &outcome.profile_arn {
+            self.profile_arn = Some(arn.clone());
+        }
+        if let Some(ea) = &outcome.expires_at {
+            self.expires_at = Some(ea.clone());
+        }
     }
 }
 
@@ -672,5 +690,63 @@ mod tests {
         let creds = Credential::default();
         let result = creds.effective_proxy(None);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn apply_refresh_overwrites_access_token_and_optional_fields() {
+        let mut cred = Credential::default();
+        let outcome = RefreshOutcome {
+            access_token: "new-at".to_string(),
+            refresh_token: Some("new-rt".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/Y".to_string()),
+            expires_at: Some("2030-01-01T00:00:00Z".to_string()),
+        };
+        cred.apply_refresh(&outcome);
+        assert_eq!(cred.access_token.as_deref(), Some("new-at"));
+        assert_eq!(cred.refresh_token.as_deref(), Some("new-rt"));
+        assert_eq!(
+            cred.profile_arn.as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/Y")
+        );
+        assert_eq!(cred.expires_at.as_deref(), Some("2030-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn apply_refresh_only_access_token_preserves_other_fields() {
+        let mut cred = Credential {
+            access_token: Some("old-at".to_string()),
+            refresh_token: Some("old-rt".to_string()),
+            profile_arn: Some("old-arn".to_string()),
+            expires_at: Some("old-exp".to_string()),
+            ..Default::default()
+        };
+        let outcome = RefreshOutcome {
+            access_token: "fresh-at".to_string(),
+            refresh_token: None,
+            profile_arn: None,
+            expires_at: None,
+        };
+        cred.apply_refresh(&outcome);
+        assert_eq!(cred.access_token.as_deref(), Some("fresh-at"));
+        assert_eq!(cred.refresh_token.as_deref(), Some("old-rt"));
+        assert_eq!(cred.profile_arn.as_deref(), Some("old-arn"));
+        assert_eq!(cred.expires_at.as_deref(), Some("old-exp"));
+    }
+
+    #[test]
+    fn apply_refresh_does_not_clear_existing_profile_arn_when_outcome_missing() {
+        let mut cred = Credential {
+            profile_arn: Some("kept-arn".to_string()),
+            ..Default::default()
+        };
+        let outcome = RefreshOutcome {
+            access_token: "at".to_string(),
+            refresh_token: Some("rt".to_string()),
+            profile_arn: None,
+            expires_at: Some("exp".to_string()),
+        };
+        cred.apply_refresh(&outcome);
+        assert_eq!(cred.profile_arn.as_deref(), Some("kept-arn"));
+        assert_eq!(cred.refresh_token.as_deref(), Some("rt"));
     }
 }

@@ -75,7 +75,18 @@ impl CredentialStore {
             file.save(&creds, true)?;
         }
 
-        // 4. 收集 ValidationIssue（api_key 凭据缺 kiroApiKey）
+        // 4. 拒绝重复 id（避免后续 HashMap 静默覆盖凭据，导致 refresh_token 丢失）
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for cred in &creds {
+            let id = cred.id.expect("已补齐 id");
+            if !seen.insert(id) {
+                return Err(ConfigError::Validation(format!(
+                    "credentials.json 含重复 id {id}：拒绝启动以避免凭据被静默覆盖"
+                )));
+            }
+        }
+
+        // 5. 收集 ValidationIssue（api_key 凭据缺 kiroApiKey）
         let mut issues = Vec::new();
         for cred in &creds {
             let id = cred.id.expect("已补齐 id");
@@ -355,6 +366,57 @@ mod tests {
         let removed = store.remove(id).unwrap();
         assert!(removed);
         assert_eq!(store.count(), 3);
+        let _ = fs::remove_file(&path);
+    }
+
+    fn try_load_from(content: &str, tag: &str) -> (Result<(CredentialStore, Vec<ValidationIssue>), ConfigError>, PathBuf) {
+        let path = tmp_path(tag);
+        fs::write(&path, content).unwrap();
+        let file = Arc::new(CredentialsFileStore::new(Some(path.clone())));
+        let config = Arc::new(Config::default());
+        let resolver = Arc::new(MachineIdResolver::new());
+        let res = CredentialStore::load(file, config, resolver);
+        (res, path)
+    }
+
+    #[test]
+    fn load_rejects_duplicate_ids() {
+        let json = r#"[
+            {"id":1,"refreshToken":"rt-a","authMethod":"social"},
+            {"id":1,"refreshToken":"rt-b","authMethod":"social"}
+        ]"#;
+        let (res, path) = try_load_from(json, "dup-id");
+        match res {
+            Err(ConfigError::Validation(msg)) => {
+                assert!(msg.contains("重复 id 1"), "expected message to contain 重复 id 1, got: {msg}");
+            }
+            Err(other) => panic!("expected ConfigError::Validation, got {other:?}"),
+            Ok(_) => panic!("expected ConfigError::Validation, got Ok"),
+        }
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_accepts_distinct_explicit_ids() {
+        let json = r#"[
+            {"id":1,"refreshToken":"rt-a","authMethod":"social"},
+            {"id":2,"refreshToken":"rt-b","authMethod":"social"}
+        ]"#;
+        let (res, path) = try_load_from(json, "distinct-ids");
+        let (store, _) = res.expect("distinct ids should load");
+        assert_eq!(store.count(), 2);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_accepts_all_missing_ids_auto_assign() {
+        let json = r#"[
+            {"refreshToken":"rt-a","authMethod":"social"},
+            {"refreshToken":"rt-b","authMethod":"social"}
+        ]"#;
+        let (res, path) = try_load_from(json, "auto-id");
+        let (store, _) = res.expect("auto-assigned ids should not be flagged duplicate");
+        assert_eq!(store.count(), 2);
         let _ = fs::remove_file(&path);
     }
 }
