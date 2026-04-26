@@ -7,7 +7,7 @@
 pub mod converter;
 pub mod delivery;
 pub mod reducer;
-pub mod stream;
 pub mod thinking;
 pub mod tokens;
+pub mod tools;
 pub mod websearch;

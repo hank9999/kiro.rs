@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
-use super::stream::SseEvent;
+use super::reducer::SseEvent;
 use crate::domain::error::ProviderError;
 use crate::interface::http::anthropic::dto::{ErrorResponse, MessagesRequest};
 

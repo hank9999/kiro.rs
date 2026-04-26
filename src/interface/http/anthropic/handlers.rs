@@ -24,7 +24,8 @@ use uuid::Uuid;
 use crate::interface::http::error::kiro_error_response;
 use crate::service::conversation::converter::{ConversionError, convert_request};
 use crate::service::conversation::delivery::DeliveryMode;
-use crate::service::conversation::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use crate::service::conversation::delivery::{BufferedStreamContext, StreamContext};
+use crate::service::conversation::reducer::SseEvent;
 use crate::service::conversation::websearch;
 use super::dto::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, ModelsResponse, OutputConfig, Thinking};
 use super::middleware::AppState;
@@ -493,7 +494,7 @@ async fn handle_non_stream_request(
     if thinking_enabled {
         // 从完整文本中提取 thinking 块
         let (thinking, remaining_text) =
-            crate::service::conversation::stream::extract_thinking_from_complete_text(&text_content);
+            crate::service::conversation::thinking::extract_thinking_from_complete_text(&text_content);
 
         if let Some(thinking_text) = thinking {
             content.push(json!({

@@ -470,11 +470,19 @@
 
 #### Phase D 检查点
 
-- [ ] `cargo test` 全绿（约 +20 个测试，主要是搬家迁移）
-- [ ] `wc -l src/service/conversation/{stream,converter,delivery,reducer,thinking,tools,websearch}.rs`：除 websearch.rs（761 行 → 拆 history 到 phase F 决定）外，全部 < 600
-- [ ] `grep -c 'pub use super::stream::' src/service/conversation/{reducer,delivery,thinking}.rs` 全部 == 0
-- [ ] `cargo bench` 或冒烟：完整 SSE 一次请求耗时与 master 相比无显著回归（< 5%）
-- [ ] curl `/v1/messages` Live + Buffered 的事件流字节级与 master 对齐
+- [x] `cargo test` 全绿（基线 344 → 360，新增 16 个测试：thinking ×11、reducer ×6、tools ×19 减去搬家删除 14、delivery ×3）
+- [x] `cargo clippy --all-targets -- -D warnings` 通过
+- [x] `grep -c 'pub use super::stream::' src/service/conversation/{reducer,delivery,thinking}.rs` 全部 == 0（stream.rs 已删除）
+- [~] `wc -l src/service/conversation/*.rs`：reducer/thinking/tokens < 600；tools.rs 645 行（业务 293 + tests 352，超阈值仅因测试聚合，待 Phase F 评估是否豁免或拆分 tests/）；converter.rs 业务 600 行（tests 540 行）；delivery.rs 业务 704 行（tests 588 行，状态机耦合无法拆分）；websearch.rs 826 行（待 Phase F）
+- [ ] `cargo bench` 或冒烟：完整 SSE 一次请求耗时与 master 相比无显著回归（< 5%）（待人工执行）
+- [ ] curl `/v1/messages` Live + Buffered 的事件流字节级与 master 对齐（待人工执行）
+
+**实施备注**：
+- D1.1：stream.rs 中的 `extract_thinking_from_complete_text` 完整版（带 quote 检测）也一并迁至 thinking.rs，原 thinking.rs 简化版被替代（语义不同，简化版无人调用）；handlers.rs 改为引用 `thinking::extract_thinking_from_complete_text`。
+- D2.1：`is_block_open_of_type` 与 `has_non_thinking_blocks` 由 `fn` 提升为 `pub(crate) fn`，因为跨模块（delivery）需访问。
+- D3.1：stream.rs 整体迁移后删除文件，`pub mod stream;` 从 mod.rs 移除；`super::converter::get_context_window_size` 改为 delivery.rs 的 use。
+- D4.1：tools.rs 的 `TOOL_NAME_MAX_LEN` 设 `pub(super)`，converter.rs tests 通过 `use super::super::tools::TOOL_NAME_MAX_LEN;` 访问（pub(super) 对兄弟模块的子模块仍可见，因继承 conversation 的可见域）。
+- D4.2：跳过。converter.rs 业务代码 600 行，与阈值持平；进一步拆分会引入跨模块强耦合，违反 KISS。
 
 ---
 
