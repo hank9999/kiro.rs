@@ -660,7 +660,7 @@ pub struct MultiTokenManager {
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// `400/429` 这类需要切换但不禁用的状态在重试前的短冷却，避免立即回切。
-const RETRYABLE_STATUS_COOLDOWN: StdDuration = StdDuration::from_secs(30);
+const RETRYABLE_STATUS_COOLDOWN: StdDuration = StdDuration::from_secs(5 * 60);
 /// 单次获取调用上下文的最大内部尝试次数，避免大量坏凭据放大刷新/校验开销。
 const MAX_CONTEXT_ACQUIRE_ATTEMPTS: usize = 30;
 /// 统计数据持久化防抖间隔
@@ -3233,6 +3233,24 @@ mod tests {
         let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
         assert!(!first.disabled, "mode={}", mode);
 
+        let now_ms = now_epoch_ms();
+        let cooldown_until_ms = manager
+            .entries
+            .lock()
+            .iter()
+            .find(|e| e.id == 1)
+            .unwrap()
+            .runtime
+            .cooldown_until_ms
+            .load(Ordering::Relaxed);
+        assert!(
+            cooldown_until_ms >= now_ms + StdDuration::from_secs(5 * 60).as_millis() as u64,
+            "mode={} cooldown_until_ms={} now_ms={}",
+            mode,
+            cooldown_until_ms,
+            now_ms
+        );
+
         let ctx = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.id, 2, "mode={}", mode);
     }
@@ -3423,7 +3441,10 @@ mod tests {
 
         let quota_entry = snapshot.entries.iter().find(|entry| entry.id == 2).unwrap();
         assert!(quota_entry.disabled);
-        assert_eq!(quota_entry.disabled_reason.as_deref(), Some("QuotaExceeded"));
+        assert_eq!(
+            quota_entry.disabled_reason.as_deref(),
+            Some("QuotaExceeded")
+        );
 
         let manual_entry = snapshot.entries.iter().find(|entry| entry.id == 3).unwrap();
         assert!(manual_entry.disabled);
