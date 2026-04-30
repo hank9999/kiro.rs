@@ -14,8 +14,8 @@ use crate::kiro::token_manager::{MultiTokenManager, RuntimeMetrics};
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, ResetAllCredentialsResponse,
-    SetLoadBalancingModeRequest,
+    ClearImmediateFailureDisabledResponse, CredentialsStatusResponse, LoadBalancingModeResponse,
+    ResetAllCredentialsResponse, SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -152,6 +152,33 @@ impl AdminService {
             reset_count: result.reset_count,
             skipped_invalid_config_count: result.skipped_invalid_config_count,
             unchanged_count: result.unchanged_count,
+            available: snapshot.available,
+            current_id: snapshot.current_id,
+        })
+    }
+
+    /// 批量清除 `ImmediateFailure` 状态的已禁用凭据
+    pub fn clear_immediate_failure_disabled(
+        &self,
+    ) -> Result<ClearImmediateFailureDisabledResponse, AdminServiceError> {
+        let result = self
+            .token_manager
+            .clear_immediate_failure_disabled()
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        let snapshot = self.token_manager.snapshot();
+        let message = format!(
+            "已清除 {} 个 ImmediateFailure 已禁用凭据，跳过 {} 个其他禁用原因凭据，{} 个凭据无需变更",
+            result.cleared_count, result.skipped_other_disabled_count, result.unchanged_count
+        );
+
+        Ok(ClearImmediateFailureDisabledResponse {
+            success: true,
+            message,
+            cleared_count: result.cleared_count,
+            skipped_other_disabled_count: result.skipped_other_disabled_count,
+            unchanged_count: result.unchanged_count,
+            total: snapshot.total,
             available: snapshot.available,
             current_id: snapshot.current_id,
         })

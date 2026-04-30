@@ -14,6 +14,7 @@ import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import {
   useCredentials,
+  useClearImmediateFailureDisabled,
   useDeleteCredential,
   useLoadBalancingMode,
   useResetAllCredentials,
@@ -61,6 +62,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
   const { mutate: resetAllCredentials, isPending: isResettingAllCredentials } = useResetAllCredentials()
+  const {
+    mutate: clearImmediateFailureDisabled,
+    isPending: isClearingImmediateFailureDisabled,
+  } = useClearImmediateFailureDisabled()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { data: runtimeMetrics } = useRuntimeMetrics()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
@@ -70,7 +75,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const startIndex = (currentPage - 1) * itemsPerPage
   const endIndex = startIndex + itemsPerPage
   const currentCredentials = data?.credentials.slice(startIndex, endIndex) || []
-  const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
+  const immediateFailureDisabledCount = data?.credentials.filter(credential =>
+    credential.disabled && credential.disabledReason === 'ImmediateFailure'
+  ).length || 0
   const recoverableCredentialCount = data?.credentials.filter(credential =>
     credential.disabledReason !== 'InvalidConfig' &&
     (credential.disabled || credential.failureCount > 0 || credential.refreshFailureCount > 0)
@@ -338,46 +345,24 @@ export function Dashboard({ onLogout }: DashboardProps) {
       return
     }
 
-    const disabledCredentials = data.credentials.filter(credential => credential.disabled)
-
-    if (disabledCredentials.length === 0) {
-      toast.error('没有可清除的已禁用凭据')
+    if (immediateFailureDisabledCount === 0) {
+      toast.error('没有可清除的 ImmediateFailure 已禁用凭据')
       return
     }
 
-    if (!confirm(`确定要清除所有 ${disabledCredentials.length} 个已禁用凭据吗？此操作无法撤销。`)) {
+    if (!confirm(`确定要清除所有 ${immediateFailureDisabledCount} 个 ImmediateFailure 状态的已禁用凭据吗？此操作无法撤销。`)) {
       return
     }
 
-    let successCount = 0
-    let failCount = 0
-
-    for (const credential of disabledCredentials) {
-      try {
-        await new Promise<void>((resolve, reject) => {
-          deleteCredential(credential.id, {
-            onSuccess: () => {
-              successCount++
-              resolve()
-            },
-            onError: (err) => {
-              failCount++
-              reject(err)
-            }
-          })
-        })
-      } catch (error) {
-        // 错误已在 onError 中处理
-      }
-    }
-
-    if (failCount === 0) {
-      toast.success(`成功清除所有 ${successCount} 个已禁用凭据`)
-    } else {
-      toast.warning(`清除已禁用凭据：成功 ${successCount} 个，失败 ${failCount} 个`)
-    }
-
-    deselectAll()
+    clearImmediateFailureDisabled(undefined, {
+      onSuccess: (response) => {
+        toast.success(response.message)
+        deselectAll()
+      },
+      onError: (error) => {
+        toast.error(`操作失败: ${extractErrorMessage(error)}`)
+      },
+    })
   }
 
   // 查询当前页凭据信息（逐个查询，避免瞬时并发）
@@ -756,11 +741,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   size="sm"
                   variant="outline"
                   className="text-destructive hover:text-destructive"
-                  disabled={disabledCredentialCount === 0}
-                  title={disabledCredentialCount === 0 ? '没有可清除的已禁用凭据' : undefined}
+                  disabled={isClearingImmediateFailureDisabled || immediateFailureDisabledCount === 0}
+                  title={immediateFailureDisabledCount === 0 ? '没有可清除的 ImmediateFailure 已禁用凭据' : undefined}
                 >
-                  <Trash2 className="h-4 w-4 mr-2" />
-                  清除已禁用
+                  <Trash2 className={`h-4 w-4 mr-2 ${isClearingImmediateFailureDisabled ? 'animate-pulse' : ''}`} />
+                  {isClearingImmediateFailureDisabled ? '清除中...' : '清除已禁用'}
                 </Button>
               )}
               <Button onClick={() => setKamImportDialogOpen(true)} size="sm" variant="outline">

@@ -5,6 +5,7 @@ import {
   setCredentialPriority,
   resetCredentialFailure,
   resetAllCredentials,
+  clearImmediateFailureDisabled,
   forceRefreshToken,
   getCredentialBalance,
   addCredential,
@@ -74,6 +75,17 @@ export function useResetAllCredentials() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: resetAllCredentials,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 批量清除 ImmediateFailure 已禁用凭据
+export function useClearImmediateFailureDisabled() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: clearImmediateFailureDisabled,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

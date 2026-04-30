@@ -5,6 +5,7 @@ import type {
   BalanceResponse,
   SuccessResponse,
   ResetAllCredentialsResponse,
+  ClearImmediateFailureDisabledResponse,
   SetDisabledRequest,
   SetPriorityRequest,
   AddCredentialRequest,
@@ -69,6 +70,14 @@ export async function resetCredentialFailure(
 // 启动所有账号并重置失败计数
 export async function resetAllCredentials(): Promise<ResetAllCredentialsResponse> {
   const { data } = await api.post<ResetAllCredentialsResponse>('/credentials/reset-all')
+  return data
+}
+
+// 批量清除 ImmediateFailure 已禁用凭据
+export async function clearImmediateFailureDisabled(): Promise<ClearImmediateFailureDisabledResponse> {
+  const { data } = await api.post<ClearImmediateFailureDisabledResponse>(
+    '/credentials/clear-immediate-failures'
+  )
   return data
 }
 

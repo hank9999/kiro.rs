@@ -169,6 +169,20 @@ pub struct ResetAllCredentialsResponse {
     pub current_id: u64,
 }
 
+/// 批量清除 ImmediateFailure 已禁用凭据响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearImmediateFailureDisabledResponse {
+    pub success: bool,
+    pub message: String,
+    pub cleared_count: usize,
+    pub skipped_other_disabled_count: usize,
+    pub unchanged_count: usize,
+    pub total: usize,
+    pub available: usize,
+    pub current_id: u64,
+}
+
 // ============ 余额查询 ============
 
 /// 余额查询响应

@@ -619,6 +619,17 @@ pub struct ResetAllCredentialsResult {
     pub unchanged_count: usize,
 }
 
+/// 批量清除 ImmediateFailure 禁用凭据的结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClearImmediateFailureDisabledResult {
+    /// 实际清除的凭据数量
+    pub cleared_count: usize,
+    /// 因其他禁用原因而被跳过的凭据数量
+    pub skipped_other_disabled_count: usize,
+    /// 未禁用且无需处理的凭据数量
+    pub unchanged_count: usize,
+}
+
 /// 多凭据 Token 管理器
 ///
 /// 支持多个凭据的管理，实现固定优先级 + 故障转移策略
@@ -2325,6 +2336,76 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 批量清除 `ImmediateFailure` 状态的已禁用凭据（Admin API）
+    pub fn clear_immediate_failure_disabled(
+        &self,
+    ) -> anyhow::Result<ClearImmediateFailureDisabledResult> {
+        let (result, removed_current, has_entries, next_current_id) = {
+            let mut entries = self.entries.lock();
+            let current_id = *self.current_id.lock();
+
+            let mut cleared_count = 0;
+            let mut skipped_other_disabled_count = 0;
+            let mut unchanged_count = 0;
+            let mut removed_current = false;
+
+            for entry in entries.iter() {
+                if entry.disabled && entry.disabled_reason == Some(DisabledReason::ImmediateFailure)
+                {
+                    cleared_count += 1;
+                    if entry.id == current_id {
+                        removed_current = true;
+                    }
+                } else if entry.disabled {
+                    skipped_other_disabled_count += 1;
+                } else {
+                    unchanged_count += 1;
+                }
+            }
+
+            entries.retain(|entry| {
+                !(entry.disabled && entry.disabled_reason == Some(DisabledReason::ImmediateFailure))
+            });
+
+            let next_current_id = entries
+                .iter()
+                .filter(|entry| !entry.disabled)
+                .min_by_key(|entry| entry.credentials.priority)
+                .map(|entry| entry.id);
+
+            (
+                ClearImmediateFailureDisabledResult {
+                    cleared_count,
+                    skipped_other_disabled_count,
+                    unchanged_count,
+                },
+                removed_current,
+                !entries.is_empty(),
+                next_current_id,
+            )
+        };
+
+        if !has_entries {
+            let mut current_id = self.current_id.lock();
+            *current_id = 0;
+            tracing::info!("所有凭据已删除，current_id 已重置为 0");
+        } else if removed_current {
+            let mut current_id = self.current_id.lock();
+            *current_id = next_current_id.unwrap_or(0);
+        }
+
+        if result.cleared_count > 0 {
+            self.persist_credentials()?;
+            self.save_stats();
+            tracing::info!(
+                "已批量清除 {} 个 ImmediateFailure 状态的已禁用凭据",
+                result.cleared_count
+            );
+        }
+
+        Ok(result)
+    }
+
     /// 强制刷新指定凭据的 Token（Admin API）
     ///
     /// 无条件调用上游 API 重新获取 access token，不检查是否过期。
@@ -3313,6 +3394,43 @@ mod tests {
             Some("InvalidConfig")
         );
         assert_eq!(snapshot.available, 1);
+    }
+
+    #[test]
+    fn test_multi_token_manager_clear_immediate_failure_disabled_only_removes_immediate_failure() {
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+        let cred3 = KiroCredentials::default();
+        let cred4 = KiroCredentials::default();
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2, cred3, cred4], None, None, false)
+                .unwrap();
+
+        assert!(manager.report_immediate_failure(1));
+        assert!(manager.report_quota_exhausted(2));
+        manager.set_disabled(3, true).unwrap();
+
+        let result = manager.clear_immediate_failure_disabled().unwrap();
+        assert_eq!(result.cleared_count, 1);
+        assert_eq!(result.skipped_other_disabled_count, 2);
+        assert_eq!(result.unchanged_count, 1);
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.total, 3);
+        assert!(snapshot.entries.iter().all(|entry| entry.id != 1));
+
+        let quota_entry = snapshot.entries.iter().find(|entry| entry.id == 2).unwrap();
+        assert!(quota_entry.disabled);
+        assert_eq!(quota_entry.disabled_reason.as_deref(), Some("QuotaExceeded"));
+
+        let manual_entry = snapshot.entries.iter().find(|entry| entry.id == 3).unwrap();
+        assert!(manual_entry.disabled);
+        assert_eq!(manual_entry.disabled_reason.as_deref(), Some("Manual"));
+
+        let untouched_entry = snapshot.entries.iter().find(|entry| entry.id == 4).unwrap();
+        assert!(!untouched_entry.disabled);
     }
 
     // ============ 凭据级 Region 优先级测试 ============
