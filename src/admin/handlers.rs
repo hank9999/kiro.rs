@@ -138,6 +138,13 @@ pub async fn get_load_balancing_mode(State(state): State<AdminState>) -> impl In
     Json(response)
 }
 
+/// GET /api/admin/runtime/metrics
+/// 获取运行时轻量指标
+pub async fn get_runtime_metrics(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_runtime_metrics();
+    Json(response)
+}
+
 /// PUT /api/admin/config/load-balancing
 /// 设置负载均衡模式
 pub async fn set_load_balancing_mode(

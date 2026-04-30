@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{MultiTokenManager, RuntimeMetrics};
 
 use super::error::AdminServiceError;
 use super::types::{
@@ -305,15 +305,25 @@ impl AdminService {
         }
     }
 
+    /// 获取轻量运行时指标
+    pub fn get_runtime_metrics(&self) -> RuntimeMetrics {
+        self.token_manager.runtime_metrics()
+    }
+
     /// 设置负载均衡模式
     pub fn set_load_balancing_mode(
         &self,
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
         // 验证模式值
-        if req.mode != "priority" && req.mode != "balanced" && req.mode != "round_robin" {
+        if req.mode != "priority"
+            && req.mode != "balanced"
+            && req.mode != "round_robin"
+            && req.mode != "adaptive_round_robin"
+        {
             return Err(AdminServiceError::InvalidCredential(
-                "mode 必须是 'priority'、'balanced' 或 'round_robin'".to_string(),
+                "mode 必须是 'priority'、'balanced'、'round_robin' 或 'adaptive_round_robin'"
+                    .to_string(),
             ));
         }
 

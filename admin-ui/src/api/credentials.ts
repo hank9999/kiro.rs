@@ -101,7 +101,16 @@ export async function deleteCredential(id: number): Promise<SuccessResponse> {
 }
 
 // 获取负载均衡模式
-export type LoadBalancingMode = 'priority' | 'balanced' | 'round_robin'
+export type LoadBalancingMode = 'priority' | 'balanced' | 'round_robin' | 'adaptive_round_robin'
+
+export interface RuntimeMetrics {
+  loadBalancingMode: LoadBalancingMode
+  total: number
+  available: number
+  disabled: number
+  coolingDown: number
+  inFlight: number
+}
 
 export async function getLoadBalancingMode(): Promise<{ mode: LoadBalancingMode }> {
   const { data } = await api.get<{ mode: LoadBalancingMode }>('/config/load-balancing')
@@ -111,5 +120,11 @@ export async function getLoadBalancingMode(): Promise<{ mode: LoadBalancingMode 
 // 设置负载均衡模式
 export async function setLoadBalancingMode(mode: LoadBalancingMode): Promise<{ mode: LoadBalancingMode }> {
   const { data } = await api.put<{ mode: LoadBalancingMode }>('/config/load-balancing', { mode })
+  return data
+}
+
+// 获取运行时轻量指标
+export async function getRuntimeMetrics(): Promise<RuntimeMetrics> {
+  const { data } = await api.get<RuntimeMetrics>('/runtime/metrics')
   return data
 }

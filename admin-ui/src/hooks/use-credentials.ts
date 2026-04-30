@@ -10,6 +10,7 @@ import {
   addCredential,
   deleteCredential,
   getLoadBalancingMode,
+  getRuntimeMetrics,
   setLoadBalancingMode,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
@@ -120,6 +121,15 @@ export function useLoadBalancingMode() {
   })
 }
 
+// 获取运行时轻量指标
+export function useRuntimeMetrics() {
+  return useQuery({
+    queryKey: ['runtimeMetrics'],
+    queryFn: getRuntimeMetrics,
+    refetchInterval: 5000,
+  })
+}
+
 // 设置负载均衡模式
 export function useSetLoadBalancingMode() {
   const queryClient = useQueryClient()
@@ -127,6 +137,7 @@ export function useSetLoadBalancingMode() {
     mutationFn: setLoadBalancingMode,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+      queryClient.invalidateQueries({ queryKey: ['runtimeMetrics'] })
     },
   })
 }

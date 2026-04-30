@@ -194,6 +194,8 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
+                let mut response = response;
+                ctx.attach_lease_to_response(&mut response);
                 self.token_manager.report_success(ctx.id);
                 return Ok(response);
             }
@@ -289,7 +291,7 @@ impl KiroProvider {
     /// 内部方法：带重试逻辑的 API 调用
     ///
     /// 重试策略：
-    /// - 单个凭据在 400/403/429 命中时立即禁用，不重复尝试
+    /// - 单个凭据在 400/403/429 命中 2 次后禁用，首次命中先短冷却
     /// - 总尝试次数 = min(凭据数量, 30)
     /// - 硬上限 30 次，避免无限重试
     async fn call_api_with_retry(
@@ -367,6 +369,8 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
+                let mut response = response;
+                ctx.attach_lease_to_response(&mut response);
                 self.token_manager.report_success(ctx.id);
                 return Ok(response);
             }

@@ -18,6 +18,7 @@ import {
   useLoadBalancingMode,
   useResetAllCredentials,
   useResetFailure,
+  useRuntimeMetrics,
   useSetLoadBalancingMode,
 } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
@@ -61,6 +62,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: resetFailure } = useResetFailure()
   const { mutate: resetAllCredentials, isPending: isResettingAllCredentials } = useResetAllCredentials()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
+  const { data: runtimeMetrics } = useRuntimeMetrics()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
 
   // 计算分页
@@ -536,8 +538,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
       currentMode === 'priority'
         ? 'round_robin'
         : currentMode === 'round_robin'
-          ? 'balanced'
-          : 'priority'
+          ? 'adaptive_round_robin'
+          : currentMode === 'adaptive_round_robin'
+            ? 'balanced'
+            : 'priority'
 
     setLoadBalancingMode(newMode, {
       onSuccess: () => {
@@ -546,7 +550,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
             ? '优先级模式'
             : newMode === 'round_robin'
               ? '轮换模式'
-              : '均衡负载模式'
+              : newMode === 'adaptive_round_robin'
+                ? '自适应轮换'
+                : '均衡负载模式'
         toast.success(`已切换到${modeName}`)
       },
       onError: (error) => {
@@ -606,8 +612,17 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   ? '优先级模式'
                   : loadBalancingData?.mode === 'round_robin'
                     ? '轮换模式'
-                    : '均衡负载'}
+                    : loadBalancingData?.mode === 'adaptive_round_robin'
+                      ? '自适应轮换'
+                      : '均衡负载'}
             </Button>
+            {runtimeMetrics && (
+              <div className="hidden lg:flex items-center gap-2 rounded-md border px-3 py-1 text-xs text-muted-foreground">
+                <span>并发 {runtimeMetrics.inFlight}</span>
+                <span>冷却 {runtimeMetrics.coolingDown}</span>
+                <span>可用 {runtimeMetrics.available}</span>
+              </div>
+            )}
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>

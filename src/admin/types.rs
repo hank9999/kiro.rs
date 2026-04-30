@@ -197,7 +197,7 @@ pub struct BalanceResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoadBalancingModeResponse {
-    /// 当前模式（"priority"、"balanced" 或 "round_robin"）
+    /// 当前模式（"priority"、"balanced"、"round_robin" 或 "adaptive_round_robin"）
     pub mode: String,
 }
 
@@ -205,7 +205,7 @@ pub struct LoadBalancingModeResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetLoadBalancingModeRequest {
-    /// 模式（"priority"、"balanced" 或 "round_robin"）
+    /// 模式（"priority"、"balanced"、"round_robin" 或 "adaptive_round_robin"）
     pub mode: String,
 }
 
