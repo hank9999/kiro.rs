@@ -420,6 +420,8 @@ enum DisabledReason {
     Manual,
     /// 连续失败达到阈值后自动禁用
     TooManyFailures,
+    /// 请求被上游拒绝后立即禁用（如 400/403/429）
+    ImmediateFailure,
     /// Token 刷新连续失败达到阈值后自动禁用
     TooManyRefreshFailures,
     /// 额度已用尽（如 MONTHLY_REQUEST_COUNT）
@@ -1259,6 +1261,54 @@ impl MultiTokenManager {
         result
     }
 
+    /// 报告指定凭据遭遇需要立即禁用的请求失败。
+    ///
+    /// 用于处理上游明确拒绝当前凭据的场景（如 400/403/429）：
+    /// - 立即禁用该凭据（不累计失败次数）
+    /// - 切换到下一个可用凭据继续尝试
+    /// - 返回是否还有可用凭据
+    pub fn report_immediate_failure(&self, id: u64) -> bool {
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => return entries.iter().any(|e| !e.disabled),
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|e| !e.disabled);
+            }
+
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::ImmediateFailure);
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+
+            tracing::error!("凭据 #{} 遭遇一次性致命请求失败，已立即禁用", id);
+
+            if let Some(next) = entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .min_by_key(|e| e.credentials.priority)
+            {
+                *current_id = next.id;
+                tracing::info!(
+                    "已切换到凭据 #{}（优先级 {}）",
+                    next.id,
+                    next.credentials.priority
+                );
+                true
+            } else {
+                tracing::error!("所有凭据均已禁用！");
+                false
+            }
+        };
+        self.save_stats_debounced();
+        result
+    }
+
     /// 报告指定凭据刷新 Token 失败。
     ///
     /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
@@ -1457,6 +1507,7 @@ impl MultiTokenManager {
                         match r {
                             DisabledReason::Manual => "Manual",
                             DisabledReason::TooManyFailures => "TooManyFailures",
+                            DisabledReason::ImmediateFailure => "ImmediateFailure",
                             DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
                             DisabledReason::QuotaExceeded => "QuotaExceeded",
                             DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
@@ -2482,6 +2533,55 @@ mod tests {
         // 再禁用第二个后，无可用凭据
         assert!(!manager.report_quota_exhausted(2));
         assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn test_multi_token_manager_report_immediate_failure() {
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        assert_eq!(manager.available_count(), 2);
+        assert!(manager.report_immediate_failure(1));
+        assert_eq!(manager.available_count(), 1);
+
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(first.disabled);
+        assert_eq!(first.disabled_reason.as_deref(), Some("ImmediateFailure"));
+        assert_eq!(snapshot.current_id, 2);
+
+        assert!(!manager.report_immediate_failure(2));
+        assert_eq!(manager.available_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_multi_token_manager_immediate_failure_disabled_is_not_auto_recovered() {
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        manager.report_immediate_failure(1);
+        manager.report_immediate_failure(2);
+        assert_eq!(manager.available_count(), 0);
+
+        let err = manager
+            .acquire_context(None)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("所有凭据均已禁用"),
+            "错误应提示所有凭据禁用，实际: {}",
+            err
+        );
     }
 
     #[tokio::test]

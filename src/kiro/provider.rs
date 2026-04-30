@@ -19,11 +19,16 @@ use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
-/// 每个凭据的最大重试次数
-const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
-
 /// 总重试次数硬上限（避免无限重试）
-const MAX_TOTAL_RETRIES: usize = 9;
+const MAX_TOTAL_RETRIES: usize = 30;
+
+fn should_disable_credential_immediately(status: u16) -> bool {
+    matches!(status, 400 | 403 | 429)
+}
+
+fn total_attempt_limit(total_credentials: usize) -> usize {
+    total_credentials.clamp(1, MAX_TOTAL_RETRIES)
+}
 
 /// Kiro API Provider
 ///
@@ -66,8 +71,8 @@ impl KiroProvider {
         );
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client
-        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
-            .expect("创建 HTTP 客户端失败");
+        let initial_client =
+            build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
 
@@ -94,10 +99,7 @@ impl KiroProvider {
     }
 
     /// 根据凭据选择 endpoint 实现
-    fn endpoint_for(
-        &self,
-        credentials: &KiroCredentials,
-    ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
+    fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
         let name = credentials
             .endpoint
             .as_deref()
@@ -127,8 +129,7 @@ impl KiroProvider {
 
     /// 内部方法：带重试逻辑的 MCP API 调用
     async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        let total_credentials = self.token_manager.total_count();
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let max_retries = total_attempt_limit(self.token_manager.total_count());
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
 
@@ -211,18 +212,34 @@ impl KiroProvider {
                 continue;
             }
 
-            // 400 Bad Request
-            if status.as_u16() == 400 {
-                anyhow::bail!("MCP 请求失败: {} {}", status, body);
+            if should_disable_credential_immediately(status.as_u16()) {
+                tracing::warn!(
+                    "MCP 请求失败（状态码命中立即禁用规则，尝试 {}/{}）: {} {}",
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+                let has_available = self.token_manager.report_immediate_failure(ctx.id);
+                if !has_available {
+                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                }
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                continue;
             }
 
-            // 401/403 凭据问题
-            if matches!(status.as_u16(), 401 | 403) {
+            // 401 仍视为凭据问题，保留一次强制刷新机会
+            if status.as_u16() == 401 {
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                    if self
+                        .token_manager
+                        .force_refresh_token_for(ctx.id)
+                        .await
+                        .is_ok()
+                    {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                         continue;
                     }
@@ -238,7 +255,7 @@ impl KiroProvider {
             }
 
             // 瞬态错误
-            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+            if status.as_u16() == 408 || status.is_server_error() {
                 tracing::warn!(
                     "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -273,16 +290,15 @@ impl KiroProvider {
     /// 内部方法：带重试逻辑的 API 调用
     ///
     /// 重试策略：
-    /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
-    /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
-    /// - 硬上限 9 次，避免无限重试
+    /// - 单个凭据在 400/403/429 命中时立即禁用，不重复尝试
+    /// - 总尝试次数 = min(凭据数量, 30)
+    /// - 硬上限 30 次，避免无限重试
     async fn call_api_with_retry(
         &self,
         request_body: &str,
         is_stream: bool,
     ) -> anyhow::Result<reqwest::Response> {
-        let total_credentials = self.token_manager.total_count();
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let max_retries = total_attempt_limit(self.token_manager.total_count());
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
@@ -389,13 +405,36 @@ impl KiroProvider {
                 continue;
             }
 
-            // 400 Bad Request - 请求问题，重试/切换凭据无意义
-            if status.as_u16() == 400 {
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+            if should_disable_credential_immediately(status.as_u16()) {
+                tracing::warn!(
+                    "API 请求失败（状态码命中立即禁用规则，尝试 {}/{}）: {} {}",
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+
+                let has_available = self.token_manager.report_immediate_failure(ctx.id);
+                if !has_available {
+                    anyhow::bail!(
+                        "{} API 请求失败（所有凭据已用尽）: {} {}",
+                        api_type,
+                        status,
+                        body
+                    );
+                }
+
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                continue;
             }
 
-            // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
-            if matches!(status.as_u16(), 401 | 403) {
+            // 401 仍视为凭据问题，保留一次强制刷新机会
+            if status.as_u16() == 401 {
                 tracing::warn!(
                     "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -408,7 +447,12 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                    if self
+                        .token_manager
+                        .force_refresh_token_for(ctx.id)
+                        .await
+                        .is_ok()
+                    {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                         continue;
                     }
@@ -434,9 +478,8 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
-            // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
-            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+            // 408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
+            if status.as_u16() == 408 || status.is_server_error() {
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -515,5 +558,29 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_TOTAL_RETRIES, should_disable_credential_immediately, total_attempt_limit};
+
+    #[test]
+    fn test_total_attempt_limit_caps_at_30() {
+        assert_eq!(total_attempt_limit(0), 1);
+        assert_eq!(total_attempt_limit(2), 2);
+        assert_eq!(total_attempt_limit(30), 30);
+        assert_eq!(MAX_TOTAL_RETRIES, 30);
+        assert_eq!(total_attempt_limit(40), 30);
+    }
+
+    #[test]
+    fn test_should_disable_credential_immediately() {
+        assert!(should_disable_credential_immediately(400));
+        assert!(should_disable_credential_immediately(403));
+        assert!(should_disable_credential_immediately(429));
+        assert!(!should_disable_credential_immediately(401));
+        assert!(!should_disable_credential_immediately(402));
+        assert!(!should_disable_credential_immediately(500));
     }
 }
