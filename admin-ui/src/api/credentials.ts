@@ -4,6 +4,7 @@ import type {
   CredentialsStatusResponse,
   BalanceResponse,
   SuccessResponse,
+  ResetAllCredentialsResponse,
   SetDisabledRequest,
   SetPriorityRequest,
   AddCredentialRequest,
@@ -62,6 +63,12 @@ export async function resetCredentialFailure(
   id: number
 ): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/reset`)
+  return data
+}
+
+// 启动所有账号并重置失败计数
+export async function resetAllCredentials(): Promise<ResetAllCredentialsResponse> {
+  const { data } = await api.post<ResetAllCredentialsResponse>('/credentials/reset-all')
   return data
 }
 

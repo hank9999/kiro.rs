@@ -70,6 +70,15 @@ pub async fn reset_failure_count(
     }
 }
 
+/// POST /api/admin/credentials/reset-all
+/// 批量启动所有账号并重置失败计数
+pub async fn reset_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.reset_and_enable_all() {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/credentials/:id/balance
 /// 获取指定凭据的余额
 pub async fn get_credential_balance(

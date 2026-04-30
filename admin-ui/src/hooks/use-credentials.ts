@@ -4,6 +4,7 @@ import {
   setCredentialDisabled,
   setCredentialPriority,
   resetCredentialFailure,
+  resetAllCredentials,
   forceRefreshToken,
   getCredentialBalance,
   addCredential,
@@ -61,6 +62,17 @@ export function useResetFailure() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: number) => resetCredentialFailure(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 启动所有账号并重置失败计数
+export function useResetAllCredentials() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: resetAllCredentials,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

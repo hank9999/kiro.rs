@@ -12,7 +12,14 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
+import {
+  useCredentials,
+  useDeleteCredential,
+  useLoadBalancingMode,
+  useResetAllCredentials,
+  useResetFailure,
+  useSetLoadBalancingMode,
+} from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
@@ -52,6 +59,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { data, isLoading, error, refetch } = useCredentials()
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
+  const { mutate: resetAllCredentials, isPending: isResettingAllCredentials } = useResetAllCredentials()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
 
@@ -61,6 +69,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const endIndex = startIndex + itemsPerPage
   const currentCredentials = data?.credentials.slice(startIndex, endIndex) || []
   const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
+  const recoverableCredentialCount = data?.credentials.filter(credential =>
+    credential.disabledReason !== 'InvalidConfig' &&
+    (credential.disabled || credential.failureCount > 0 || credential.refreshFailureCount > 0)
+  ).length || 0
   const selectedDisabledCount = Array.from(selectedIds).filter(id => {
     const credential = data?.credentials.find(c => c.id === id)
     return Boolean(credential?.disabled)
@@ -118,6 +130,32 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const handleRefresh = () => {
     refetch()
     toast.success('已刷新凭据列表')
+  }
+
+  const handleResetAllCredentials = () => {
+    if (!data?.credentials || data.credentials.length === 0) {
+      toast.error('没有可恢复的凭据')
+      return
+    }
+
+    if (recoverableCredentialCount === 0) {
+      toast.error('所有可恢复凭据都已启用且失败次数为 0')
+      return
+    }
+
+    if (!confirm(`确定要启动所有账号并重置失败次数吗？\n\n本次会在内存中批量处理后只回写一次凭据文件，以降低大文件持久化开销。\n因配置无效被禁用的账号会自动跳过。`)) {
+      return
+    }
+
+    resetAllCredentials(undefined, {
+      onSuccess: (response) => {
+        toast.success(response.message)
+        deselectAll()
+      },
+      onError: (error) => {
+        toast.error(`操作失败: ${extractErrorMessage(error)}`)
+      },
+    })
   }
 
   const handleLogout = () => {
@@ -656,6 +694,18 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 <Button onClick={() => setVerifyDialogOpen(true)} size="sm" variant="secondary">
                   <CheckCircle2 className="h-4 w-4 mr-2 animate-spin" />
                   验活中... {verifyProgress.current}/{verifyProgress.total}
+                </Button>
+              )}
+              {data?.credentials && data.credentials.length > 0 && (
+                <Button
+                  onClick={handleResetAllCredentials}
+                  size="sm"
+                  variant="outline"
+                  disabled={isResettingAllCredentials || recoverableCredentialCount === 0}
+                  title={recoverableCredentialCount === 0 ? '所有可恢复凭据都已启用且失败次数为 0' : undefined}
+                >
+                  <RotateCcw className={`h-4 w-4 mr-2 ${isResettingAllCredentials ? 'animate-spin' : ''}`} />
+                  {isResettingAllCredentials ? '启动中...' : '启动所有账号'}
                 </Button>
               )}
               {data?.credentials && data.credentials.length > 0 && (

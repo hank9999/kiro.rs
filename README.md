@@ -80,6 +80,12 @@
 
 > PS: 如果不想编辑可以直接前往 Release 下载二进制文件
 
+> Windows 本地验证可直接运行：
+> ```powershell
+> .\tools\verify-local-windows.ps1
+> ```
+> 这个脚本会自动加载 `vcvars64.bat`，执行 `cargo check --tests`、`admin-ui` 构建，并在未显式跳过时执行本地 Docker 镜像构建。
+
 > **前置步骤**：编译前需要先构建前端 Admin UI（用于嵌入到二进制中）：
 > ```bash
 > cd admin-ui && pnpm install && pnpm build
@@ -449,6 +455,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 - **Admin API（认证同 API Key）**
   - `GET /api/admin/credentials` - 获取所有凭据状态
   - `POST /api/admin/credentials` - 添加新凭据
+  - `POST /api/admin/credentials/reset-all` - 启动所有账号并重置失败计数（批量内存处理后只回写一次凭据文件）
   - `DELETE /api/admin/credentials/:id` - 删除凭据
   - `POST /api/admin/credentials/:id/disabled` - 设置凭据禁用状态
   - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级

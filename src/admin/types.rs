@@ -156,6 +156,19 @@ pub struct AddCredentialResponse {
     pub email: Option<String>,
 }
 
+/// 批量启动所有账号并重置失败计数响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetAllCredentialsResponse {
+    pub success: bool,
+    pub message: String,
+    pub reset_count: usize,
+    pub skipped_invalid_config_count: usize,
+    pub unchanged_count: usize,
+    pub available: usize,
+    pub current_id: u64,
+}
+
 // ============ 余额查询 ============
 
 /// 余额查询响应

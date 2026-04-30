@@ -14,7 +14,8 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    CredentialsStatusResponse, LoadBalancingModeResponse, ResetAllCredentialsResponse,
+    SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -130,6 +131,30 @@ impl AdminService {
         self.token_manager
             .reset_and_enable(id)
             .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 批量重置所有凭据失败计数并重新启用
+    pub fn reset_and_enable_all(&self) -> Result<ResetAllCredentialsResponse, AdminServiceError> {
+        let result = self
+            .token_manager
+            .reset_and_enable_all()
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        let snapshot = self.token_manager.snapshot();
+        let message = format!(
+            "已启动 {} 个账号并重置失败计数，跳过 {} 个无效配置账号，{} 个账号无需变更",
+            result.reset_count, result.skipped_invalid_config_count, result.unchanged_count
+        );
+
+        Ok(ResetAllCredentialsResponse {
+            success: true,
+            message,
+            reset_count: result.reset_count,
+            skipped_invalid_config_count: result.skipped_invalid_config_count,
+            unchanged_count: result.unchanged_count,
+            available: snapshot.available,
+            current_id: snapshot.current_id,
+        })
     }
 
     /// 获取凭据余额（带缓存）
@@ -448,7 +473,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
