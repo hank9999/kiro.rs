@@ -887,8 +887,8 @@ impl MultiTokenManager {
 
         if mode == "adaptive_round_robin" {
             const PROBE_LIMIT: usize = 32;
-            const MAX_IN_FLIGHT_PER_CREDENTIAL: u32 = 1;
-            const MAX_FALLBACK_IN_FLIGHT_PER_CREDENTIAL: u32 = 2;
+            const MAX_UNPROVEN_IN_FLIGHT_PER_CREDENTIAL: u32 = 1;
+            const MAX_PROVEN_IN_FLIGHT_PER_CREDENTIAL: u32 = 3;
 
             let len = entries.len();
             if len == 0 {
@@ -897,17 +897,63 @@ impl MultiTokenManager {
             let start_index = self.adaptive_cursor.load(Ordering::Relaxed) % len;
             let now_ms = now_epoch_ms();
             let probe_limit = len.min(PROBE_LIMIT);
+            let is_clean = |entry: &CredentialEntry| {
+                entry.failure_count == 0
+                    && entry.immediate_failure_count == 0
+                    && entry.refresh_failure_count == 0
+            };
+            let max_in_flight_for = |entry: &CredentialEntry| {
+                if is_clean(entry) && entry.success_count > 0 {
+                    MAX_PROVEN_IN_FLIGHT_PER_CREDENTIAL
+                } else {
+                    MAX_UNPROVEN_IN_FLIGHT_PER_CREDENTIAL
+                }
+            };
+            let candidate_rank = |entry: &CredentialEntry, in_flight: u32| {
+                let health_rank = if is_clean(entry) && entry.success_count > 0 {
+                    0
+                } else if is_clean(entry) {
+                    1
+                } else {
+                    2
+                };
+                let failure_rank = entry
+                    .failure_count
+                    .saturating_add(entry.immediate_failure_count)
+                    .saturating_add(entry.refresh_failure_count);
+                (
+                    health_rank,
+                    in_flight,
+                    failure_rank,
+                    entry.credentials.priority,
+                    entry.success_count,
+                )
+            };
 
+            let mut best_index: Option<usize> = None;
+            let mut best_key = (u8::MAX, u32::MAX, u32::MAX, u32::MAX, u64::MAX);
             for offset in 0..probe_limit {
                 let index = (start_index + offset) % len;
                 let entry = &entries[index];
                 if !is_available(entry) || entry.runtime.is_cooling_down(now_ms) {
                     continue;
                 }
-                if let Some(lease) = CredentialLease::try_acquire(
-                    entry.runtime.clone(),
-                    MAX_IN_FLIGHT_PER_CREDENTIAL,
-                ) {
+                let in_flight = entry.runtime.in_flight.load(Ordering::Relaxed);
+                if in_flight >= max_in_flight_for(entry) {
+                    continue;
+                }
+                let key = candidate_rank(entry, in_flight);
+                if key < best_key {
+                    best_key = key;
+                    best_index = Some(index);
+                }
+            }
+
+            if let Some(index) = best_index {
+                let entry = &entries[index];
+                if let Some(lease) =
+                    CredentialLease::try_acquire(entry.runtime.clone(), max_in_flight_for(entry))
+                {
                     self.adaptive_cursor
                         .store((index + 1) % len, Ordering::Relaxed);
                     *self.current_id.lock() = entry.id;
@@ -919,18 +965,18 @@ impl MultiTokenManager {
                 }
             }
 
-            // 饥饿保护：短探测窗口都在忙时才全池找最低负载，并允许单凭据最多 2 个并发。
+            // 饥饿保护：短探测窗口都在忙时全池找最低负载，但仍优先保住已证明可用的凭据。
             let mut best_index: Option<usize> = None;
-            let mut best_key = (u32::MAX, u32::MAX);
+            let mut best_key = (u8::MAX, u32::MAX, u32::MAX, u32::MAX, u64::MAX);
             for (index, entry) in entries.iter().enumerate() {
                 if !is_available(entry) || entry.runtime.is_cooling_down(now_ms) {
                     continue;
                 }
                 let in_flight = entry.runtime.in_flight.load(Ordering::Relaxed);
-                if in_flight >= MAX_FALLBACK_IN_FLIGHT_PER_CREDENTIAL {
+                if in_flight >= max_in_flight_for(entry) {
                     continue;
                 }
-                let key = (in_flight, entry.credentials.priority);
+                let key = candidate_rank(entry, in_flight);
                 if key < best_key {
                     best_key = key;
                     best_index = Some(index);
@@ -939,10 +985,8 @@ impl MultiTokenManager {
 
             let index = best_index?;
             let entry = &entries[index];
-            let lease = CredentialLease::try_acquire(
-                entry.runtime.clone(),
-                MAX_FALLBACK_IN_FLIGHT_PER_CREDENTIAL,
-            )?;
+            let lease =
+                CredentialLease::try_acquire(entry.runtime.clone(), max_in_flight_for(entry))?;
             self.adaptive_cursor
                 .store((index + 1) % len, Ordering::Relaxed);
             *self.current_id.lock() = entry.id;
@@ -2893,6 +2937,25 @@ mod tests {
 
         drop(second);
         assert_eq!(manager.runtime_metrics().in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn test_multi_token_manager_adaptive_round_robin_prefers_successful_credentials() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "adaptive_round_robin".to_string();
+
+        let mut unproven = KiroCredentials::default();
+        unproven.kiro_api_key = Some("unproven-token".to_string());
+        let mut proven = KiroCredentials::default();
+        proven.kiro_api_key = Some("proven-token".to_string());
+
+        let manager =
+            MultiTokenManager::new(config, vec![unproven, proven], None, None, false).unwrap();
+        manager.report_success(2);
+
+        let ctx = manager.acquire_context(None).await.unwrap();
+
+        assert_eq!(ctx.id, 2);
     }
 
     #[tokio::test]
