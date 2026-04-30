@@ -706,6 +706,7 @@ impl MultiTokenManager {
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
     /// - balanced 模式：均衡选择可用凭据
+    /// - round_robin 模式：按当前游标轮换选择可用凭据，降低高并发热点账号重复命中
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
@@ -740,6 +741,18 @@ impl MultiTokenManager {
         let mode = mode.as_str();
 
         match mode {
+            "round_robin" => {
+                let current_id = *self.current_id.lock();
+                let selected_index = available
+                    .iter()
+                    .position(|e| e.id == current_id)
+                    .unwrap_or(0);
+                let entry = available[selected_index];
+                let next = available[(selected_index + 1) % available.len()];
+                *self.current_id.lock() = next.id;
+
+                Some((entry.id, entry.credentials.clone()))
+            }
             "balanced" => {
                 // Least-Used 策略：选择成功次数最少的凭据
                 // 平局时按优先级排序（数字越小优先级越高）
@@ -782,11 +795,12 @@ impl MultiTokenManager {
             }
 
             let (id, credentials) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+                let mode = self.load_balancing_mode.lock().clone();
+                let rotates_on_each_request = mode == "balanced" || mode == "round_robin";
 
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
+                // balanced/round_robin 模式：每次请求都重新选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
+                let current_hit = if rotates_on_each_request {
                     None
                 } else {
                     let entries = self.entries.lock();
@@ -800,7 +814,7 @@ impl MultiTokenManager {
                 if let Some(hit) = current_hit {
                     hit
                 } else {
-                    // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
+                    // 当前凭据不可用或轮换模式，根据负载均衡策略选择
                     let mut best = self.select_next_credential(model);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
@@ -826,9 +840,11 @@ impl MultiTokenManager {
                     }
 
                     if let Some((new_id, new_creds)) = best {
-                        // 更新 current_id
-                        let mut current_id = self.current_id.lock();
-                        *current_id = new_id;
+                        if mode != "round_robin" {
+                            // round_robin 在选择时已经把 current_id 推进到下一张凭据。
+                            let mut current_id = self.current_id.lock();
+                            *current_id = new_id;
+                        }
                         (new_id, new_creds)
                     } else {
                         let entries = self.entries.lock();
@@ -2040,7 +2056,7 @@ impl MultiTokenManager {
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         // 验证模式值
-        if mode != "priority" && mode != "balanced" {
+        if mode != "priority" && mode != "balanced" && mode != "round_robin" {
             anyhow::bail!("无效的负载均衡模式: {}", mode);
         }
 
@@ -2441,6 +2457,30 @@ mod tests {
         std::fs::remove_file(&config_path).unwrap();
     }
 
+    #[test]
+    fn test_set_load_balancing_mode_accepts_round_robin() {
+        let config_path = std::env::temp_dir().join(format!(
+            "kiro-load-balancing-round-robin-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&config_path, r#"{"loadBalancingMode":"priority"}"#).unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        manager
+            .set_load_balancing_mode("round_robin".to_string())
+            .unwrap();
+
+        let persisted = Config::load(&config_path).unwrap();
+        assert_eq!(persisted.load_balancing_mode, "round_robin");
+        assert_eq!(manager.get_load_balancing_mode(), "round_robin");
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
     #[tokio::test]
     async fn test_multi_token_manager_acquire_context_auto_recovers_all_disabled() {
         let config = Config::default();
@@ -2491,6 +2531,35 @@ mod tests {
         let ctx = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
+    }
+
+    #[tokio::test]
+    async fn test_multi_token_manager_acquire_context_round_robin_rotates_credentials() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "round_robin".to_string();
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("token-1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("token-2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred3 = KiroCredentials::default();
+        cred3.access_token = Some("token-3".to_string());
+        cred3.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2, cred3], None, None, false).unwrap();
+
+        let first = manager.acquire_context(None).await.unwrap();
+        let second = manager.acquire_context(None).await.unwrap();
+        let third = manager.acquire_context(None).await.unwrap();
+        let fourth = manager.acquire_context(None).await.unwrap();
+
+        assert_eq!(
+            vec![first.id, second.id, third.id, fourth.id],
+            vec![1, 2, 3, 1]
+        );
     }
 
     #[test]

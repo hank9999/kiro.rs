@@ -87,7 +87,7 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
-    /// 负载均衡模式（"priority" 或 "balanced"）
+    /// 负载均衡模式（"priority"、"balanced" 或 "round_robin"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 

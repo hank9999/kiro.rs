@@ -311,9 +311,9 @@ impl AdminService {
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
         // 验证模式值
-        if req.mode != "priority" && req.mode != "balanced" {
+        if req.mode != "priority" && req.mode != "balanced" && req.mode != "round_robin" {
             return Err(AdminServiceError::InvalidCredential(
-                "mode 必须是 'priority' 或 'balanced'".to_string(),
+                "mode 必须是 'priority'、'balanced' 或 'round_robin'".to_string(),
             ));
         }
 
