@@ -22,7 +22,7 @@ use parking_lot::Mutex;
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 30;
 
-fn should_disable_credential_immediately(status: u16) -> bool {
+fn should_track_failfast_status(status: u16) -> bool {
     matches!(status, 400 | 403 | 429)
 }
 
@@ -212,9 +212,9 @@ impl KiroProvider {
                 continue;
             }
 
-            if should_disable_credential_immediately(status.as_u16()) {
+            if should_track_failfast_status(status.as_u16()) {
                 tracing::warn!(
-                    "MCP 请求失败（状态码命中立即禁用规则，尝试 {}/{}）: {} {}",
+                    "MCP 请求失败（状态码命中快速禁用计数规则，尝试 {}/{}）: {} {}",
                     attempt + 1,
                     max_retries,
                     status,
@@ -405,9 +405,9 @@ impl KiroProvider {
                 continue;
             }
 
-            if should_disable_credential_immediately(status.as_u16()) {
+            if should_track_failfast_status(status.as_u16()) {
                 tracing::warn!(
-                    "API 请求失败（状态码命中立即禁用规则，尝试 {}/{}）: {} {}",
+                    "API 请求失败（状态码命中快速禁用计数规则，尝试 {}/{}）: {} {}",
                     attempt + 1,
                     max_retries,
                     status,
@@ -563,7 +563,7 @@ impl KiroProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_TOTAL_RETRIES, should_disable_credential_immediately, total_attempt_limit};
+    use super::{MAX_TOTAL_RETRIES, should_track_failfast_status, total_attempt_limit};
 
     #[test]
     fn test_total_attempt_limit_caps_at_30() {
@@ -575,12 +575,12 @@ mod tests {
     }
 
     #[test]
-    fn test_should_disable_credential_immediately() {
-        assert!(should_disable_credential_immediately(400));
-        assert!(should_disable_credential_immediately(403));
-        assert!(should_disable_credential_immediately(429));
-        assert!(!should_disable_credential_immediately(401));
-        assert!(!should_disable_credential_immediately(402));
-        assert!(!should_disable_credential_immediately(500));
+    fn test_should_track_failfast_status() {
+        assert!(should_track_failfast_status(400));
+        assert!(should_track_failfast_status(403));
+        assert!(should_track_failfast_status(429));
+        assert!(!should_track_failfast_status(401));
+        assert!(!should_track_failfast_status(402));
+        assert!(!should_track_failfast_status(500));
     }
 }

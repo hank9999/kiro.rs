@@ -401,6 +401,8 @@ struct CredentialEntry {
     credentials: KiroCredentials,
     /// API 调用连续失败次数
     failure_count: u32,
+    /// 400/403/429 类快速禁用状态累计命中次数
+    immediate_failure_count: u32,
     /// Token 刷新连续失败次数
     refresh_failure_count: u32,
     /// 是否已禁用
@@ -420,7 +422,7 @@ enum DisabledReason {
     Manual,
     /// 连续失败达到阈值后自动禁用
     TooManyFailures,
-    /// 请求被上游拒绝后立即禁用（如 400/403/429）
+    /// 请求被上游拒绝达到阈值后禁用（如 400/403/429）
     ImmediateFailure,
     /// Token 刷新连续失败达到阈值后自动禁用
     TooManyRefreshFailures,
@@ -540,6 +542,8 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+/// 每个凭据在 400/403/429 状态下的快速禁用阈值
+const MAX_IMMEDIATE_FAILURES_PER_CREDENTIAL: u32 = 2;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -600,6 +604,7 @@ impl MultiTokenManager {
                     id,
                     credentials: cred.clone(),
                     failure_count: 0,
+                    immediate_failure_count: 0,
                     refresh_failure_count: 0,
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
                     disabled_reason: if cred.disabled {
@@ -812,6 +817,7 @@ impl MultiTokenManager {
                                     e.disabled = false;
                                     e.disabled_reason = None;
                                     e.failure_count = 0;
+                                    e.immediate_failure_count = 0;
                                 }
                             }
                             drop(entries);
@@ -1138,6 +1144,7 @@ impl MultiTokenManager {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.failure_count = 0;
+                entry.immediate_failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
@@ -1264,8 +1271,8 @@ impl MultiTokenManager {
     /// 报告指定凭据遭遇需要立即禁用的请求失败。
     ///
     /// 用于处理上游明确拒绝当前凭据的场景（如 400/403/429）：
-    /// - 立即禁用该凭据（不累计失败次数）
-    /// - 切换到下一个可用凭据继续尝试
+    /// - 单独累计快速禁用计数
+    /// - 达到阈值后禁用该凭据，并切换到下一个可用凭据继续尝试
     /// - 返回是否还有可用凭据
     pub fn report_immediate_failure(&self, id: u64) -> bool {
         let result = {
@@ -1281,12 +1288,30 @@ impl MultiTokenManager {
                 return entries.iter().any(|e| !e.disabled);
             }
 
+            entry.immediate_failure_count += 1;
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            let immediate_failure_count = entry.immediate_failure_count;
+
+            tracing::warn!(
+                "凭据 #{} 遭遇快速禁用类请求失败（{}/{}）",
+                id,
+                immediate_failure_count,
+                MAX_IMMEDIATE_FAILURES_PER_CREDENTIAL
+            );
+
+            if immediate_failure_count < MAX_IMMEDIATE_FAILURES_PER_CREDENTIAL {
+                return entries.iter().any(|e| !e.disabled);
+            }
+
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::ImmediateFailure);
-            entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
 
-            tracing::error!("凭据 #{} 遭遇一次性致命请求失败，已立即禁用", id);
+            tracing::error!(
+                "凭据 #{} 遭遇快速禁用类请求失败 {} 次，已禁用",
+                id,
+                immediate_failure_count
+            );
 
             if let Some(next) = entries
                 .iter()
@@ -1536,6 +1561,7 @@ impl MultiTokenManager {
             if !disabled {
                 // 启用时重置失败计数
                 entry.failure_count = 0;
+                entry.immediate_failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.disabled_reason = None;
             } else {
@@ -1579,6 +1605,7 @@ impl MultiTokenManager {
                 anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
             }
             entry.failure_count = 0;
+            entry.immediate_failure_count = 0;
             entry.refresh_failure_count = 0;
             entry.disabled = false;
             entry.disabled_reason = None;
@@ -1607,6 +1634,7 @@ impl MultiTokenManager {
 
                 let needs_reset = entry.disabled
                     || entry.failure_count > 0
+                    || entry.immediate_failure_count > 0
                     || entry.refresh_failure_count > 0
                     || entry.disabled_reason.is_some();
 
@@ -1616,6 +1644,7 @@ impl MultiTokenManager {
                 }
 
                 entry.failure_count = 0;
+                entry.immediate_failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.disabled = false;
                 entry.disabled_reason = None;
@@ -1861,6 +1890,7 @@ impl MultiTokenManager {
                 id: new_id,
                 credentials: validated_cred,
                 failure_count: 0,
+                immediate_failure_count: 0,
                 refresh_failure_count: 0,
                 disabled: false,
                 disabled_reason: None,
@@ -2546,6 +2576,14 @@ mod tests {
 
         assert_eq!(manager.available_count(), 2);
         assert!(manager.report_immediate_failure(1));
+        assert_eq!(manager.available_count(), 2);
+
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(!first.disabled);
+        assert_eq!(snapshot.current_id, 1);
+
+        assert!(manager.report_immediate_failure(1));
         assert_eq!(manager.available_count(), 1);
 
         let snapshot = manager.snapshot();
@@ -2553,6 +2591,9 @@ mod tests {
         assert!(first.disabled);
         assert_eq!(first.disabled_reason.as_deref(), Some("ImmediateFailure"));
         assert_eq!(snapshot.current_id, 2);
+
+        assert!(manager.report_immediate_failure(2));
+        assert_eq!(manager.available_count(), 1);
 
         assert!(!manager.report_immediate_failure(2));
         assert_eq!(manager.available_count(), 0);
@@ -2568,6 +2609,8 @@ mod tests {
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
         manager.report_immediate_failure(1);
+        manager.report_immediate_failure(1);
+        manager.report_immediate_failure(2);
         manager.report_immediate_failure(2);
         assert_eq!(manager.available_count(), 0);
 
