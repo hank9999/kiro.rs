@@ -22,8 +22,12 @@ use parking_lot::Mutex;
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 30;
 
-fn should_track_failfast_status(status: u16) -> bool {
-    matches!(status, 400 | 403 | 429)
+fn should_disable_credential_on_status(status: u16) -> bool {
+    status == 403
+}
+
+fn should_rotate_without_disabling_status(status: u16) -> bool {
+    matches!(status, 400 | 429)
 }
 
 fn total_attempt_limit(total_credentials: usize) -> usize {
@@ -213,9 +217,9 @@ impl KiroProvider {
                 continue;
             }
 
-            if should_track_failfast_status(status.as_u16()) {
+            if should_disable_credential_on_status(status.as_u16()) {
                 tracing::warn!(
-                    "MCP 请求失败（状态码命中快速禁用计数规则，尝试 {}/{}）: {} {}",
+                    "MCP 请求失败（403，立即禁用当前凭据并切换，尝试 {}/{}）: {} {}",
                     attempt + 1,
                     max_retries,
                     status,
@@ -224,6 +228,22 @@ impl KiroProvider {
                 let has_available = self.token_manager.report_immediate_failure(ctx.id);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                }
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                continue;
+            }
+
+            if should_rotate_without_disabling_status(status.as_u16()) {
+                tracing::warn!(
+                    "MCP 请求失败（{}，不禁用当前凭据，切换到下一张，尝试 {}/{}）: {}",
+                    status,
+                    attempt + 1,
+                    max_retries,
+                    body
+                );
+                let has_available = self.token_manager.report_retryable_status_failure(ctx.id);
+                if !has_available {
+                    anyhow::bail!("MCP 请求失败（无可切换凭据）: {} {}", status, body);
                 }
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 continue;
@@ -291,7 +311,8 @@ impl KiroProvider {
     /// 内部方法：带重试逻辑的 API 调用
     ///
     /// 重试策略：
-    /// - 单个凭据在 400/403/429 命中 2 次后禁用，首次命中先短冷却
+    /// - `403`：立即禁用当前凭据并切换
+    /// - `400/429`：不禁用当前凭据，短冷却后切换下一张
     /// - 总尝试次数 = min(凭据数量, 30)
     /// - 硬上限 30 次，避免无限重试
     async fn call_api_with_retry(
@@ -407,9 +428,9 @@ impl KiroProvider {
                 continue;
             }
 
-            if should_track_failfast_status(status.as_u16()) {
+            if should_disable_credential_on_status(status.as_u16()) {
                 tracing::warn!(
-                    "API 请求失败（状态码命中快速禁用计数规则，尝试 {}/{}）: {} {}",
+                    "API 请求失败（403，立即禁用当前凭据并切换，尝试 {}/{}）: {} {}",
                     attempt + 1,
                     max_retries,
                     status,
@@ -420,6 +441,34 @@ impl KiroProvider {
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
+                        api_type,
+                        status,
+                        body
+                    );
+                }
+
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                continue;
+            }
+
+            if should_rotate_without_disabling_status(status.as_u16()) {
+                tracing::warn!(
+                    "API 请求失败（{}，不禁用当前凭据，切换到下一张，尝试 {}/{}）: {}",
+                    status,
+                    attempt + 1,
+                    max_retries,
+                    body
+                );
+
+                let has_available = self.token_manager.report_retryable_status_failure(ctx.id);
+                if !has_available {
+                    anyhow::bail!(
+                        "{} API 请求失败（无可切换凭据）: {} {}",
                         api_type,
                         status,
                         body
@@ -565,7 +614,10 @@ impl KiroProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_TOTAL_RETRIES, should_track_failfast_status, total_attempt_limit};
+    use super::{
+        MAX_TOTAL_RETRIES, should_disable_credential_on_status,
+        should_rotate_without_disabling_status, total_attempt_limit,
+    };
 
     #[test]
     fn test_total_attempt_limit_caps_at_30() {
@@ -577,12 +629,17 @@ mod tests {
     }
 
     #[test]
-    fn test_should_track_failfast_status() {
-        assert!(should_track_failfast_status(400));
-        assert!(should_track_failfast_status(403));
-        assert!(should_track_failfast_status(429));
-        assert!(!should_track_failfast_status(401));
-        assert!(!should_track_failfast_status(402));
-        assert!(!should_track_failfast_status(500));
+    fn test_status_handling_rules() {
+        assert!(should_disable_credential_on_status(403));
+        assert!(!should_disable_credential_on_status(400));
+        assert!(!should_disable_credential_on_status(429));
+        assert!(!should_disable_credential_on_status(401));
+
+        assert!(should_rotate_without_disabling_status(400));
+        assert!(should_rotate_without_disabling_status(429));
+        assert!(!should_rotate_without_disabling_status(403));
+        assert!(!should_rotate_without_disabling_status(401));
+        assert!(!should_rotate_without_disabling_status(402));
+        assert!(!should_rotate_without_disabling_status(500));
     }
 }

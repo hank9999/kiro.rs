@@ -648,10 +648,8 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
-/// 每个凭据在 400/403/429 状态下的快速禁用阈值
-const MAX_IMMEDIATE_FAILURES_PER_CREDENTIAL: u32 = 2;
-/// 快速禁用类错误第一次命中后的短冷却，降低高并发重复踩同一坏账号。
-const IMMEDIATE_FAILURE_COOLDOWN: StdDuration = StdDuration::from_secs(30);
+/// `400/429` 这类需要切换但不禁用的状态在重试前的短冷却，避免立即回切。
+const RETRYABLE_STATUS_COOLDOWN: StdDuration = StdDuration::from_secs(30);
 /// 单次获取调用上下文的最大内部尝试次数，避免大量坏凭据放大刷新/校验开销。
 const MAX_CONTEXT_ACQUIRE_ATTEMPTS: usize = 30;
 /// 统计数据持久化防抖间隔
@@ -867,6 +865,7 @@ impl MultiTokenManager {
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     fn select_next_credential(&self, model: Option<&str>) -> Option<SelectedCredential> {
         let entries = self.entries.lock();
+        let now_ms = now_epoch_ms();
 
         // 检查是否是 opus 模型
         let is_opus = model
@@ -998,7 +997,10 @@ impl MultiTokenManager {
         }
 
         // 非自适应模式保留原有语义：先构造可用列表，再按模式选择。
-        let available: Vec<_> = entries.iter().filter(|e| is_available(e)).collect();
+        let available: Vec<_> = entries
+            .iter()
+            .filter(|e| is_available(e) && !e.runtime.is_cooling_down(now_ms))
+            .collect();
 
         if available.is_empty() {
             return None;
@@ -1083,9 +1085,12 @@ impl MultiTokenManager {
                 } else {
                     let entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
+                    let now_ms = now_epoch_ms();
                     entries
                         .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
+                        .find(|e| {
+                            e.id == current_id && !e.disabled && !e.runtime.is_cooling_down(now_ms)
+                        })
                         .map(|e| SelectedCredential {
                             id: e.id,
                             credentials: e.credentials.clone(),
@@ -1579,9 +1584,9 @@ impl MultiTokenManager {
 
     /// 报告指定凭据遭遇需要立即禁用的请求失败。
     ///
-    /// 用于处理上游明确拒绝当前凭据的场景（如 400/403/429）：
-    /// - 单独累计快速禁用计数
-    /// - 达到阈值后禁用该凭据，并切换到下一个可用凭据继续尝试
+    /// 用于处理上游明确拒绝当前凭据且无需保留的场景（如 403）：
+    /// - 立即禁用该凭据
+    /// - 切换到下一个可用凭据继续尝试
     /// - 返回是否还有可用凭据
     pub fn report_immediate_failure(&self, id: u64) -> bool {
         let result = {
@@ -1602,16 +1607,10 @@ impl MultiTokenManager {
             let immediate_failure_count = entry.immediate_failure_count;
 
             tracing::warn!(
-                "凭据 #{} 遭遇快速禁用类请求失败（{}/{}）",
+                "凭据 #{} 遭遇需立即禁用的请求失败（累计 {} 次）",
                 id,
-                immediate_failure_count,
-                MAX_IMMEDIATE_FAILURES_PER_CREDENTIAL
+                immediate_failure_count
             );
-
-            if immediate_failure_count < MAX_IMMEDIATE_FAILURES_PER_CREDENTIAL {
-                entry.runtime.set_cooldown_for(IMMEDIATE_FAILURE_COOLDOWN);
-                return entries.iter().any(|e| !e.disabled);
-            }
 
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::ImmediateFailure);
@@ -1640,6 +1639,43 @@ impl MultiTokenManager {
                 tracing::error!("所有凭据均已禁用！");
                 false
             }
+        };
+        self.save_stats_debounced();
+        result
+    }
+
+    /// 报告指定凭据遭遇可重试但需要临时切换的状态失败。
+    ///
+    /// 用于处理 `400/429` 这类当前请求不应继续压在同一凭据上的场景：
+    /// - 不禁用该凭据
+    /// - 标记短冷却，避免所有模式立刻切回同一张凭据
+    /// - 返回当前是否还有可立即尝试的其他凭据
+    pub fn report_retryable_status_failure(&self, id: u64) -> bool {
+        let result = {
+            let mut entries = self.entries.lock();
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => return false,
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|e| !e.disabled);
+            }
+
+            entry.immediate_failure_count += 1;
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.runtime.set_cooldown_for(RETRYABLE_STATUS_COOLDOWN);
+
+            tracing::warn!(
+                "凭据 #{} 遭遇可重试状态失败（累计 {} 次），进入短冷却并切换下一张",
+                id,
+                entry.immediate_failure_count
+            );
+
+            let now_ms = now_epoch_ms();
+            entries
+                .iter()
+                .any(|e| !e.disabled && !e.runtime.is_cooling_down(now_ms))
         };
         self.save_stats_debounced();
         result
@@ -3076,7 +3112,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_token_manager_report_immediate_failure() {
+    fn test_multi_token_manager_report_immediate_failure_disables_immediately() {
         let config = Config::default();
         let cred1 = KiroCredentials::default();
         let cred2 = KiroCredentials::default();
@@ -3086,14 +3122,6 @@ mod tests {
 
         assert_eq!(manager.available_count(), 2);
         assert!(manager.report_immediate_failure(1));
-        assert_eq!(manager.available_count(), 2);
-
-        let snapshot = manager.snapshot();
-        let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
-        assert!(!first.disabled);
-        assert_eq!(snapshot.current_id, 1);
-
-        assert!(manager.report_immediate_failure(1));
         assert_eq!(manager.available_count(), 1);
 
         let snapshot = manager.snapshot();
@@ -3101,12 +3129,52 @@ mod tests {
         assert!(first.disabled);
         assert_eq!(first.disabled_reason.as_deref(), Some("ImmediateFailure"));
         assert_eq!(snapshot.current_id, 2);
+    }
 
-        assert!(manager.report_immediate_failure(2));
-        assert_eq!(manager.available_count(), 1);
+    async fn assert_retryable_status_failure_switches_without_disabling(mode: &str) {
+        let mut config = Config::default();
+        config.load_balancing_mode = mode.to_string();
 
-        assert!(!manager.report_immediate_failure(2));
-        assert_eq!(manager.available_count(), 0);
+        let mut cred1 = KiroCredentials::default();
+        cred1.priority = 0;
+        cred1.kiro_api_key = Some("token-1".to_string());
+
+        let mut cred2 = KiroCredentials::default();
+        cred2.priority = 1;
+        cred2.kiro_api_key = Some("token-2".to_string());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        assert!(manager.report_retryable_status_failure(1));
+
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(!first.disabled, "mode={}", mode);
+
+        let ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, 2, "mode={}", mode);
+    }
+
+    #[tokio::test]
+    async fn test_multi_token_manager_retryable_status_failure_switches_in_priority_mode() {
+        assert_retryable_status_failure_switches_without_disabling("priority").await;
+    }
+
+    #[tokio::test]
+    async fn test_multi_token_manager_retryable_status_failure_switches_in_balanced_mode() {
+        assert_retryable_status_failure_switches_without_disabling("balanced").await;
+    }
+
+    #[tokio::test]
+    async fn test_multi_token_manager_retryable_status_failure_switches_in_round_robin_mode() {
+        assert_retryable_status_failure_switches_without_disabling("round_robin").await;
+    }
+
+    #[tokio::test]
+    async fn test_multi_token_manager_retryable_status_failure_switches_in_adaptive_round_robin_mode()
+     {
+        assert_retryable_status_failure_switches_without_disabling("adaptive_round_robin").await;
     }
 
     #[tokio::test]
@@ -3119,8 +3187,6 @@ mod tests {
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
         manager.report_immediate_failure(1);
-        manager.report_immediate_failure(1);
-        manager.report_immediate_failure(2);
         manager.report_immediate_failure(2);
         assert_eq!(manager.available_count(), 0);
 
