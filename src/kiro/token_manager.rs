@@ -1352,11 +1352,10 @@ impl MultiTokenManager {
                         && !entry.runtime.is_cooling_down(now_ms)
                 })
                 .collect();
-            candidates.sort_by_key(|entry| entry.credentials.priority);
+            fastrand::shuffle(&mut candidates);
 
             candidates.into_iter().find_map(|entry| {
                 CredentialLease::try_acquire(entry.runtime.clone(), 1).map(|lease| {
-                    *self.current_id.lock() = entry.id;
                     SelectedCredential {
                         id: entry.id,
                         credentials: entry.credentials.clone(),
@@ -2859,7 +2858,17 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use uuid::Uuid;
+
+    fn premium_probe_credential(id: u64, priority: u32) -> KiroCredentials {
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(id);
+        credential.priority = priority;
+        credential.access_token = Some(format!("test-access-token-{id}"));
+        credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        credential
+    }
 
     #[test]
     fn test_is_token_expired_with_expired_token() {
@@ -2920,6 +2929,57 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_premium_probe_context_randomizes_unknown_candidates() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                premium_probe_credential(1, 0),
+                premium_probe_credential(2, 10),
+                premium_probe_credential(3, 20),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut selected_ids = BTreeSet::new();
+        for _ in 0..64 {
+            let ctx = manager.acquire_premium_probe_context().await.unwrap();
+            selected_ids.insert(ctx.id);
+        }
+
+        assert!(
+            selected_ids.len() > 1,
+            "premium probe credential selection stayed fixed at {:?}",
+            selected_ids
+        );
+    }
+
+    #[tokio::test]
+    async fn test_acquire_premium_probe_context_does_not_mutate_current_id() {
+        let config = Config::default();
+        let mut current_credential = premium_probe_credential(1, 0);
+        current_credential.premium_model_access = Some(false);
+        let probe_credential = premium_probe_credential(2, 10);
+        let manager = MultiTokenManager::new(
+            config,
+            vec![current_credential, probe_credential],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let initial_current_id = manager.snapshot().current_id;
+
+        let ctx = manager.acquire_premium_probe_context().await.unwrap();
+
+        assert_eq!(ctx.id, 2);
+        assert_eq!(manager.snapshot().current_id, initial_current_id);
     }
 
     #[test]
