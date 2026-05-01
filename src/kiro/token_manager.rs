@@ -1868,9 +1868,6 @@ impl MultiTokenManager {
 
             entries.iter().any(|e| !e.disabled)
         };
-        if let Err(e) = self.persist_credentials() {
-            tracing::warn!("立即禁用凭据后持久化失败（运行态已禁用）: {}", e);
-        }
         self.save_stats_debounced();
         result
     }
@@ -1983,6 +1980,9 @@ impl MultiTokenManager {
                 false
             }
         };
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!("立即禁用凭据后持久化失败（运行态已禁用）: {}", e);
+        }
         self.save_stats_debounced();
         result
     }
