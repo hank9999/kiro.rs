@@ -1868,6 +1868,9 @@ impl MultiTokenManager {
 
             entries.iter().any(|e| !e.disabled)
         };
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!("立即禁用凭据后持久化失败（运行态已禁用）: {}", e);
+        }
         self.save_stats_debounced();
         result
     }
@@ -3673,6 +3676,41 @@ mod tests {
         assert!(first.disabled);
         assert_eq!(first.disabled_reason.as_deref(), Some("ImmediateFailure"));
         assert_eq!(snapshot.current_id, 2);
+    }
+
+    #[test]
+    fn test_multi_token_manager_report_immediate_failure_persists_disabled_state() {
+        let dir = std::env::temp_dir().join(format!("kiro-immediate-failure-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let credentials_path = dir.join("credentials.json");
+
+        let cred1 = premium_probe_credential(1, 0);
+        let cred2 = premium_probe_credential(2, 10);
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![cred1.clone(), cred2.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred1, cred2],
+            None,
+            Some(credentials_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        assert!(manager.report_immediate_failure(1));
+
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&credentials_path).unwrap()).unwrap();
+        assert_eq!(persisted[0].id, Some(1));
+        assert!(persisted[0].disabled);
+        assert_eq!(persisted[1].id, Some(2));
+        assert!(!persisted[1].disabled);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     async fn assert_retryable_status_failure_switches_without_disabling(mode: &str) {
