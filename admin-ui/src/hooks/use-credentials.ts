@@ -10,6 +10,10 @@ import {
   getCredentialBalance,
   addCredential,
   deleteCredential,
+  getPremiumCredentials,
+  exportPremiumCredentials,
+  restorePremiumCredential,
+  deletePremiumCredential,
   getLoadBalancingMode,
   getRuntimeMetrics,
   setLoadBalancingMode,
@@ -121,6 +125,45 @@ export function useDeleteCredential() {
     mutationFn: (id: number) => deleteCredential(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 查询高级凭证库
+export function usePremiumCredentials(enabled: boolean) {
+  return useQuery({
+    queryKey: ['premiumCredentials'],
+    queryFn: getPremiumCredentials,
+    enabled,
+  })
+}
+
+// 导出高级凭证库完整内容
+export function useExportPremiumCredentials() {
+  return useMutation({
+    mutationFn: exportPremiumCredentials,
+  })
+}
+
+// 恢复高级凭证到普通池
+export function useRestorePremiumCredential() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => restorePremiumCredential(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['premiumCredentials'] })
+    },
+  })
+}
+
+// 删除高级凭证
+export function useDeletePremiumCredential() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => deletePremiumCredential(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['premiumCredentials'] })
     },
   })
 }

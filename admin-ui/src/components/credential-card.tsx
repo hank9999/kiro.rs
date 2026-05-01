@@ -49,6 +49,26 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
+function formatPremiumStatus(access: boolean | null): {
+  label: string
+  variant: 'success' | 'destructive' | 'warning'
+} {
+  if (access === true) {
+    return { label: '高级模型：是', variant: 'success' }
+  }
+  if (access === false) {
+    return { label: '高级模型：否', variant: 'destructive' }
+  }
+  return { label: '高级模型：未校验', variant: 'warning' }
+}
+
+function formatDateTime(value?: string | null): string {
+  if (!value) return '未知'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleString('zh-CN')
+}
+
 export function CredentialCard({
   credential,
   onViewBalance,
@@ -66,6 +86,7 @@ export function CredentialCard({
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
+  const premiumStatus = formatPremiumStatus(credential.premiumModelAccess)
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -173,6 +194,7 @@ export function CredentialCard({
                 {credential.endpoint && (
                   <Badge variant="outline">{credential.endpoint}</Badge>
                 )}
+                <Badge variant={premiumStatus.variant}>{premiumStatus.label}</Badge>
               </CardTitle>
             </div>
             <div className="flex items-center gap-2">
@@ -285,6 +307,34 @@ export function CredentialCard({
               <div className="col-span-2">
                 <span className="text-muted-foreground">代理：</span>
                 <span className="font-medium">{credential.proxyUrl}</span>
+              </div>
+            )}
+            {(credential.premiumModelAccessCheckedAt ||
+              credential.premiumModelAccessProbeModel ||
+              credential.premiumModelAccessLastError) && (
+              <div className="col-span-2 rounded-md border p-2 space-y-1">
+                <div>
+                  <span className="text-muted-foreground">高级校验：</span>
+                  <span className="font-medium">{formatDateTime(credential.premiumModelAccessCheckedAt)}</span>
+                </div>
+                {credential.premiumModelAccessSourceModel && (
+                  <div>
+                    <span className="text-muted-foreground">来源模型：</span>
+                    <span className="font-medium">{credential.premiumModelAccessSourceModel}</span>
+                  </div>
+                )}
+                {credential.premiumModelAccessProbeModel && (
+                  <div>
+                    <span className="text-muted-foreground">探针模型：</span>
+                    <span className="font-medium">{credential.premiumModelAccessProbeModel}</span>
+                  </div>
+                )}
+                {credential.premiumModelAccessLastError && (
+                  <div>
+                    <span className="text-muted-foreground">校验错误：</span>
+                    <span className="text-red-500 break-all">{credential.premiumModelAccessLastError}</span>
+                  </div>
+                )}
               </div>
             )}
             {credential.hasProfileArn && (

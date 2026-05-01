@@ -7,19 +7,35 @@ use std::sync::Arc;
 use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{MultiTokenManager, RuntimeMetrics};
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    ClearImmediateFailureDisabledResponse, CredentialsStatusResponse, LoadBalancingModeResponse,
-    ResetAllCredentialsResponse, SetLoadBalancingModeRequest,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse,
+    ClearImmediateFailureDisabledResponse, CredentialStatusItem, CredentialsStatusResponse,
+    LoadBalancingModeResponse, PremiumCredentialItem, PremiumCredentialsExportResponse,
+    PremiumCredentialsResponse, ResetAllCredentialsResponse, RestorePremiumCredentialResponse,
+    SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+
+fn sha256_hex(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn mask_api_key(value: &str) -> String {
+    if value.len() <= 12 {
+        return "***".to_string();
+    }
+    format!("{}...{}", &value[..6], &value[value.len() - 4..])
+}
 
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +104,12 @@ impl AdminService {
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                premium_model_access: entry.premium_model_access,
+                premium_model_access_checked_at: entry.premium_model_access_checked_at,
+                premium_model_access_probe_model: entry.premium_model_access_probe_model,
+                premium_model_access_source_model: entry.premium_model_access_source_model,
+                premium_model_access_last_error: entry.premium_model_access_last_error,
+                premium_vault_status: entry.premium_vault_status,
             })
             .collect();
 
@@ -287,6 +309,12 @@ impl AdminService {
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
+            premium_model_access: None,
+            premium_model_access_checked_at: None,
+            premium_model_access_probe_model: None,
+            premium_model_access_source_model: None,
+            premium_model_access_last_error: None,
+            premium_vault_status: None,
         };
 
         // 调用 token_manager 添加凭据
@@ -323,6 +351,74 @@ impl AdminService {
         self.save_balance_cache();
 
         Ok(())
+    }
+
+    pub fn get_premium_credentials(&self) -> Result<PremiumCredentialsResponse, AdminServiceError> {
+        let credentials = self
+            .token_manager
+            .list_premium_vault_credentials()
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        let items = credentials
+            .into_iter()
+            .map(|credential| {
+                let is_api_key = credential.is_api_key_credential();
+                PremiumCredentialItem {
+                    id: credential.id.unwrap_or(0),
+                    email: credential.email,
+                    auth_method: if is_api_key {
+                        Some("api_key".to_string())
+                    } else {
+                        credential.auth_method
+                    },
+                    refresh_token_hash: credential.refresh_token.as_deref().map(sha256_hex),
+                    api_key_hash: credential.kiro_api_key.as_deref().map(sha256_hex),
+                    masked_api_key: credential.kiro_api_key.as_deref().map(mask_api_key),
+                    premium_model_access_checked_at: credential.premium_model_access_checked_at,
+                    premium_model_access_probe_model: credential.premium_model_access_probe_model,
+                    premium_model_access_source_model: credential.premium_model_access_source_model,
+                    premium_vault_status: credential.premium_vault_status,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        Ok(PremiumCredentialsResponse {
+            total: items.len(),
+            credentials: items,
+        })
+    }
+
+    pub fn export_premium_credentials(
+        &self,
+    ) -> Result<PremiumCredentialsExportResponse, AdminServiceError> {
+        let credentials = self
+            .token_manager
+            .list_premium_vault_credentials()
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        Ok(PremiumCredentialsExportResponse {
+            total: credentials.len(),
+            credentials,
+        })
+    }
+
+    pub fn restore_premium_credential(
+        &self,
+        id: u64,
+    ) -> Result<RestorePremiumCredentialResponse, AdminServiceError> {
+        let credential_id = self
+            .token_manager
+            .restore_premium_vault_credential(id)
+            .map_err(|e| self.classify_premium_vault_error(e, id))?;
+        Ok(RestorePremiumCredentialResponse {
+            success: true,
+            message: format!("高级凭证 #{} 已恢复到普通池", id),
+            credential_id,
+        })
+    }
+
+    pub fn delete_premium_credential(&self, id: u64) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .delete_premium_vault_credential(id)
+            .map_err(|e| self.classify_premium_vault_error(e, id))
     }
 
     /// 获取负载均衡模式
@@ -513,6 +609,15 @@ impl AdminService {
         } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
         {
             AdminServiceError::InvalidCredential(msg)
+        } else {
+            AdminServiceError::InternalError(msg)
+        }
+    }
+
+    fn classify_premium_vault_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
+        let msg = e.to_string();
+        if msg.contains("不存在") {
+            AdminServiceError::NotFound { id }
         } else {
             AdminServiceError::InternalError(msg)
         }

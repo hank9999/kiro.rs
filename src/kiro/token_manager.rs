@@ -12,6 +12,7 @@ use tokio::sync::Mutex as TokioMutex;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -545,6 +546,14 @@ struct StatsEntry {
     last_used_at: Option<String>,
 }
 
+/// 高级模型探针证明信息，用于写入高级凭证库和审计流水。
+#[derive(Debug, Clone)]
+pub struct PremiumVaultProof {
+    pub source_model: String,
+    pub target_model: String,
+    pub status: u16,
+}
+
 // ============================================================================
 // Admin API 公开结构
 // ============================================================================
@@ -592,6 +601,18 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 是否已验证可调用高级模型
+    pub premium_model_access: Option<bool>,
+    /// 高级模型能力最近一次校验时间
+    pub premium_model_access_checked_at: Option<String>,
+    /// 最近一次高级模型探针目标模型
+    pub premium_model_access_probe_model: Option<String>,
+    /// 最近一次高级模型探针源模型
+    pub premium_model_access_source_model: Option<String>,
+    /// 最近一次高级模型探针错误摘要
+    pub premium_model_access_last_error: Option<String>,
+    /// 高级凭证库状态
+    pub premium_vault_status: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -1307,6 +1328,285 @@ impl MultiTokenManager {
         })
     }
 
+    /// 是否存在可用于高级模型探针的未校验凭据。
+    pub fn has_premium_probe_candidate(&self) -> bool {
+        let entries = self.entries.lock();
+        let now_ms = now_epoch_ms();
+        entries.iter().any(|entry| {
+            !entry.disabled
+                && entry.credentials.premium_model_access.is_none()
+                && !entry.runtime.is_cooling_down(now_ms)
+        })
+    }
+
+    /// 获取一个仅用于高级模型探针的调用上下文，只会选择未校验凭据。
+    pub async fn acquire_premium_probe_context(&self) -> anyhow::Result<CallContext> {
+        let selected = {
+            let entries = self.entries.lock();
+            let now_ms = now_epoch_ms();
+            let mut candidates: Vec<_> = entries
+                .iter()
+                .filter(|entry| {
+                    !entry.disabled
+                        && entry.credentials.premium_model_access.is_none()
+                        && !entry.runtime.is_cooling_down(now_ms)
+                })
+                .collect();
+            candidates.sort_by_key(|entry| entry.credentials.priority);
+
+            candidates.into_iter().find_map(|entry| {
+                CredentialLease::try_acquire(entry.runtime.clone(), 1).map(|lease| {
+                    *self.current_id.lock() = entry.id;
+                    SelectedCredential {
+                        id: entry.id,
+                        credentials: entry.credentials.clone(),
+                        lease,
+                    }
+                })
+            })
+        };
+
+        let selected = selected.ok_or_else(|| anyhow::anyhow!("没有未校验的高级模型候选凭据"))?;
+        match self
+            .try_ensure_token(selected.id, &selected.credentials, selected.lease)
+            .await
+        {
+            Ok(ctx) => Ok(ctx),
+            Err(e) => {
+                self.report_refresh_failure(selected.id);
+                Err(e)
+            }
+        }
+    }
+
+    /// 标记凭据高级模型能力并回写普通凭据文件。
+    pub fn mark_premium_model_access(
+        &self,
+        id: u64,
+        access: bool,
+        proof: &PremiumVaultProof,
+        error: Option<&str>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            let checked_at = Utc::now().to_rfc3339();
+            entry.credentials.premium_model_access = Some(access);
+            entry.credentials.premium_model_access_checked_at = Some(checked_at);
+            entry.credentials.premium_model_access_probe_model = Some(proof.target_model.clone());
+            entry.credentials.premium_model_access_source_model = Some(proof.source_model.clone());
+            entry.credentials.premium_model_access_last_error = error.map(|s| s.to_string());
+        }
+
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    fn read_premium_vault(&self, path: &PathBuf) -> anyhow::Result<Vec<KiroCredentials>> {
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let content = std::fs::read_to_string(path)?;
+        if content.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(serde_json::from_str(&content)?)
+    }
+
+    fn write_premium_vault(
+        &self,
+        path: &PathBuf,
+        credentials: &[KiroCredentials],
+    ) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(credentials)?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    fn append_premium_event(
+        &self,
+        event: &str,
+        credential: &KiroCredentials,
+        proof: &PremiumVaultProof,
+    ) -> anyhow::Result<()> {
+        let path = self.premium_event_log_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let refresh_token_hash = credential.refresh_token.as_deref().map(sha256_hex);
+        let api_key_hash = credential.kiro_api_key.as_deref().map(sha256_hex);
+        let payload = serde_json::json!({
+            "event": event,
+            "credentialId": credential.id,
+            "at": Utc::now().to_rfc3339(),
+            "sourceModel": proof.source_model,
+            "targetModel": proof.target_model,
+            "status": proof.status,
+            "refreshTokenHash": refresh_token_hash,
+            "apiKeyHash": api_key_hash,
+            "email": credential.email,
+        });
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        writeln!(file, "{}", serde_json::to_string(&payload)?)?;
+        file.flush()?;
+        Ok(())
+    }
+
+    /// 将已验证高级模型可用的凭据移入高级凭证库，成功写库后才从普通池移除。
+    pub fn move_credential_to_premium_vault(
+        &self,
+        id: u64,
+        proof: &PremiumVaultProof,
+    ) -> anyhow::Result<()> {
+        let mut credential = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        let checked_at = Utc::now().to_rfc3339();
+        credential.premium_model_access = Some(true);
+        credential.premium_model_access_checked_at = Some(checked_at);
+        credential.premium_model_access_probe_model = Some(proof.target_model.clone());
+        credential.premium_model_access_source_model = Some(proof.source_model.clone());
+        credential.premium_model_access_last_error = None;
+        credential.premium_vault_status = Some("verified".to_string());
+
+        let vault_path = self.premium_vault_path();
+        let mut vault = self.read_premium_vault(&vault_path)?;
+        let refresh_hash = credential.refresh_token.as_deref().map(sha256_hex);
+        let api_key_hash = credential.kiro_api_key.as_deref().map(sha256_hex);
+        let exists = vault.iter().any(|existing| {
+            existing.id == credential.id
+                || (refresh_hash.is_some()
+                    && existing.refresh_token.as_deref().map(sha256_hex) == refresh_hash)
+                || (api_key_hash.is_some()
+                    && existing.kiro_api_key.as_deref().map(sha256_hex) == api_key_hash)
+        });
+        if !exists {
+            vault.push(credential.clone());
+        }
+        self.write_premium_vault(&vault_path, &vault)?;
+        self.append_premium_event("moved_to_premium_vault", &credential, proof)?;
+
+        {
+            let mut entries = self.entries.lock();
+            entries.retain(|entry| entry.id != id);
+        }
+        self.select_highest_priority();
+        self.persist_credentials()?;
+        self.save_stats();
+        tracing::info!(
+            "凭据 #{} 已验证可调用高级模型并移入高级凭证库: {}",
+            id,
+            vault_path.display()
+        );
+        Ok(())
+    }
+
+    pub fn list_premium_vault_credentials(&self) -> anyhow::Result<Vec<KiroCredentials>> {
+        self.read_premium_vault(&self.premium_vault_path())
+    }
+
+    pub fn restore_premium_vault_credential(&self, id: u64) -> anyhow::Result<u64> {
+        let vault_path = self.premium_vault_path();
+        let mut vault = self.read_premium_vault(&vault_path)?;
+        let position = vault
+            .iter()
+            .position(|credential| credential.id == Some(id))
+            .ok_or_else(|| anyhow::anyhow!("高级凭证不存在: {}", id))?;
+        let mut credential = vault.remove(position);
+        credential.disabled = false;
+        credential.premium_vault_status = Some("restored".to_string());
+
+        let restored_id = {
+            let mut entries = self.entries.lock();
+            let duplicate_id = credential
+                .id
+                .is_some_and(|candidate| entries.iter().any(|entry| entry.id == candidate));
+            if duplicate_id || credential.id.is_none() {
+                let new_id = entries.iter().map(|entry| entry.id).max().unwrap_or(0) + 1;
+                credential.id = Some(new_id);
+            }
+            let id = credential.id.unwrap();
+            entries.push(CredentialEntry {
+                id,
+                credentials: credential.clone(),
+                failure_count: 0,
+                immediate_failure_count: 0,
+                refresh_failure_count: 0,
+                disabled: false,
+                disabled_reason: None,
+                success_count: 0,
+                last_used_at: None,
+                runtime: Arc::new(CredentialRuntimeState::new()),
+            });
+            id
+        };
+
+        self.persist_credentials()?;
+        self.write_premium_vault(&vault_path, &vault)?;
+        self.append_premium_event(
+            "restored_to_active_pool",
+            &credential,
+            &PremiumVaultProof {
+                source_model: credential
+                    .premium_model_access_source_model
+                    .clone()
+                    .unwrap_or_default(),
+                target_model: credential
+                    .premium_model_access_probe_model
+                    .clone()
+                    .unwrap_or_default(),
+                status: 0,
+            },
+        )?;
+        self.select_highest_priority();
+        Ok(restored_id)
+    }
+
+    pub fn delete_premium_vault_credential(&self, id: u64) -> anyhow::Result<()> {
+        let vault_path = self.premium_vault_path();
+        let mut vault = self.read_premium_vault(&vault_path)?;
+        let position = vault
+            .iter()
+            .position(|credential| credential.id == Some(id))
+            .ok_or_else(|| anyhow::anyhow!("高级凭证不存在: {}", id))?;
+        let mut credential = vault.remove(position);
+        credential.premium_vault_status = Some("deleted".to_string());
+        self.write_premium_vault(&vault_path, &vault)?;
+        self.append_premium_event(
+            "deleted_from_premium_vault",
+            &credential,
+            &PremiumVaultProof {
+                source_model: credential
+                    .premium_model_access_source_model
+                    .clone()
+                    .unwrap_or_default(),
+                target_model: credential
+                    .premium_model_access_probe_model
+                    .clone()
+                    .unwrap_or_default(),
+                status: 0,
+            },
+        )?;
+        Ok(())
+    }
+
     /// 将凭据列表回写到源文件
     ///
     /// 仅在以下条件满足时回写：
@@ -1365,6 +1665,36 @@ impl MultiTokenManager {
         self.credentials_path
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    }
+
+    fn resolve_credentials_sidecar_path(&self, configured: &str, default_name: &str) -> PathBuf {
+        let name = if configured.trim().is_empty() {
+            default_name
+        } else {
+            configured
+        };
+        let path = PathBuf::from(name);
+        if path.is_absolute() {
+            path
+        } else {
+            self.cache_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(path)
+        }
+    }
+
+    fn premium_vault_path(&self) -> PathBuf {
+        self.resolve_credentials_sidecar_path(
+            &self.config.premium_model_probe.premium_vault_path,
+            "credentials.premium.json",
+        )
+    }
+
+    fn premium_event_log_path(&self) -> PathBuf {
+        self.resolve_credentials_sidecar_path(
+            &self.config.premium_model_probe.event_log_path,
+            "credentials.premium-events.jsonl",
+        )
     }
 
     /// 统计数据文件路径
@@ -1899,6 +2229,24 @@ impl MultiTokenManager {
                         .to_string()
                     }),
                     endpoint: e.credentials.endpoint.clone(),
+                    premium_model_access: e.credentials.premium_model_access,
+                    premium_model_access_checked_at: e
+                        .credentials
+                        .premium_model_access_checked_at
+                        .clone(),
+                    premium_model_access_probe_model: e
+                        .credentials
+                        .premium_model_access_probe_model
+                        .clone(),
+                    premium_model_access_source_model: e
+                        .credentials
+                        .premium_model_access_source_model
+                        .clone(),
+                    premium_model_access_last_error: e
+                        .credentials
+                        .premium_model_access_last_error
+                        .clone(),
+                    premium_vault_status: e.credentials.premium_vault_status.clone(),
                 })
                 .collect(),
             current_id,
@@ -2511,12 +2859,67 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     #[test]
     fn test_is_token_expired_with_expired_token() {
         let mut credentials = KiroCredentials::default();
         credentials.expires_at = Some("2020-01-01T00:00:00Z".to_string());
         assert!(is_token_expired(&credentials));
+    }
+
+    #[test]
+    fn test_move_credential_to_premium_vault_writes_vault_and_removes_active() {
+        let dir = std::env::temp_dir().join(format!("kiro-premium-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let credentials_path = dir.join("credentials.json");
+
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.refresh_token = Some("test-refresh-token".to_string());
+        credential.access_token = Some("test-access-token".to_string());
+        credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        credential.machine_id = Some("a".repeat(64));
+
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![credential],
+            None,
+            Some(credentials_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        let proof = PremiumVaultProof {
+            source_model: "claude-sonnet-4-5-20250929".to_string(),
+            target_model: "claude-sonnet-4-6".to_string(),
+            status: 200,
+        };
+
+        manager.move_credential_to_premium_vault(1, &proof).unwrap();
+
+        let active: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&credentials_path).unwrap()).unwrap();
+        assert!(active.is_empty());
+
+        let vault_path = dir.join("credentials.premium.json");
+        let vault: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&vault_path).unwrap()).unwrap();
+        assert_eq!(vault.len(), 1);
+        assert_eq!(vault[0].id, Some(1));
+        assert_eq!(vault[0].premium_model_access, Some(true));
+        assert_eq!(
+            vault[0].premium_model_access_probe_model.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

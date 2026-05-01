@@ -109,6 +109,36 @@ pub struct KiroCredentials {
     /// 端点名必须在启动时注册的端点 registry 中存在。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// 是否已验证可调用高级模型：None=未校验，Some(true)=可调用，Some(false)=不可调用
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub premium_model_access: Option<bool>,
+
+    /// 高级模型能力最近一次校验时间（RFC3339）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub premium_model_access_checked_at: Option<String>,
+
+    /// 最近一次高级模型探针使用的目标模型
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub premium_model_access_probe_model: Option<String>,
+
+    /// 最近一次高级模型探针改写前的源模型
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub premium_model_access_source_model: Option<String>,
+
+    /// 最近一次高级模型探针的确定性错误摘要
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub premium_model_access_last_error: Option<String>,
+
+    /// 高级凭证库管理状态（如 verified/exported/restored）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub premium_vault_status: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -343,6 +373,12 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            premium_model_access: None,
+            premium_model_access_checked_at: None,
+            premium_model_access_probe_model: None,
+            premium_model_access_source_model: None,
+            premium_model_access_last_error: None,
+            premium_vault_status: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -461,6 +497,12 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            premium_model_access: None,
+            premium_model_access_checked_at: None,
+            premium_model_access_probe_model: None,
+            premium_model_access_source_model: None,
+            premium_model_access_last_error: None,
+            premium_vault_status: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -492,6 +534,12 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            premium_model_access: None,
+            premium_model_access_checked_at: None,
+            premium_model_access_probe_model: None,
+            premium_model_access_source_model: None,
+            premium_model_access_last_error: None,
+            premium_vault_status: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -606,6 +654,12 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            premium_model_access: None,
+            premium_model_access_checked_at: None,
+            premium_model_access_probe_model: None,
+            premium_model_access_source_model: None,
+            premium_model_access_last_error: None,
+            premium_vault_status: None,
         };
 
         let json = original.to_pretty_json().unwrap();
@@ -869,5 +923,30 @@ mod tests {
         let creds = KiroCredentials::default();
         let result = creds.effective_proxy(None);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_premium_model_access_roundtrip() {
+        let json = r#"{
+            "id": 7,
+            "refreshToken": "test_refresh",
+            "premiumModelAccess": true,
+            "premiumModelAccessCheckedAt": "2026-05-01T12:00:00Z",
+            "premiumModelAccessProbeModel": "claude-sonnet-4-6",
+            "premiumModelAccessSourceModel": "claude-sonnet-4-5-20250929",
+            "premiumVaultStatus": "verified"
+        }"#;
+
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(creds.premium_model_access, Some(true));
+        assert_eq!(
+            creds.premium_model_access_probe_model.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(creds.premium_vault_status.as_deref(), Some("verified"));
+
+        let serialized = creds.to_pretty_json().unwrap();
+        assert!(serialized.contains("premiumModelAccess"));
+        assert!(serialized.contains("premiumVaultStatus"));
     }
 }

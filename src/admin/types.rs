@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::kiro::model::credentials::KiroCredentials;
+
 // ============ 凭据状态 ============
 
 /// 所有凭据状态响应
@@ -62,6 +64,18 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 是否已验证可调用高级模型：null=未校验，true=可调用，false=不可调用
+    pub premium_model_access: Option<bool>,
+    /// 高级模型能力最近一次校验时间
+    pub premium_model_access_checked_at: Option<String>,
+    /// 最近一次高级模型探针目标模型
+    pub premium_model_access_probe_model: Option<String>,
+    /// 最近一次高级模型探针源模型
+    pub premium_model_access_source_model: Option<String>,
+    /// 最近一次高级模型探针错误摘要
+    pub premium_model_access_last_error: Option<String>,
+    /// 高级凭证库状态
+    pub premium_vault_status: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -181,6 +195,45 @@ pub struct ClearImmediateFailureDisabledResponse {
     pub total: usize,
     pub available: usize,
     pub current_id: u64,
+}
+
+// ============ 高级凭证库 ============
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PremiumCredentialsResponse {
+    pub total: usize,
+    pub credentials: Vec<PremiumCredentialItem>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PremiumCredentialItem {
+    pub id: u64,
+    pub email: Option<String>,
+    pub auth_method: Option<String>,
+    pub refresh_token_hash: Option<String>,
+    pub api_key_hash: Option<String>,
+    pub masked_api_key: Option<String>,
+    pub premium_model_access_checked_at: Option<String>,
+    pub premium_model_access_probe_model: Option<String>,
+    pub premium_model_access_source_model: Option<String>,
+    pub premium_vault_status: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PremiumCredentialsExportResponse {
+    pub total: usize,
+    pub credentials: Vec<KiroCredentials>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestorePremiumCredentialResponse {
+    pub success: bool,
+    pub message: String,
+    pub credential_id: u64,
 }
 
 // ============ 余额查询 ============

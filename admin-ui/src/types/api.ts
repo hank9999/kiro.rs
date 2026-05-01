@@ -27,6 +27,12 @@ export interface CredentialStatusItem {
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
+  premiumModelAccess: boolean | null
+  premiumModelAccessCheckedAt?: string | null
+  premiumModelAccessProbeModel?: string | null
+  premiumModelAccessSourceModel?: string | null
+  premiumModelAccessLastError?: string | null
+  premiumVaultStatus?: string | null
 }
 
 // 余额响应
@@ -65,6 +71,35 @@ export interface ClearImmediateFailureDisabledResponse {
   total: number
   available: number
   currentId: number
+}
+
+export interface PremiumCredentialItem {
+  id: number
+  email?: string | null
+  authMethod?: string | null
+  refreshTokenHash?: string | null
+  apiKeyHash?: string | null
+  maskedApiKey?: string | null
+  premiumModelAccessCheckedAt?: string | null
+  premiumModelAccessProbeModel?: string | null
+  premiumModelAccessSourceModel?: string | null
+  premiumVaultStatus?: string | null
+}
+
+export interface PremiumCredentialsResponse {
+  total: number
+  credentials: PremiumCredentialItem[]
+}
+
+export interface PremiumCredentialsExportResponse {
+  total: number
+  credentials: unknown[]
+}
+
+export interface RestorePremiumCredentialResponse {
+  success: boolean
+  message: string
+  credentialId: number
 }
 
 // 错误响应

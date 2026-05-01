@@ -5,5 +5,17 @@
   "tlsBackend": "rustls",
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
-  "defaultEndpoint": "ide"
+  "defaultEndpoint": "ide",
+  "premiumModelProbe": {
+    "enabled": false,
+    "probability": 0.01,
+    "nonStreamOnly": true,
+    "sourceModels": [
+      "claude-sonnet-4-5-20250929",
+      "claude-sonnet-4-5-20250929-thinking"
+    ],
+    "targetModel": "claude-sonnet-4-6",
+    "premiumVaultPath": "credentials.premium.json",
+    "eventLogPath": "credentials.premium-events.jsonl"
+  }
 }

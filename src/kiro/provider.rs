@@ -30,6 +30,12 @@ fn should_rotate_without_disabling_status(status: u16) -> bool {
     matches!(status, 400 | 429)
 }
 
+pub(crate) fn is_invalid_model_id_error(status: u16, body: &str) -> bool {
+    (status == 400 || status == 502)
+        && (body.contains("INVALID_MODEL_ID")
+            || body.contains("Invalid model. Please select a different model"))
+}
+
 fn total_attempt_limit(total_credentials: usize) -> usize {
     total_credentials.clamp(1, MAX_TOTAL_RETRIES)
 }
@@ -124,6 +130,124 @@ impl KiroProvider {
     /// 发送流式 API 请求
     pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
         self.call_api_with_retry(request_body, true).await
+    }
+
+    pub fn premium_probe_target_for(&self, model: &str, stream: bool) -> Option<String> {
+        let probe = &self.token_manager.config().premium_model_probe;
+        if !probe.should_probe_model(model, stream) {
+            return None;
+        }
+        if !self.token_manager.has_premium_probe_candidate() {
+            return None;
+        }
+        if fastrand::f64() > probe.probability_clamped() {
+            return None;
+        }
+        Some(probe.target_model.clone())
+    }
+
+    /// 发送一次高级模型探针请求。探针只使用未校验凭据；成功后移入高级凭证库，
+    /// 确定性 INVALID_MODEL_ID 则标记为不支持并回退原始请求。
+    pub async fn call_api_with_premium_probe(
+        &self,
+        probe_body: &str,
+        fallback_body: &str,
+        source_model: &str,
+        target_model: &str,
+    ) -> anyhow::Result<reqwest::Response> {
+        let proof = crate::kiro::token_manager::PremiumVaultProof {
+            source_model: source_model.to_string(),
+            target_model: target_model.to_string(),
+            status: 0,
+        };
+
+        let ctx = match self.token_manager.acquire_premium_probe_context().await {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                tracing::debug!("高级模型探针无可用未校验凭据，回退普通请求: {}", e);
+                return self.call_api(fallback_body).await;
+            }
+        };
+
+        let config = self.token_manager.config();
+        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
+        let endpoint = match self.endpoint_for(&ctx.credentials) {
+            Ok(e) => e,
+            Err(e) => {
+                self.token_manager.report_failure(ctx.id);
+                tracing::warn!("高级模型探针端点解析失败，回退普通请求: {}", e);
+                return self.call_api(fallback_body).await;
+            }
+        };
+
+        let rctx = RequestContext {
+            credentials: &ctx.credentials,
+            token: &ctx.token,
+            machine_id: &machine_id,
+            config,
+        };
+
+        let url = endpoint.api_url(&rctx);
+        let body = endpoint.transform_api_body(probe_body, &rctx);
+        let base = self
+            .client_for(&ctx.credentials)?
+            .post(&url)
+            .body(body)
+            .header("content-type", "application/json");
+        let request = endpoint.decorate_api(base, &rctx);
+
+        let response = match request.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::warn!("高级模型探针发送失败，保持未校验并回退普通请求: {}", e);
+                return self.call_api(fallback_body).await;
+            }
+        };
+
+        let status = response.status();
+        if status.is_success() {
+            let mut proof = proof;
+            proof.status = status.as_u16();
+            if let Err(e) = self
+                .token_manager
+                .move_credential_to_premium_vault(ctx.id, &proof)
+            {
+                tracing::warn!(
+                    "高级模型探针成功但凭据 #{} 转存高级库失败，保留普通池: {}",
+                    ctx.id,
+                    e
+                );
+            }
+            let mut response = response;
+            ctx.attach_lease_to_response(&mut response);
+            return Ok(response);
+        }
+
+        let status_code = status.as_u16();
+        let body = response.text().await.unwrap_or_default();
+        if is_invalid_model_id_error(status_code, &body) {
+            self.token_manager.mark_premium_model_access(
+                ctx.id,
+                false,
+                &proof,
+                Some("INVALID_MODEL_ID"),
+            )?;
+        } else if status_code == 402 && endpoint.is_monthly_request_limit(&body) {
+            self.token_manager.report_quota_exhausted(ctx.id);
+        } else if should_disable_credential_on_status(status_code) {
+            self.token_manager.report_immediate_failure(ctx.id);
+        } else if should_rotate_without_disabling_status(status_code) {
+            self.token_manager.report_retryable_status_failure(ctx.id);
+        } else if status_code == 401 {
+            self.token_manager.report_failure(ctx.id);
+        }
+
+        tracing::warn!(
+            "高级模型探针失败（status={}），已按分类处理并回退普通请求: {}",
+            status_code,
+            body
+        );
+        self.call_api(fallback_body).await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -615,7 +739,7 @@ impl KiroProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_TOTAL_RETRIES, should_disable_credential_on_status,
+        MAX_TOTAL_RETRIES, is_invalid_model_id_error, should_disable_credential_on_status,
         should_rotate_without_disabling_status, total_attempt_limit,
     };
 
@@ -641,5 +765,20 @@ mod tests {
         assert!(!should_rotate_without_disabling_status(401));
         assert!(!should_rotate_without_disabling_status(402));
         assert!(!should_rotate_without_disabling_status(500));
+    }
+
+    #[test]
+    fn test_invalid_model_id_detection_handles_wrapped_502_body() {
+        let body = r#"{"error":{"type":"api_error","message":"上游 API 调用失败: 非流式 API 请求失败: 400 Bad Request {\"message\":\"Invalid model. Please select a different model to continue.\",\"reason\":\"INVALID_MODEL_ID\"}"}}"#;
+        assert!(is_invalid_model_id_error(502, body));
+    }
+
+    #[test]
+    fn test_invalid_model_id_detection_does_not_match_transient_errors() {
+        assert!(!is_invalid_model_id_error(
+            500,
+            "upstream temporarily unavailable"
+        ));
+        assert!(!is_invalid_model_id_error(429, "rate limited"));
     }
 }

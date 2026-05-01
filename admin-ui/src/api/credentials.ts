@@ -6,6 +6,9 @@ import type {
   SuccessResponse,
   ResetAllCredentialsResponse,
   ClearImmediateFailureDisabledResponse,
+  PremiumCredentialsResponse,
+  PremiumCredentialsExportResponse,
+  RestorePremiumCredentialResponse,
   SetDisabledRequest,
   SetPriorityRequest,
   AddCredentialRequest,
@@ -106,6 +109,30 @@ export async function addCredential(
 // 删除凭据
 export async function deleteCredential(id: number): Promise<SuccessResponse> {
   const { data } = await api.delete<SuccessResponse>(`/credentials/${id}`)
+  return data
+}
+
+// 获取高级凭证库列表（不返回明文 token）
+export async function getPremiumCredentials(): Promise<PremiumCredentialsResponse> {
+  const { data } = await api.get<PremiumCredentialsResponse>('/premium-credentials')
+  return data
+}
+
+// 导出高级凭证库完整内容（包含可另作他用的完整凭证）
+export async function exportPremiumCredentials(): Promise<PremiumCredentialsExportResponse> {
+  const { data } = await api.post<PremiumCredentialsExportResponse>('/premium-credentials/export')
+  return data
+}
+
+// 恢复高级凭证到普通池
+export async function restorePremiumCredential(id: number): Promise<RestorePremiumCredentialResponse> {
+  const { data } = await api.post<RestorePremiumCredentialResponse>(`/premium-credentials/${id}/restore`)
+  return data
+}
+
+// 从高级凭证库删除
+export async function deletePremiumCredential(id: number): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>(`/premium-credentials/${id}`)
   return data
 }
 
