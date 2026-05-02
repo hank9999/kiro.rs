@@ -27,7 +27,7 @@ fn should_disable_credential_on_status(status: u16) -> bool {
 }
 
 fn should_rotate_without_disabling_status(status: u16) -> bool {
-    matches!(status, 400 | 429)
+    status == 429
 }
 
 pub(crate) fn is_invalid_model_id_error(status: u16, body: &str) -> bool {
@@ -417,6 +417,13 @@ impl KiroProvider {
 
             // 其他 4xx
             if status.is_client_error() {
+                if status.as_u16() == 400 {
+                    tracing::warn!(
+                        "MCP 请求失败（400，请求格式错误，不重试不切换凭据）: {}; request_summary={}",
+                        body,
+                        Self::kiro_request_diagnostic_summary(request_body)
+                    );
+                }
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
@@ -676,6 +683,14 @@ impl KiroProvider {
 
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
+                if status.as_u16() == 400 {
+                    tracing::warn!(
+                        "{} API 请求失败（400，请求格式错误，不重试不切换凭据）: {}; request_summary={}",
+                        api_type,
+                        body,
+                        Self::kiro_request_diagnostic_summary(request_body)
+                    );
+                }
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
@@ -724,6 +739,195 @@ impl KiroProvider {
             .map(|s| s.to_string())
     }
 
+    fn kiro_request_diagnostic_summary(request_body: &str) -> String {
+        use serde_json::Value;
+
+        let Ok(json) = serde_json::from_str::<Value>(request_body) else {
+            return format!("parse_error=true body_bytes={}", request_body.len());
+        };
+
+        let state = json.get("conversationState").unwrap_or(&Value::Null);
+        let history = state
+            .get("history")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let current_user = state
+            .get("currentMessage")
+            .and_then(|v| v.get("userInputMessage"))
+            .unwrap_or(&Value::Null);
+        let current_context = current_user
+            .get("userInputMessageContext")
+            .unwrap_or(&Value::Null);
+
+        let model = current_user
+            .get("modelId")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let current_content_chars = current_user
+            .get("content")
+            .and_then(Value::as_str)
+            .map(|s| s.chars().count())
+            .unwrap_or(0);
+        let current_tools = current_context
+            .get("tools")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let current_tool_results = current_context
+            .get("toolResults")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let current_images = current_user
+            .get("images")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+
+        let mut history_tool_use_ids = HashSet::new();
+        let mut history_tool_results = 0usize;
+        let mut empty_history_user_messages = 0usize;
+        let mut empty_history_assistant_messages = 0usize;
+
+        for message in history {
+            if let Some(user_message) = message.get("userInputMessage") {
+                let content = user_message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if content.trim().is_empty() {
+                    empty_history_user_messages += 1;
+                }
+
+                history_tool_results += user_message
+                    .get("userInputMessageContext")
+                    .and_then(|v| v.get("toolResults"))
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0);
+            }
+
+            if let Some(assistant_message) = message.get("assistantResponseMessage") {
+                let content = assistant_message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let tool_uses = assistant_message
+                    .get("toolUses")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+
+                if content.trim().is_empty() && tool_uses.is_empty() {
+                    empty_history_assistant_messages += 1;
+                }
+
+                for tool_use in tool_uses {
+                    if let Some(tool_use_id) = tool_use.get("toolUseId").and_then(Value::as_str) {
+                        history_tool_use_ids.insert(tool_use_id.to_string());
+                    }
+                }
+            }
+        }
+
+        let orphan_current_tool_results = current_context
+            .get("toolResults")
+            .and_then(Value::as_array)
+            .map(|tool_results| {
+                tool_results
+                    .iter()
+                    .filter(|result| {
+                        result
+                            .get("toolUseId")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| !history_tool_use_ids.contains(id))
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+
+        let schema_anomalies = current_context
+            .get("tools")
+            .and_then(Value::as_array)
+            .map(|tools| {
+                tools
+                    .iter()
+                    .map(|tool| {
+                        tool.get("toolSpecification")
+                            .and_then(|v| v.get("inputSchema"))
+                            .and_then(|v| v.get("json"))
+                            .map(Self::count_json_schema_anomalies)
+                            .unwrap_or(0)
+                    })
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+
+        format!(
+            "model={} history_messages={} current_content_chars={} current_content_empty={} current_images={} current_tools={} current_tool_results={} history_tool_uses={} history_tool_results={} orphan_current_tool_results={} empty_history_user_messages={} empty_history_assistant_messages={} schema_anomalies={} body_bytes={}",
+            model,
+            history.len(),
+            current_content_chars,
+            current_content_chars == 0,
+            current_images,
+            current_tools,
+            current_tool_results,
+            history_tool_use_ids.len(),
+            history_tool_results,
+            orphan_current_tool_results,
+            empty_history_user_messages,
+            empty_history_assistant_messages,
+            schema_anomalies,
+            request_body.len()
+        )
+    }
+
+    fn count_json_schema_anomalies(value: &serde_json::Value) -> usize {
+        use serde_json::Value;
+
+        match value {
+            Value::Object(obj) => {
+                let mut count = 0;
+
+                if let Some(schema_type) = obj.get("type") {
+                    if !schema_type.as_str().is_some_and(|s| !s.is_empty()) {
+                        count += 1;
+                    }
+                }
+
+                if let Some(properties) = obj.get("properties") {
+                    if !properties.is_object() {
+                        count += 1;
+                    }
+                }
+
+                if let Some(required) = obj.get("required") {
+                    let valid_required = required
+                        .as_array()
+                        .is_some_and(|items| items.iter().all(Value::is_string));
+                    if !valid_required {
+                        count += 1;
+                    }
+                }
+
+                if let Some(additional_properties) = obj.get("additionalProperties") {
+                    if !(additional_properties.is_boolean() || additional_properties.is_object()) {
+                        count += 1;
+                    }
+                }
+
+                count
+                    + obj
+                        .values()
+                        .map(Self::count_json_schema_anomalies)
+                        .sum::<usize>()
+            }
+            Value::Array(items) => items.iter().map(Self::count_json_schema_anomalies).sum(),
+            _ => 0,
+        }
+    }
+
     fn retry_delay(attempt: usize) -> Duration {
         // 指数退避 + 少量抖动，避免上游抖动时放大故障
         const BASE_MS: u64 = 200;
@@ -739,8 +943,9 @@ impl KiroProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_TOTAL_RETRIES, is_invalid_model_id_error, should_disable_credential_on_status,
-        should_rotate_without_disabling_status, total_attempt_limit,
+        KiroProvider, MAX_TOTAL_RETRIES, is_invalid_model_id_error,
+        should_disable_credential_on_status, should_rotate_without_disabling_status,
+        total_attempt_limit,
     };
 
     #[test]
@@ -759,7 +964,7 @@ mod tests {
         assert!(!should_disable_credential_on_status(429));
         assert!(!should_disable_credential_on_status(401));
 
-        assert!(should_rotate_without_disabling_status(400));
+        assert!(!should_rotate_without_disabling_status(400));
         assert!(should_rotate_without_disabling_status(429));
         assert!(!should_rotate_without_disabling_status(403));
         assert!(!should_rotate_without_disabling_status(401));
@@ -780,5 +985,68 @@ mod tests {
             "upstream temporarily unavailable"
         ));
         assert!(!is_invalid_model_id_error(429, "rate limited"));
+    }
+
+    #[test]
+    fn test_kiro_request_diagnostic_summary_redacts_content() {
+        let request_body = serde_json::json!({
+            "conversationState": {
+                "conversationId": "conv-secret",
+                "history": [
+                    {
+                        "assistantResponseMessage": {
+                            "content": "assistant secret text",
+                            "toolUses": [
+                                {"toolUseId": "tool-1", "name": "Read", "input": {"path": "secret.txt"}}
+                            ]
+                        }
+                    },
+                    {
+                        "userInputMessage": {
+                            "content": "user secret text",
+                            "modelId": "claude-sonnet-4.5",
+                            "userInputMessageContext": {
+                                "toolResults": [
+                                    {"toolUseId": "tool-1", "content": [{"text": "tool secret"}], "status": "success"}
+                                ]
+                            }
+                        }
+                    }
+                ],
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": "current secret text",
+                        "modelId": "claude-sonnet-4.5",
+                        "userInputMessageContext": {
+                            "tools": [
+                                {
+                                    "toolSpecification": {
+                                        "name": "BrokenTool",
+                                        "inputSchema": {"json": {"type": "object", "required": null}}
+                                    }
+                                }
+                            ],
+                            "toolResults": [
+                                {"toolUseId": "orphan", "content": [{"text": "orphan secret"}], "status": "success"}
+                            ]
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let summary = KiroProvider::kiro_request_diagnostic_summary(&request_body);
+
+        assert!(summary.contains("model=claude-sonnet-4.5"));
+        assert!(summary.contains("history_messages=2"));
+        assert!(summary.contains("current_tools=1"));
+        assert!(summary.contains("current_tool_results=1"));
+        assert!(summary.contains("history_tool_uses=1"));
+        assert!(summary.contains("history_tool_results=1"));
+        assert!(summary.contains("orphan_current_tool_results=1"));
+        assert!(summary.contains("schema_anomalies=1"));
+        assert!(!summary.contains("secret"));
+        assert!(!summary.contains("conv-secret"));
     }
 }
