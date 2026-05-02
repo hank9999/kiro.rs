@@ -2,11 +2,11 @@
 
 use std::convert::Infallible;
 
-use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
+use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
@@ -24,7 +24,10 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::types::{
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
+    OutputConfig, Thinking,
+};
 use super::websearch;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -65,6 +68,12 @@ fn map_provider_error(err: Error) -> Response {
         )),
     )
         .into_response()
+}
+
+struct PremiumProbeCall {
+    fallback_body: String,
+    source_model: String,
+    target_model: String,
 }
 
 /// GET /v1/models
@@ -220,6 +229,15 @@ pub async fn post_messages(
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
+    let premium_probe_source_payload = provider
+        .premium_probe_target_for(&payload.model, payload.stream)
+        .map(|target_model| {
+            let source_payload = payload.clone();
+            let source_model = payload.model.clone();
+            payload.model = target_model.clone();
+            (source_payload, source_model, target_model)
+        });
+
     // 转换请求
     let conversion_result = match convert_request(&payload) {
         Ok(result) => result,
@@ -262,6 +280,35 @@ pub async fn post_messages(
         }
     };
 
+    let premium_probe_call = match premium_probe_source_payload {
+        Some((source_payload, source_model, target_model)) if !payload.stream => {
+            match convert_request(&source_payload) {
+                Ok(fallback_conversion) => {
+                    let fallback_request = KiroRequest {
+                        conversation_state: fallback_conversion.conversation_state,
+                        profile_arn: None,
+                    };
+                    match serde_json::to_string(&fallback_request) {
+                        Ok(fallback_body) => Some(PremiumProbeCall {
+                            fallback_body,
+                            source_model,
+                            target_model,
+                        }),
+                        Err(e) => {
+                            tracing::warn!("高级模型探针 fallback 请求序列化失败，跳过探针: {}", e);
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("高级模型探针 fallback 请求转换失败，跳过探针: {}", e);
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
     tracing::debug!("Kiro request body: {}", request_body);
 
     // 估算输入 tokens
@@ -295,7 +342,20 @@ pub async fn post_messages(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        let response_model = premium_probe_call
+            .as_ref()
+            .map(|probe| probe.source_model.as_str())
+            .unwrap_or(&payload.model);
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            response_model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            premium_probe_call.as_ref(),
+        )
+        .await
     }
 }
 
@@ -315,7 +375,8 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx =
+        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -443,9 +504,23 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    premium_probe: Option<&PremiumProbeCall>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
+    let response = match premium_probe {
+        Some(probe) => {
+            provider
+                .call_api_with_premium_probe(
+                    request_body,
+                    &probe.fallback_body,
+                    &probe.source_model,
+                    &probe.target_model,
+                )
+                .await
+        }
+        None => provider.call_api(request_body).await,
+    };
+    let response = match response {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -505,14 +580,14 @@ async fn handle_non_stream_request(
                                 let input: serde_json::Value = if buffer.is_empty() {
                                     serde_json::json!({})
                                 } else {
-                                    serde_json::from_str(buffer)
-                                        .unwrap_or_else(|e| {
-                                            tracing::warn!(
-                                                "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                                e, tool_use.tool_use_id
-                                            );
-                                            serde_json::json!({})
-                                        })
+                                    serde_json::from_str(buffer).unwrap_or_else(|e| {
+                                        tracing::warn!(
+                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}",
+                                            e,
+                                            tool_use.tool_use_id
+                                        );
+                                        serde_json::json!({})
+                                    })
                                 };
 
                                 let original_name = tool_name_map
@@ -531,10 +606,9 @@ async fn handle_non_stream_request(
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
                             let window_size = get_context_window_size(model);
-                            let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (window_size as f64)
-                                / 100.0)
-                                as i32;
+                            let actual_input_tokens =
+                                (context_usage.context_usage_percentage * (window_size as f64)
+                                    / 100.0) as i32;
                             context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
@@ -631,14 +705,10 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 =
-        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let is_opus_4_6 = model_lower.contains("opus")
+        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
 
-    let thinking_type = if is_opus_4_6 {
-        "adaptive"
-    } else {
-        "enabled"
-    };
+    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
 
     tracing::info!(
         model = %payload.model,
@@ -650,7 +720,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
-    
+
     if is_opus_4_6 {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
@@ -808,7 +878,16 @@ pub async fn post_messages_cc(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            None,
+        )
+        .await
     }
 }
 
@@ -831,7 +910,12 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let ctx = BufferedStreamContext::new(
+        model,
+        estimated_input_tokens,
+        thinking_enabled,
+        tool_name_map,
+    );
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);

@@ -4,11 +4,18 @@ import {
   setCredentialDisabled,
   setCredentialPriority,
   resetCredentialFailure,
+  resetAllCredentials,
+  clearImmediateFailureDisabled,
   forceRefreshToken,
   getCredentialBalance,
   addCredential,
   deleteCredential,
+  getPremiumCredentials,
+  exportPremiumCredentials,
+  restorePremiumCredential,
+  deletePremiumCredential,
   getLoadBalancingMode,
+  getRuntimeMetrics,
   setLoadBalancingMode,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
@@ -67,6 +74,28 @@ export function useResetFailure() {
   })
 }
 
+// 启动所有账号并重置失败计数
+export function useResetAllCredentials() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: resetAllCredentials,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 批量清除 ImmediateFailure 已禁用凭据
+export function useClearImmediateFailureDisabled() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: clearImmediateFailureDisabled,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
 // 强制刷新 Token
 export function useForceRefreshToken() {
   const queryClient = useQueryClient()
@@ -100,11 +129,59 @@ export function useDeleteCredential() {
   })
 }
 
+// 查询高级凭证库
+export function usePremiumCredentials(enabled: boolean) {
+  return useQuery({
+    queryKey: ['premiumCredentials'],
+    queryFn: getPremiumCredentials,
+    enabled,
+  })
+}
+
+// 导出高级凭证库完整内容
+export function useExportPremiumCredentials() {
+  return useMutation({
+    mutationFn: exportPremiumCredentials,
+  })
+}
+
+// 恢复高级凭证到普通池
+export function useRestorePremiumCredential() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => restorePremiumCredential(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['premiumCredentials'] })
+    },
+  })
+}
+
+// 删除高级凭证
+export function useDeletePremiumCredential() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => deletePremiumCredential(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['premiumCredentials'] })
+    },
+  })
+}
+
 // 获取负载均衡模式
 export function useLoadBalancingMode() {
   return useQuery({
     queryKey: ['loadBalancingMode'],
     queryFn: getLoadBalancingMode,
+  })
+}
+
+// 获取运行时轻量指标
+export function useRuntimeMetrics() {
+  return useQuery({
+    queryKey: ['runtimeMetrics'],
+    queryFn: getRuntimeMetrics,
+    refetchInterval: 5000,
   })
 }
 
@@ -115,6 +192,7 @@ export function useSetLoadBalancingMode() {
     mutationFn: setLoadBalancingMode,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+      queryClient.invalidateQueries({ queryKey: ['runtimeMetrics'] })
     },
   })
 }

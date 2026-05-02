@@ -87,7 +87,7 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
-    /// 负载均衡模式（"priority" 或 "balanced"）
+    /// 负载均衡模式（"priority"、"balanced"、"round_robin" 或 "adaptive_round_robin"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
@@ -109,9 +109,32 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// 高级模型凭证筛选配置。命中探针后会把可调用高级模型的凭证移入高级凭证库。
+    #[serde(default)]
+    pub premium_model_probe: PremiumModelProbeConfig,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PremiumModelProbeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub probability: f64,
+    #[serde(default = "default_premium_probe_non_stream_only")]
+    pub non_stream_only: bool,
+    #[serde(default = "default_premium_probe_source_models")]
+    pub source_models: Vec<String>,
+    #[serde(default = "default_premium_probe_target_model")]
+    pub target_model: String,
+    #[serde(default = "default_premium_probe_vault_path")]
+    pub premium_vault_path: String,
+    #[serde(default = "default_premium_probe_event_log_path")]
+    pub event_log_path: String,
 }
 
 fn default_host() -> String {
@@ -159,6 +182,61 @@ fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
 
+fn default_premium_probe_non_stream_only() -> bool {
+    true
+}
+
+fn default_premium_probe_source_models() -> Vec<String> {
+    vec![
+        "claude-sonnet-4-5-20250929".to_string(),
+        "claude-sonnet-4-5-20250929-thinking".to_string(),
+    ]
+}
+
+fn default_premium_probe_target_model() -> String {
+    "claude-sonnet-4-6".to_string()
+}
+
+fn default_premium_probe_vault_path() -> String {
+    "credentials.premium.json".to_string()
+}
+
+fn default_premium_probe_event_log_path() -> String {
+    "credentials.premium-events.jsonl".to_string()
+}
+
+impl Default for PremiumModelProbeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            probability: 0.0,
+            non_stream_only: default_premium_probe_non_stream_only(),
+            source_models: default_premium_probe_source_models(),
+            target_model: default_premium_probe_target_model(),
+            premium_vault_path: default_premium_probe_vault_path(),
+            event_log_path: default_premium_probe_event_log_path(),
+        }
+    }
+}
+
+impl PremiumModelProbeConfig {
+    pub fn should_probe_model(&self, model: &str, stream: bool) -> bool {
+        if !self.enabled || self.probability <= 0.0 {
+            return false;
+        }
+        if self.non_stream_only && stream {
+            return false;
+        }
+        self.source_models
+            .iter()
+            .any(|source| source.eq_ignore_ascii_case(model))
+    }
+
+    pub fn probability_clamped(&self) -> f64 {
+        self.probability.clamp(0.0, 1.0)
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -184,6 +262,7 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
+            premium_model_probe: PremiumModelProbeConfig::default(),
             config_path: None,
         }
     }
@@ -236,7 +315,50 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content).with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        fs::write(path, content)
+            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_premium_model_probe_defaults_disabled() {
+        let config = Config::default();
+        assert!(!config.premium_model_probe.enabled);
+        assert_eq!(config.premium_model_probe.probability, 0.0);
+        assert!(config.premium_model_probe.non_stream_only);
+    }
+
+    #[test]
+    fn test_premium_model_probe_parses_and_matches_source_model() {
+        let json = r#"{
+            "premiumModelProbe": {
+                "enabled": true,
+                "probability": 0.02,
+                "nonStreamOnly": true,
+                "sourceModels": ["claude-sonnet-4-5-20250929"],
+                "targetModel": "claude-sonnet-4-6",
+                "premiumVaultPath": "credentials.premium.json",
+                "eventLogPath": "credentials.premium-events.jsonl"
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.premium_model_probe.enabled);
+        assert!(
+            config
+                .premium_model_probe
+                .should_probe_model("claude-sonnet-4-5-20250929", false)
+        );
+        assert!(
+            !config
+                .premium_model_probe
+                .should_probe_model("claude-sonnet-4-5-20250929", true)
+        );
+        assert_eq!(config.premium_model_probe.target_model, "claude-sonnet-4-6");
     }
 }
