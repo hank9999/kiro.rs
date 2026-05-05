@@ -98,11 +98,14 @@ export async function deleteCredential(id: number): Promise<SuccessResponse> {
   return data;
 }
 
+// 负载均衡模式联合类型
+export type LoadBalancingMode = "priority" | "balanced" | "round_robin";
+
 // 获取负载均衡模式
 export async function getLoadBalancingMode(): Promise<{
-  mode: "priority" | "balanced";
+  mode: LoadBalancingMode;
 }> {
-  const { data } = await api.get<{ mode: "priority" | "balanced" }>(
+  const { data } = await api.get<{ mode: LoadBalancingMode }>(
     "/config/load-balancing",
   );
   return data;
@@ -110,9 +113,9 @@ export async function getLoadBalancingMode(): Promise<{
 
 // 设置负载均衡模式
 export async function setLoadBalancingMode(
-  mode: "priority" | "balanced",
-): Promise<{ mode: "priority" | "balanced" }> {
-  const { data } = await api.put<{ mode: "priority" | "balanced" }>(
+  mode: LoadBalancingMode,
+): Promise<{ mode: LoadBalancingMode }> {
+  const { data } = await api.put<{ mode: LoadBalancingMode }>(
     "/config/load-balancing",
     { mode },
   );

@@ -529,6 +529,8 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 轮询模式游标：记录上次返回的凭据 id（0 表示尚未轮询过，下一次从第一个开始）
+    round_robin_cursor: Mutex<u64>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -661,6 +663,7 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            round_robin_cursor: Mutex::new(0),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -735,7 +738,8 @@ impl MultiTokenManager {
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：均衡选择可用凭据
+    /// - balanced 模式：均衡选择可用凭据（Least-Used）
+    /// - round_robin 模式：按 (priority, id) 升序轮询所有可用凭据
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
@@ -747,8 +751,8 @@ impl MultiTokenManager {
             .map(|m| m.to_lowercase().contains("opus"))
             .unwrap_or(false);
 
-        // 过滤可用凭据
-        let available: Vec<_> = entries
+        // 过滤可用凭据，并按 (priority, id) 升序排序，保证多模式下顺序稳定
+        let mut available: Vec<_> = entries
             .iter()
             .filter(|e| {
                 if e.disabled {
@@ -766,22 +770,38 @@ impl MultiTokenManager {
             return None;
         }
 
+        available.sort_by_key(|e| (e.credentials.priority, e.id));
+
         let mode = self.load_balancing_mode.lock().clone();
         let mode = mode.as_str();
 
         match mode {
             "balanced" => {
                 // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
+                // 平局时按 (priority, id) 排序（数字越小优先级越高）
                 let entry = available
                     .iter()
-                    .min_by_key(|e| (e.success_count, e.credentials.priority))?;
+                    .min_by_key(|e| (e.success_count, e.credentials.priority, e.id))?;
 
                 Some((entry.id, entry.credentials.clone()))
             }
+            "round_robin" => {
+                // 轮询模式：按 (priority, id) 升序轮换
+                // 找到游标 last_id 在排序后列表中的位置，取下一个；
+                // 若 last_id 不存在（被禁用/删除）或已在末尾，则回到列表头
+                let last_id = *self.round_robin_cursor.lock();
+                let chosen = match available.iter().position(|e| e.id == last_id) {
+                    Some(idx) if idx + 1 < available.len() => available[idx + 1],
+                    _ => available[0],
+                };
+
+                *self.round_robin_cursor.lock() = chosen.id;
+                Some((chosen.id, chosen.credentials.clone()))
+            }
             _ => {
-                // priority 模式（默认）：选择优先级最高的
-                let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
+                // priority 模式（默认）：available 已按 (priority, id) 排序，
+                // 直接取首位即可
+                let entry = available[0];
                 Some((entry.id, entry.credentials.clone()))
             }
         }
@@ -812,11 +832,15 @@ impl MultiTokenManager {
             }
 
             let (id, credentials) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+                let mode = self.load_balancing_mode.lock().clone();
+                // 非粘性模式：每次请求都重新选择凭据，不复用 current_id
+                // - balanced：基于 success_count 重新均衡
+                // - round_robin：按顺序前进游标
+                // priority 模式（默认）：优先使用 current_id 指向的凭据
+                let is_per_request_select =
+                    mode.as_str() == "balanced" || mode.as_str() == "round_robin";
 
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
+                let current_hit = if is_per_request_select {
                     None
                 } else {
                     let entries = self.entries.lock();
@@ -1993,7 +2017,7 @@ impl MultiTokenManager {
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         // 验证模式值
-        if mode != "priority" && mode != "balanced" {
+        if mode != "priority" && mode != "balanced" && mode != "round_robin" {
             anyhow::bail!("无效的负载均衡模式: {}", mode);
         }
 
@@ -2007,6 +2031,11 @@ impl MultiTokenManager {
         if let Err(err) = self.persist_load_balancing_mode(&mode) {
             *self.load_balancing_mode.lock() = previous_mode;
             return Err(err);
+        }
+
+        // 持久化成功后再重置游标，确保失败回滚不会影响轮询状态
+        if mode == "round_robin" {
+            *self.round_robin_cursor.lock() = 0;
         }
 
         tracing::info!("负载均衡模式已设置为: {}", mode);
@@ -2384,6 +2413,116 @@ mod tests {
         let persisted = Config::load(&config_path).unwrap();
         assert_eq!(persisted.load_balancing_mode, "balanced");
         assert_eq!(manager.get_load_balancing_mode(), "balanced");
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
+    /// 辅助函数：构造 N 个带访问令牌、按 priority 升序的凭据
+    fn build_round_robin_test_creds(count: u32) -> Vec<KiroCredentials> {
+        (0..count)
+            .map(|i| {
+                let mut c = KiroCredentials::default();
+                c.priority = i;
+                c.access_token = Some(format!("token-{}", i));
+                c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+                c
+            })
+            .collect()
+    }
+
+    /// 测试 round_robin 切换到 round_robin 模式后，按 (priority, id) 顺序循环选择
+    #[test]
+    fn test_round_robin_select_cycles_through_available_credentials() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "round_robin".to_string();
+        let creds = build_round_robin_test_creds(3);
+
+        let manager = MultiTokenManager::new(config, creds, None, None, None, false).unwrap();
+
+        // 凭据自动分配 id 1/2/3，priority 已按 0/1/2 排好
+        let mut order = Vec::new();
+        for _ in 0..6 {
+            let (id, _) = manager.select_next_credential(None).unwrap();
+            order.push(id);
+        }
+        assert_eq!(order, vec![1, 2, 3, 1, 2, 3]);
+    }
+
+    /// 测试 round_robin 跳过被禁用的凭据
+    #[test]
+    fn test_round_robin_skips_disabled_credentials() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "round_robin".to_string();
+        let creds = build_round_robin_test_creds(3);
+
+        let manager = MultiTokenManager::new(config, creds, None, None, None, false).unwrap();
+
+        // 禁用中间那个：id=2
+        manager.set_disabled(2, true).unwrap();
+
+        let mut order = Vec::new();
+        for _ in 0..4 {
+            let (id, _) = manager.select_next_credential(None).unwrap();
+            order.push(id);
+        }
+        // id=2 被禁用，预期顺序：1 → 3 → 1 → 3
+        assert_eq!(order, vec![1, 3, 1, 3]);
+    }
+
+    /// 测试 priority 变更后，round_robin 仍能按新顺序继续轮询
+    #[test]
+    fn test_round_robin_handles_priority_change() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "round_robin".to_string();
+        let creds = build_round_robin_test_creds(3);
+
+        let manager = MultiTokenManager::new(config, creds, None, None, None, false).unwrap();
+
+        // 第 1 次：选中 id=1
+        let (first, _) = manager.select_next_credential(None).unwrap();
+        assert_eq!(first, 1);
+
+        // 把 id=1 的 priority 调到最大，新排序变成 [id=2, id=3, id=1]
+        manager.set_priority(1, 100).unwrap();
+
+        // 由于游标=1，新排序中 id=1 的位置是末尾 → 回到第一个 = id=2
+        let (second, _) = manager.select_next_credential(None).unwrap();
+        assert_eq!(second, 2);
+
+        // 继续轮：id=2 → id=3
+        let (third, _) = manager.select_next_credential(None).unwrap();
+        assert_eq!(third, 3);
+
+        // id=3 → id=1（新排序末位）
+        let (fourth, _) = manager.select_next_credential(None).unwrap();
+        assert_eq!(fourth, 1);
+    }
+
+    /// 测试 set_load_balancing_mode 接受 round_robin 字符串并持久化
+    #[test]
+    fn test_set_load_balancing_mode_accepts_round_robin() {
+        let config_path = std::env::temp_dir().join(format!(
+            "kiro-load-balancing-rr-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&config_path, r#"{"loadBalancingMode":"priority"}"#).unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, None, false)
+                .unwrap();
+
+        manager
+            .set_load_balancing_mode("round_robin".to_string())
+            .expect("round_robin 应该是合法值");
+
+        let persisted = Config::load(&config_path).unwrap();
+        assert_eq!(persisted.load_balancing_mode, "round_robin");
+        assert_eq!(manager.get_load_balancing_mode(), "round_robin");
+
+        // 非法字符串仍然被拒绝
+        let bad = manager.set_load_balancing_mode("unknown".to_string());
+        assert!(bad.is_err());
 
         std::fs::remove_file(&config_path).unwrap();
     }
