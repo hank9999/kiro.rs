@@ -808,7 +808,7 @@ impl CredentialPool {
         Ok(())
     }
 
-    /// 查询使用额度（必要时刷新 token，调上游 q.{region}.amazonaws.com/getUsageLimits）
+    /// 查询使用额度（必要时刷新 token，调上游 usage limits 端点）
     pub async fn get_usage_limits_for(
         &self,
         id: u64,
@@ -879,8 +879,35 @@ impl CredentialPool {
         cred: &Credential,
         token: &str,
     ) -> Result<UsageLimitsResponse, AdminPoolError> {
+        let request = self.build_usage_limits_request(cred, token)?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| AdminPoolError::Network(e.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            // 截断 body，避免大响应回显放大 + 限制错误链中的敏感细节泄漏
+            let body = truncate_upstream_body(&body, 512);
+            return Err(AdminPoolError::UpstreamHttp {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let usage: UsageLimitsResponse = response
+            .json()
+            .await
+            .map_err(|e| AdminPoolError::Network(e.to_string()))?;
+        Ok(usage)
+    }
+
+    fn build_usage_limits_request(
+        &self,
+        cred: &Credential,
+        token: &str,
+    ) -> Result<reqwest::RequestBuilder, AdminPoolError> {
         let region = cred.effective_api_region(&self.config);
-        let host = format!("q.{region}.amazonaws.com");
+        let host = format!("management.{region}.kiro.dev");
         let machine_id = self.resolver.resolve(cred, &self.config);
         let kiro_version = &self.config.kiro.kiro_version;
         let os_name = &self.config.kiro.system_version;
@@ -915,25 +942,7 @@ impl CredentialPool {
             req = req.header("tokentype", "API_KEY");
         }
 
-        let response = req
-            .send()
-            .await
-            .map_err(|e| AdminPoolError::Network(e.to_string()))?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            // 截断 body，避免大响应回显放大 + 限制错误链中的敏感细节泄漏
-            let body = truncate_upstream_body(&body, 512);
-            return Err(AdminPoolError::UpstreamHttp {
-                status: status.as_u16(),
-                body,
-            });
-        }
-        let usage: UsageLimitsResponse = response
-            .json()
-            .await
-            .map_err(|e| AdminPoolError::Network(e.to_string()))?;
-        Ok(usage)
+        Ok(req)
     }
 }
 
@@ -1047,6 +1056,49 @@ mod tests {
 
     fn far_future_expires_at() -> String {
         (Utc::now() + Duration::days(7)).to_rfc3339()
+    }
+
+    #[test]
+    fn fetch_usage_limits_uses_management_endpoint_host() {
+        let file = Arc::new(CredentialsFileStore::new(None));
+        let config = Config::default();
+        let config = Arc::new(config);
+        let resolver = Arc::new(MachineIdResolver::new());
+        let (store, _) = CredentialStore::load(file, config.clone(), resolver.clone()).unwrap();
+        let pool = CredentialPool::new(
+            Arc::new(store),
+            Arc::new(CredentialState::new()),
+            Arc::new(CredentialStats::new()),
+            None,
+            config,
+            resolver,
+        );
+        let cred = Credential {
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some("test-api-key".to_string()),
+            ..Default::default()
+        };
+
+        let request = pool
+            .build_usage_limits_request(&cred, "test-token")
+            .expect("build usage request")
+            .build()
+            .expect("finalize usage request");
+        assert_eq!(
+            request.url().as_str(),
+            "https://management.us-east-1.kiro.dev/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST"
+        );
+        assert_eq!(
+            request.headers().get("host").and_then(|v| v.to_str().ok()),
+            Some("management.us-east-1.kiro.dev")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("tokentype")
+                .and_then(|v| v.to_str().ok()),
+            Some("API_KEY")
+        );
     }
 
     /// 测试用 refresher：计数自增；可设置 sleep 模拟延迟

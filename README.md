@@ -210,7 +210,24 @@ docker-compose up
    "proxyPassword": "pass",
    "adminApiKey": "sk-admin-your-secret-key",
    "loadBalancingMode": "priority",
+   "defaultEndpoint": "ide",
    "extractThinking": true
+}
+```
+
+#### Kiro 端点
+
+所有 Kiro API 请求默认使用 `ide` 端点名称；该名称保留用于配置兼容，内部请求已切换到新的 Kiro 端点：
+
+- API: `https://runtime.{apiRegion}.kiro.dev/generateAssistantResponse`
+- MCP / WebSearch: `https://runtime.{apiRegion}.kiro.dev/mcp`
+- 余额/订阅等级: `https://management.{apiRegion}.kiro.dev/getUsageLimits`
+
+如需显式配置端点名称，可使用：
+
+```json
+{
+   "defaultEndpoint": "ide"
 }
 ```
 
