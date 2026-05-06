@@ -34,6 +34,7 @@ Complete all chunked operations without commentary.";
 /// 按照用户要求：
 /// - sonnet 4.6/4-6 → claude-sonnet-4.6
 /// - 其他 sonnet → claude-sonnet-4.5
+/// - opus 4.7/4-7 → claude-opus-4.7
 /// - opus 4.5/4-5 → claude-opus-4.5
 /// - 其他 opus → claude-opus-4.6
 /// - 所有 haiku → claude-haiku-4.5
@@ -49,6 +50,8 @@ pub fn map_model(model: &str) -> Option<String> {
     } else if model_lower.contains("opus") {
         if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
+        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
+            Some("claude-opus-4.7".to_string())
         } else {
             Some("claude-opus-4.6".to_string())
         }
@@ -62,10 +65,17 @@ pub fn map_model(model: &str) -> Option<String> {
 /// 根据模型名称返回对应的上下文窗口大小
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
+/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文；
+/// Opus 4.7 发布即 1M 上下文。
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
-        Some(mapped) if mapped == "claude-sonnet-4.6" || mapped == "claude-opus-4.6" => 1_000_000,
+        Some(mapped)
+            if mapped == "claude-sonnet-4.6"
+                || mapped == "claude-opus-4.6"
+                || mapped == "claude-opus-4.7" =>
+        {
+            1_000_000
+        }
         _ => 200_000,
     }
 }
@@ -667,6 +677,35 @@ mod tests {
     }
 
     #[test]
+    fn test_map_model_opus_4_7() {
+        // 新增：opus 4.7 映射到 claude-opus-4.7
+        assert_eq!(
+            map_model("claude-opus-4-7"),
+            Some("claude-opus-4.7".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4.7"),
+            Some("claude-opus-4.7".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_model_thinking_suffix_opus_4_7() {
+        // thinking 后缀不应影响 opus 4.7 模型映射
+        let result = map_model("claude-opus-4-7-thinking");
+        assert_eq!(result, Some("claude-opus-4.7".to_string()));
+    }
+
+    #[test]
+    fn test_context_window_opus_4_7_is_1m() {
+        assert_eq!(get_context_window_size("claude-opus-4-7"), 1_000_000);
+        assert_eq!(
+            get_context_window_size("claude-opus-4-7-thinking"),
+            1_000_000
+        );
+    }
+
+    #[test]
     fn test_map_model_thinking_suffix_haiku() {
         // thinking 后缀不应影响 haiku 模型映射
         let result = map_model("claude-haiku-4-5-20251001-thinking");
@@ -689,6 +728,37 @@ mod tests {
             metadata: None,
         };
         assert_eq!(determine_chat_trigger_type(&req), "MANUAL");
+    }
+
+    #[test]
+    fn test_adaptive_thinking_prefix_uses_client_effort() {
+        use crate::interface::http::anthropic::dto::{OutputConfig, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 64000,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 20000,
+                display: None,
+            }),
+            output_config: Some(OutputConfig {
+                effort: "medium".to_string(),
+            }),
+            metadata: None,
+        };
+
+        assert_eq!(
+            generate_thinking_prefix(&req).as_deref(),
+            Some(
+                "<thinking_mode>adaptive</thinking_mode><thinking_effort>medium</thinking_effort>"
+            )
+        );
     }
 
     // 工具相关函数级单测（collect_history_tool_names / create_placeholder_tool /

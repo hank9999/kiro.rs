@@ -6,13 +6,46 @@
 
 use super::dto::Model;
 
+/// 返回模型的最大输出 token 上限。
+pub fn model_max_tokens(model: &str) -> i32 {
+    let model_lower = model.to_lowercase();
+    if model_lower.contains("opus")
+        && (model_lower.contains("4-7")
+            || model_lower.contains("4.7")
+            || model_lower.contains("4-6")
+            || model_lower.contains("4.6"))
+    {
+        128000
+    } else {
+        64000
+    }
+}
+
 /// Anthropic 兼容协议下当前支持的模型列表（顺序与对外 JSON 一致）。
 ///
 /// 每次调用都会重新构造一份 owned `Vec<Model>`，避免 `Lazy` 的 `Send + Sync` 噪音
 /// 也避免与 axum `Json` 共享所有权时的不必要约束。
-/// 列表本身只有 10 项，重复构造的代价远低于运行时 lock。
+/// 列表本身只有 12 项，重复构造的代价远低于运行时 lock。
 pub fn supported_models() -> Vec<Model> {
     vec![
+        Model {
+            id: "claude-opus-4-7".to_string(),
+            object: "model".to_string(),
+            created: 1777593600, // May 1, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.7".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: model_max_tokens("claude-opus-4-7"),
+        },
+        Model {
+            id: "claude-opus-4-7-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1777593600, // May 1, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: model_max_tokens("claude-opus-4-7-thinking"),
+        },
         Model {
             id: "claude-opus-4-6".to_string(),
             object: "model".to_string(),
@@ -20,7 +53,7 @@ pub fn supported_models() -> Vec<Model> {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.6".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: model_max_tokens("claude-opus-4-6"),
         },
         Model {
             id: "claude-opus-4-6-thinking".to_string(),
@@ -29,7 +62,7 @@ pub fn supported_models() -> Vec<Model> {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.6 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: model_max_tokens("claude-opus-4-6-thinking"),
         },
         Model {
             id: "claude-sonnet-4-6".to_string(),
@@ -116,6 +149,8 @@ mod tests {
         let models = supported_models();
         let ids: HashSet<&str> = models.iter().map(|m| m.id.as_str()).collect();
         for expected in [
+            "claude-opus-4-7",
+            "claude-opus-4-7-thinking",
             "claude-opus-4-6",
             "claude-opus-4-6-thinking",
             "claude-sonnet-4-6",
@@ -135,20 +170,31 @@ mod tests {
     fn supported_models_preserves_order() {
         let models = supported_models();
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids[0], "claude-opus-4-6");
-        assert_eq!(ids[2], "claude-sonnet-4-6");
-        assert_eq!(ids[4], "claude-opus-4-5-20251101");
-        assert_eq!(ids[8], "claude-haiku-4-5-20251001");
-        assert_eq!(ids.len(), 10);
+        assert_eq!(ids[0], "claude-opus-4-7");
+        assert_eq!(ids[2], "claude-opus-4-6");
+        assert_eq!(ids[4], "claude-sonnet-4-6");
+        assert_eq!(ids[6], "claude-opus-4-5-20251101");
+        assert_eq!(ids[10], "claude-haiku-4-5-20251001");
+        assert_eq!(ids.len(), 12);
     }
 
     #[test]
-    fn supported_models_all_have_chat_type_and_64k_tokens() {
+    fn supported_models_all_have_chat_type_and_expected_tokens() {
         for m in supported_models() {
             assert_eq!(m.model_type, "chat", "model={}", m.id);
-            assert_eq!(m.max_tokens, 64000, "model={}", m.id);
+            assert_eq!(m.max_tokens, model_max_tokens(&m.id), "model={}", m.id);
             assert_eq!(m.owned_by, "anthropic", "model={}", m.id);
             assert_eq!(m.object, "model", "model={}", m.id);
         }
+    }
+
+    #[test]
+    fn model_max_tokens_marks_opus_4_6_and_4_7_as_128k() {
+        assert_eq!(model_max_tokens("claude-opus-4-7"), 128000);
+        assert_eq!(model_max_tokens("claude-opus-4-7-thinking"), 128000);
+        assert_eq!(model_max_tokens("claude-opus-4-6"), 128000);
+        assert_eq!(model_max_tokens("claude-opus-4-6-thinking"), 128000);
+        assert_eq!(model_max_tokens("claude-sonnet-4-6-thinking"), 64000);
+        assert_eq!(model_max_tokens("claude-haiku-4-5-20251001"), 64000);
     }
 }

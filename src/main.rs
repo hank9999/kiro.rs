@@ -257,13 +257,40 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     let pool_for_shutdown = pool.clone();
-    // graceful shutdown：信号触发后等所有连接关闭再返回；用 timeout 兜底防止
-    // 长 SSE 连接卡住 flush_stats（30s 上限）
-    let serve = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
-    match tokio::time::timeout(std::time::Duration::from_secs(30), serve).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::error!("HTTP 服务异常退出: {}", e),
-        Err(_) => tracing::warn!("graceful shutdown 超时 30s，强制退出（仍会 flush_stats）"),
+
+    // graceful shutdown 的正确形态：
+    //   1. serve 平时无 timeout 限制，持续运行；
+    //   2. 收到信号后进入 drain 阶段；
+    //   3. drain 最多等 30 秒，超时则强制退出（防止长 SSE 连接卡住 flush_stats）。
+    //
+    // 早期版本用 `tokio::time::timeout(30s, serve)` 包住整个 serve，相当于给
+    // 服务器本身设了 30 秒硬上限，没有信号也会强退。这里用一个 oneshot 标记
+    // "信号已触达"的时间点，把 30 秒窗口限制在 drain 阶段。
+    let (signaled_tx, signaled_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown_and_mark = async move {
+        shutdown_signal().await;
+        // 信号已触达：通知 watchdog 启动 30 秒 drain 计时
+        let _ = signaled_tx.send(());
+    };
+    let drain_watchdog = async move {
+        // 信号未触达时保持挂起（drain_watchdog 永远不 resolve），select! 由 serve 那边驱动
+        if signaled_rx.await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    };
+
+    let serve = axum::serve(listener, app).with_graceful_shutdown(shutdown_and_mark);
+
+    tokio::select! {
+        res = serve => {
+            if let Err(e) = res {
+                tracing::error!("HTTP 服务异常退出: {}", e);
+            }
+        }
+        _ = drain_watchdog => {
+            tracing::warn!("graceful shutdown drain 超时 30s，强制退出（仍会 flush_stats）");
+        }
     }
 
     // 进程退出前显式 flush stats，避免最后一窗口的统计因未到 30s debounce 丢失

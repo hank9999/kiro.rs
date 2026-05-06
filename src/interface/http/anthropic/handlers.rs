@@ -26,7 +26,7 @@ use super::dto::{
     OutputConfig, Thinking,
 };
 use super::middleware::AppState;
-use super::models::supported_models;
+use super::models::{model_max_tokens, supported_models};
 use crate::interface::http::error::kiro_error_response;
 use crate::service::conversation::converter::{ConversionError, convert_request};
 use crate::service::conversation::delivery::DeliveryMode;
@@ -111,8 +111,17 @@ async fn post_messages_impl(
         }
     };
 
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+    // 检测模型名是否包含 "thinking" 后缀，若包含则补齐 thinking 配置
     override_thinking_from_model_name(&mut payload);
+
+    if let Err(message) = validate_messages_request(&payload) {
+        tracing::warn!(model = %payload.model, error = %message, "请求参数校验失败");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", message)),
+        )
+            .into_response();
+    }
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -533,9 +542,8 @@ async fn handle_non_stream_request(
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = get_context_window_size(model);
-                let actual_input_tokens = (context_usage.context_usage_percentage
-                    * (window_size as f64)
-                    / 100.0) as i32;
+                let actual_input_tokens =
+                    (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
                 context_input_tokens = Some(actual_input_tokens);
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                 if context_usage.context_usage_percentage >= 100.0 {
@@ -647,21 +655,136 @@ async fn handle_non_stream_request(
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
-/// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+fn model_is_opus_4_7(model_lower: &str) -> bool {
+    model_lower.contains("opus") && (model_lower.contains("4-7") || model_lower.contains("4.7"))
+}
+
+fn model_is_opus_4_6(model_lower: &str) -> bool {
+    model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6"))
+}
+
+fn model_is_sonnet_4_6(model_lower: &str) -> bool {
+    model_lower.contains("sonnet") && (model_lower.contains("4-6") || model_lower.contains("4.6"))
+}
+
+fn model_supports_adaptive_thinking(model_lower: &str) -> bool {
+    model_is_opus_4_7(model_lower)
+        || model_is_opus_4_6(model_lower)
+        || model_is_sonnet_4_6(model_lower)
+}
+
+fn default_alias_budget(max_tokens: i32) -> i32 {
+    if max_tokens > 20000 {
+        20000
+    } else {
+        max_tokens.saturating_sub(1).max(1)
+    }
+}
+
+fn validate_effort_for_model(model_lower: &str, effort: &str) -> bool {
+    match effort {
+        "low" | "medium" | "high" => true,
+        "max" => model_supports_adaptive_thinking(model_lower),
+        "xhigh" => model_is_opus_4_7(model_lower),
+        _ => false,
+    }
+}
+
+fn validate_messages_request(payload: &MessagesRequest) -> Result<(), String> {
+    if payload.max_tokens <= 0 {
+        return Err("max_tokens must be greater than 0".to_string());
+    }
+
+    let model_limit = model_max_tokens(&payload.model);
+    if payload.max_tokens > model_limit {
+        return Err(format!(
+            "max_tokens exceeds model limit: {} > {}",
+            payload.max_tokens, model_limit
+        ));
+    }
+
+    validate_thinking_config(payload)
+}
+
+fn validate_thinking_config(payload: &MessagesRequest) -> Result<(), String> {
+    let Some(thinking) = &payload.thinking else {
+        return Ok(());
+    };
+
+    let model_lower = payload.model.to_lowercase();
+    let thinking_type = thinking.thinking_type.as_str();
+
+    if let Some(display) = thinking.display.as_deref()
+        && display != "omitted"
+        && display != "summarized"
+    {
+        return Err(format!("unsupported thinking.display: {display}"));
+    }
+
+    match thinking_type {
+        "disabled" => Ok(()),
+        "enabled" => {
+            if model_is_opus_4_7(&model_lower) {
+                return Err(
+                    "claude-opus-4.7 only supports adaptive thinking; enabled is unsupported"
+                        .to_string(),
+                );
+            }
+            if thinking.budget_tokens <= 0 {
+                return Err("thinking.budget_tokens must be greater than 0".to_string());
+            }
+            if thinking.budget_tokens >= payload.max_tokens {
+                return Err(format!(
+                    "thinking.budget_tokens must be less than max_tokens: {} >= {}",
+                    thinking.budget_tokens, payload.max_tokens
+                ));
+            }
+            Ok(())
+        }
+        "adaptive" => {
+            if !model_supports_adaptive_thinking(&model_lower) {
+                return Err(format!(
+                    "{} does not support adaptive thinking",
+                    payload.model
+                ));
+            }
+            let effort = payload
+                .output_config
+                .as_ref()
+                .map(|c| c.effort.as_str())
+                .unwrap_or("high");
+            if !validate_effort_for_model(&model_lower, effort) {
+                return Err(format!(
+                    "unsupported output_config.effort for {}: {}",
+                    payload.model, effort
+                ));
+            }
+            Ok(())
+        }
+        other => Err(format!("unsupported thinking.type: {other}")),
+    }
+}
+
+/// 检测模型名是否包含 "thinking" 后缀，若包含则补齐 thinking 配置
 ///
-/// - Opus 4.6：覆写为 adaptive 类型
-/// - 其他模型：覆写为 enabled 类型
-/// - budget_tokens 固定为 20000
+/// - Opus 4.6 / 4.7 / Sonnet 4.6：补齐为 adaptive 类型；
+/// - 其他模型：补齐为 enabled 类型；
+/// - 客户端传入的 output_config.effort 优先，未传时 adaptive 默认 high。
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let model_lower = payload.model.to_lowercase();
     if !model_lower.contains("thinking") {
         return;
     }
 
-    let is_opus_4_6 = model_lower.contains("opus")
-        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let is_adaptive = model_supports_adaptive_thinking(&model_lower);
 
-    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
+    let thinking_type = if is_adaptive { "adaptive" } else { "enabled" };
+    let existing_thinking = payload.thinking.clone();
+    let budget_tokens = existing_thinking
+        .as_ref()
+        .map(|t| t.budget_tokens)
+        .unwrap_or_else(|| default_alias_budget(payload.max_tokens));
+    let display = existing_thinking.and_then(|t| t.display);
 
     tracing::info!(
         model = %payload.model,
@@ -671,10 +794,11 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 
     payload.thinking = Some(Thinking {
         thinking_type: thinking_type.to_string(),
-        budget_tokens: 20000,
+        budget_tokens,
+        display,
     });
 
-    if is_opus_4_6 {
+    if is_adaptive && payload.output_config.is_none() {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
         });
@@ -879,6 +1003,158 @@ mod tests {
             output_config: None,
             metadata: None,
         }
+    }
+
+    fn request_with_model(model: &str) -> MessagesRequest {
+        let mut req = empty_request();
+        req.model = model.to_string();
+        req
+    }
+
+    fn thinking(thinking_type: &str, budget_tokens: i32) -> Thinking {
+        Thinking {
+            thinking_type: thinking_type.to_string(),
+            budget_tokens,
+            display: None,
+        }
+    }
+
+    /// Opus 4.7 的 `-thinking` 后缀必须走 adaptive + effort=high。
+    #[test]
+    fn override_thinking_opus_4_7_uses_adaptive_high() {
+        let mut req = request_with_model("claude-opus-4-7-thinking");
+        req.max_tokens = 128000;
+        override_thinking_from_model_name(&mut req);
+        let t = req.thinking.expect("thinking 应被覆写");
+        assert_eq!(t.thinking_type, "adaptive");
+        assert_eq!(t.budget_tokens, 20000);
+        let oc = req.output_config.expect("output_config 应被设置为 high");
+        assert_eq!(oc.effort, "high");
+    }
+
+    /// Opus 4.6 的 `-thinking` 后缀行为回归保护：adaptive + effort=high。
+    #[test]
+    fn override_thinking_opus_4_6_uses_adaptive_high() {
+        let mut req = request_with_model("claude-opus-4-6-thinking");
+        req.max_tokens = 128000;
+        override_thinking_from_model_name(&mut req);
+        let t = req.thinking.expect("thinking 应被覆写");
+        assert_eq!(t.thinking_type, "adaptive");
+        let oc = req.output_config.expect("output_config 应被设置为 high");
+        assert_eq!(oc.effort, "high");
+    }
+
+    /// Sonnet 4.6 的 `-thinking` 后缀也应走 adaptive。
+    #[test]
+    fn override_thinking_sonnet_4_6_uses_adaptive_high() {
+        let mut req = request_with_model("claude-sonnet-4-6-thinking");
+        req.max_tokens = 64000;
+        override_thinking_from_model_name(&mut req);
+        let t = req.thinking.expect("thinking 应被覆写");
+        assert_eq!(t.thinking_type, "adaptive");
+        assert_eq!(t.budget_tokens, 20000);
+        let oc = req.output_config.expect("output_config 应被设置为 high");
+        assert_eq!(oc.effort, "high");
+    }
+
+    /// 客户端显式传入的 effort 不能被 `-thinking` 别名覆盖。
+    #[test]
+    fn override_thinking_preserves_client_effort() {
+        let mut req = request_with_model("claude-sonnet-4-6-thinking");
+        req.max_tokens = 64000;
+        req.output_config = Some(OutputConfig {
+            effort: "medium".to_string(),
+        });
+        override_thinking_from_model_name(&mut req);
+        let t = req.thinking.expect("thinking 应被覆写");
+        assert_eq!(t.thinking_type, "adaptive");
+        let oc = req.output_config.expect("output_config 应保留");
+        assert_eq!(oc.effort, "medium");
+    }
+
+    /// 非 adaptive 能力模型的 `-thinking` 后缀走 enabled 分支，不设置 output_config。
+    #[test]
+    fn override_thinking_legacy_model_uses_enabled_without_output_config() {
+        let mut req = request_with_model("claude-haiku-4-5-20251001-thinking");
+        req.max_tokens = 64000;
+        override_thinking_from_model_name(&mut req);
+        let t = req.thinking.expect("thinking 应被覆写");
+        assert_eq!(t.thinking_type, "enabled");
+        assert_eq!(t.budget_tokens, 20000);
+        assert!(
+            req.output_config.is_none(),
+            "非 adaptive 模型不应设置 output_config"
+        );
+    }
+
+    /// 模型名里没有 `thinking` 后缀时，override 函数应完全不动 payload。
+    #[test]
+    fn override_thinking_no_suffix_is_noop() {
+        let mut req = request_with_model("claude-opus-4-7");
+        override_thinking_from_model_name(&mut req);
+        assert!(req.thinking.is_none());
+        assert!(req.output_config.is_none());
+    }
+
+    #[test]
+    fn validate_rejects_opus_4_7_enabled_thinking() {
+        let mut req = request_with_model("claude-opus-4-7");
+        req.max_tokens = 64000;
+        req.thinking = Some(thinking("enabled", 20000));
+        let err = validate_messages_request(&req).expect_err("应拒绝 Opus 4.7 enabled");
+        assert!(err.contains("only supports adaptive thinking"));
+    }
+
+    #[test]
+    fn validate_rejects_legacy_adaptive_thinking() {
+        let mut req = request_with_model("claude-haiku-4-5-20251001");
+        req.max_tokens = 64000;
+        req.thinking = Some(thinking("adaptive", 20000));
+        req.output_config = Some(OutputConfig {
+            effort: "high".to_string(),
+        });
+        let err = validate_messages_request(&req).expect_err("应拒绝 legacy adaptive");
+        assert!(err.contains("does not support adaptive thinking"));
+    }
+
+    #[test]
+    fn validate_rejects_budget_not_less_than_max_tokens() {
+        let mut req = request_with_model("claude-sonnet-4-5-20250929");
+        req.max_tokens = 10000;
+        req.thinking = Some(thinking("enabled", 10000));
+        let err = validate_messages_request(&req).expect_err("应拒绝超预算 thinking");
+        assert!(err.contains("must be less than max_tokens"));
+    }
+
+    #[test]
+    fn validate_accepts_sonnet_4_6_adaptive_medium_effort() {
+        let mut req = request_with_model("claude-sonnet-4-6");
+        req.max_tokens = 64000;
+        req.thinking = Some(thinking("adaptive", 20000));
+        req.output_config = Some(OutputConfig {
+            effort: "medium".to_string(),
+        });
+        validate_messages_request(&req).expect("Sonnet 4.6 adaptive medium 应有效");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_adaptive_effort() {
+        let mut req = request_with_model("claude-sonnet-4-6");
+        req.max_tokens = 64000;
+        req.thinking = Some(thinking("adaptive", 20000));
+        req.output_config = Some(OutputConfig {
+            effort: "xhigh".to_string(),
+        });
+        let err = validate_messages_request(&req).expect_err("Sonnet 4.6 不应支持 xhigh");
+        assert!(err.contains("unsupported output_config.effort"));
+    }
+
+    #[test]
+    fn validate_rejects_max_tokens_above_model_limit() {
+        let mut req = request_with_model("claude-sonnet-4-6");
+        req.max_tokens = 64001;
+        let err = validate_messages_request(&req).expect_err("应拒绝超过模型上限");
+        assert!(err.contains("max_tokens exceeds model limit"));
     }
 
     /// 当 KiroClient 未配置时 `/v1/messages` 必须返回 503，且 body 携带
