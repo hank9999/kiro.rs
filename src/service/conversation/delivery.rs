@@ -34,35 +34,35 @@ pub enum DeliveryMode {
 /// 流处理上下文
 pub struct StreamContext {
     /// SSE 状态管理器
-    pub state_manager: SseStateManager,
+    state_manager: SseStateManager,
     /// 请求的模型名称
-    pub model: String,
+    model: String,
     /// 消息 ID
-    pub message_id: String,
+    message_id: String,
     /// 输入 tokens（估算值）
-    pub input_tokens: i32,
+    input_tokens: i32,
     /// 从 contextUsageEvent 计算的实际输入 tokens
-    pub context_input_tokens: Option<i32>,
+    context_input_tokens: Option<i32>,
     /// 累计的 assistant 原始文本（含 thinking 标签与内容），末段统一估算 output_tokens 用
     output_text_buffer: String,
     /// 累计的 tool_use.input 片段（JSON），末段统一估算 output_tokens 用
     tool_input_buffer: String,
     /// 工具块索引映射 (tool_id -> block_index)
-    pub tool_block_indices: HashMap<String, i32>,
+    tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
-    pub tool_name_map: HashMap<String, String>,
+    tool_name_map: HashMap<String, String>,
     /// thinking 是否启用
-    pub thinking_enabled: bool,
+    thinking_enabled: bool,
     /// thinking 内容缓冲区
-    pub thinking_buffer: String,
+    thinking_buffer: String,
     /// 是否在 thinking 块内
-    pub in_thinking_block: bool,
+    in_thinking_block: bool,
     /// thinking 块是否已提取完成
-    pub thinking_extracted: bool,
+    thinking_extracted: bool,
     /// thinking 块索引
-    pub thinking_block_index: Option<i32>,
+    thinking_block_index: Option<i32>,
     /// 文本块索引（thinking 启用时动态分配）
-    pub text_block_index: Option<i32>,
+    text_block_index: Option<i32>,
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
@@ -622,6 +622,16 @@ impl StreamContext {
         );
         events
     }
+
+    #[cfg(test)]
+    pub fn text_block_index(&self) -> Option<i32> {
+        self.text_block_index
+    }
+
+    #[cfg(test)]
+    pub fn thinking_block_index(&self) -> Option<i32> {
+        self.thinking_block_index
+    }
 }
 
 /// 缓冲流处理上下文 - 用于 /cc/v1/messages 流式请求
@@ -815,7 +825,7 @@ mod tests {
         );
 
         let initial_text_index = ctx
-            .text_block_index
+            .text_block_index()
             .expect("initial text block index should exist");
 
         let tool_events = ctx.process_tool_use(&crate::domain::event::ToolUseEvent {
@@ -963,7 +973,7 @@ mod tests {
         );
 
         let thinking_index = ctx
-            .thinking_block_index
+            .thinking_block_index()
             .expect("thinking block index should exist");
         let pos_thinking_stop = all_events.iter().position(|e| {
             e.event == "content_block_stop"
