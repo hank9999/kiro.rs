@@ -359,6 +359,7 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
+            dynamic_models: DynamicModelsConfig::default(),
             config_path: None,
         }
     }
