@@ -233,9 +233,58 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// 动态模型列表配置
+    ///
+    /// 控制后台周期性从上游 `ListAvailableModels` 拉取真实可用模型列表。
+    /// 若禁用或拉取失败，会回退到 `crate::anthropic::fallback_models()` 硬编码列表。
+    #[serde(default)]
+    pub dynamic_models: DynamicModelsConfig,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
+}
+
+/// 动态模型列表刷新配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicModelsConfig {
+    /// 是否启用动态拉取（默认 true）
+    #[serde(default = "default_dynamic_models_enabled")]
+    pub enabled: bool,
+
+    /// 周期刷新间隔（秒，默认 1800 = 30 分钟）
+    #[serde(default = "default_dynamic_models_refresh_secs")]
+    pub refresh_interval_secs: u64,
+
+    /// 启动后首次拉取前的延迟（秒，默认 5）
+    ///
+    /// 等待 token_manager / 代理池等子系统完成初始化后再发出第一次请求，
+    /// 避免与服务启动尖峰流量重叠。
+    #[serde(default = "default_dynamic_models_initial_delay_secs")]
+    pub initial_delay_secs: u64,
+}
+
+impl Default for DynamicModelsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_dynamic_models_enabled(),
+            refresh_interval_secs: default_dynamic_models_refresh_secs(),
+            initial_delay_secs: default_dynamic_models_initial_delay_secs(),
+        }
+    }
+}
+
+fn default_dynamic_models_enabled() -> bool {
+    true
+}
+
+fn default_dynamic_models_refresh_secs() -> u64 {
+    1800
+}
+
+fn default_dynamic_models_initial_delay_secs() -> u64 {
+    5
 }
 
 fn default_host() -> String {

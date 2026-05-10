@@ -24,6 +24,7 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
+use crate::kiro::model::list_models::ListAvailableModelsResponse;
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 
@@ -388,6 +389,74 @@ pub(crate) async fn get_usage_limits(
     }
 
     let data: UsageLimitsResponse = response.json().await?;
+    Ok(data)
+}
+
+/// 调用上游 ListAvailableModels 接口
+///
+/// `GET https://q.{api_region}.amazonaws.com/ListAvailableModels?origin=AI_EDITOR`
+/// 返回当前账号下可用的模型列表。该接口是元数据查询，不消耗 AGENTIC_REQUEST 配额。
+///
+/// 实测发现 `profileArn` 不是必传参数，省略也能 200 OK；这里仍按 `getUsageLimits`
+/// 的逻辑可选附加，便于未来上游升级。
+pub(crate) async fn list_available_models(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<ListAvailableModelsResponse> {
+    tracing::debug!("正在拉取上游可用模型列表...");
+
+    let region = credentials.effective_api_region(config);
+    let host = format!("q.{}.amazonaws.com", region);
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let kiro_version = &config.kiro_version;
+    let os_name = &config.system_version;
+    let node_version = &config.node_version;
+
+    let mut url = format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host);
+    if let Some(profile_arn) = &credentials.profile_arn {
+        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
+    }
+
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        os_name, node_version, kiro_version, machine_id
+    );
+    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+
+    let mut request = client
+        .get(&url)
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Connection", "close");
+
+    if credentials.is_api_key_credential() {
+        request = request.header("tokentype", "API_KEY");
+    }
+
+    let response = request.send().await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        let error_msg = match status.as_u16() {
+            401 => "认证失败，Token 无效或已过期",
+            403 => "权限不足，无法获取模型列表",
+            429 => "请求过于频繁，已被限流",
+            500..=599 => "服务器错误，AWS 服务暂时不可用",
+            _ => "获取模型列表失败",
+        };
+        bail!("{}: {} {}", error_msg, status, body_text);
+    }
+
+    let data: ListAvailableModelsResponse = response.json().await?;
     Ok(data)
 }
 
@@ -1752,6 +1821,103 @@ impl MultiTokenManager {
         }
 
         Ok(usage_limits)
+    }
+
+    /// 使用当前活跃（或第一个非禁用）凭据调用上游 `ListAvailableModels`
+    ///
+    /// 用于动态模型列表后台刷新任务。流程：
+    /// 1. 优先使用 `current_id` 指向的凭据，若不可用则取第一个非禁用凭据
+    /// 2. 必要时刷新 token（仅 OAuth 凭据，API Key 直接使用）
+    /// 3. 走凭据级有效代理（与 `getUsageLimits` 同链路）
+    pub async fn list_available_models_via_active(
+        &self,
+    ) -> anyhow::Result<ListAvailableModelsResponse> {
+        // 1. 选凭据：优先 current_id，回退到第一个非禁用
+        let cred_id = {
+            let entries = self.entries.lock();
+            let current_id = *self.current_id.lock();
+            entries
+                .iter()
+                .find(|e| e.id == current_id && !e.disabled)
+                .or_else(|| entries.iter().find(|e| !e.disabled))
+                .map(|e| e.id)
+                .ok_or_else(|| anyhow::anyhow!("没有可用凭据用于拉取模型列表"))?
+        };
+
+        // 2. 取凭据快照
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == cred_id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", cred_id))?
+        };
+
+        // 3. 准备 token：API Key 直接用；OAuth 必要时刷新
+        let token = if credentials.is_api_key_credential() {
+            credentials
+                .kiro_api_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
+        } else {
+            let needs_refresh =
+                is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
+            if needs_refresh {
+                let _guard = self.refresh_lock.lock().await;
+                let current_creds = {
+                    let entries = self.entries.lock();
+                    entries
+                        .iter()
+                        .find(|e| e.id == cred_id)
+                        .map(|e| e.credentials.clone())
+                        .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", cred_id))?
+                };
+                if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
+                    let effective_proxy = self.effective_proxy_for(&current_creds);
+                    let new_creds =
+                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
+                            .await?;
+                    {
+                        let mut entries = self.entries.lock();
+                        if let Some(entry) = entries.iter_mut().find(|e| e.id == cred_id) {
+                            entry.credentials = new_creds.clone();
+                        }
+                    }
+                    if let Err(e) = self.persist_credentials() {
+                        tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
+                    }
+                    new_creds
+                        .access_token
+                        .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
+                } else {
+                    current_creds
+                        .access_token
+                        .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
+                }
+            } else {
+                credentials
+                    .access_token
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
+            }
+        };
+
+        // 4. 重新取最新凭据快照（刷新流程可能更新了 profile_arn 等字段）
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == cred_id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", cred_id))?
+        };
+
+        let effective_proxy = self.effective_proxy_for(&credentials);
+        let response =
+            list_available_models(&credentials, &self.config, &token, effective_proxy.as_ref())
+                .await?;
+        Ok(response)
     }
 
     /// 添加新凭据（Admin API）

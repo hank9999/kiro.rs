@@ -10,11 +10,13 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::anthropic::{available_models, types::ModelsResponse};
+use crate::anthropic::types::{Model, ModelsResponse};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::list_models::UpstreamModel;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::monitoring::{RequestActivitySnapshot, RequestMonitor};
+use crate::shared_state::ModelsCacheHandle;
 
 use super::error::AdminServiceError;
 use super::types::{
@@ -54,6 +56,10 @@ pub struct AdminService {
     config_path: PathBuf,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+    /// 共享的动态模型列表缓存（与 anthropic AppState 共享同一份）
+    models_cache: ModelsCacheHandle,
+    /// 服务启动时间（Unix 秒），用于填充 Model.created
+    started_at_unix: i64,
 }
 
 impl AdminService {
@@ -63,6 +69,7 @@ impl AdminService {
         log_path: PathBuf,
         config_path: PathBuf,
         known_endpoints: impl IntoIterator<Item = String>,
+        models_cache: ModelsCacheHandle,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -78,6 +85,8 @@ impl AdminService {
             log_path,
             config_path,
             known_endpoints: known_endpoints.into_iter().collect(),
+            models_cache,
+            started_at_unix: Utc::now().timestamp(),
         }
     }
 
@@ -303,11 +312,66 @@ impl AdminService {
     }
 
     /// 获取当前服务暴露的模型列表
+    ///
+    /// 直接从共享的 [`ModelsCacheHandle`] 读取。该缓存由后台周期任务通过
+    /// [`Self::refresh_models`] 写入；首次启动尚未刷新成功时返回 fallback。
     pub fn get_available_models(&self) -> ModelsResponse {
         ModelsResponse {
             object: "list".to_string(),
-            data: available_models(),
+            data: self.models_cache.snapshot_models(),
         }
+    }
+
+    /// 拉取上游 ListAvailableModels 并写入共享缓存
+    ///
+    /// 由后台周期任务（在 `main.rs` 中通过 `tokio::spawn` 启动）调用。
+    /// 失败时不清除现有缓存，仅记录 `last_error`，让现有列表（可能是 fallback 或上一次成功的结果）继续生效。
+    ///
+    /// 处理上游响应时有两道保护：
+    /// 1. **过滤非 claude 模型**：handlers::map_model 当前只支持 claude 系列，
+    ///    暴露 deepseek/minimax/glm/qwen 等模型只会让 admin UI 出现实际无法调用的条目。
+    ///    后续若 handlers 支持更多模型，再放宽此过滤。
+    /// 2. **空数组保护**：上游临时故障 / 过滤后无 claude 模型时，保留现有缓存而非清空。
+    pub async fn refresh_models(&self) -> Result<(), AdminServiceError> {
+        let response = self
+            .token_manager
+            .list_available_models_via_active()
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                self.models_cache.mark_error(msg.clone());
+                AdminServiceError::UpstreamError(msg)
+            })?;
+
+        let (models, total_upstream) =
+            convert_and_filter_upstream_models(&response, self.started_at_unix);
+
+        if models.is_empty() {
+            let msg = format!(
+                "上游返回 {} 个模型，过滤后无 claude-* 可用，保留现有缓存",
+                total_upstream
+            );
+            tracing::warn!("{}", msg);
+            self.models_cache.mark_error(msg.clone());
+            return Err(AdminServiceError::UpstreamError(msg));
+        }
+
+        let default_id = response
+            .default_model
+            .as_ref()
+            .map(|m| m.model_id.clone());
+
+        let count = models.len();
+        let filtered_out = total_upstream.saturating_sub(count);
+        self.models_cache.replace(models, default_id.clone());
+        tracing::info!(
+            model_count = count,
+            filtered_out = filtered_out,
+            default_id = ?default_id,
+            "模型列表已通过上游 ListAvailableModels 更新"
+        );
+
+        Ok(())
     }
 
     /// 获取最近请求活动
@@ -1183,12 +1247,237 @@ fn extract_ip_from_json(body: &str) -> Option<String> {
     None
 }
 
+/// 上游 ListAvailableModels 返回的模型是否被本服务实际支持转发
+///
+/// 当前 [`crate::anthropic::converter::map_model`] 只识别 `sonnet` / `opus` / `haiku` 关键字
+/// （即 `claude-*` 系列），其他模型（`auto` / `deepseek-*` / `minimax-*` / `glm-*` /
+/// `qwen*` 等）若暴露给客户端只会触发 `UnsupportedModel` 错误。
+///
+/// 此函数与 `map_model` 的支持范围保持一致：仅放行 `claude-*` 系列。
+/// 后续若 `map_model` 扩展，请同步放宽此过滤。
+fn is_supported_upstream_model(model_id: &str) -> bool {
+    model_id.to_ascii_lowercase().starts_with("claude-")
+}
+
+/// 把上游响应转换并过滤为可对外暴露的 [`Model`] 列表
+///
+/// 返回 `(filtered_models, total_upstream_count)`，调用方据此判断 BUG #2 (空保护)。
+/// 与 `refresh_models` 解耦后便于单独单测过滤 / 空响应行为，无需 mock 整个 token_manager。
+fn convert_and_filter_upstream_models(
+    response: &crate::kiro::model::list_models::ListAvailableModelsResponse,
+    started_at_unix: i64,
+) -> (Vec<Model>, usize) {
+    let total = response.models.len();
+    let models = response
+        .models
+        .iter()
+        .filter(|upstream| is_supported_upstream_model(&upstream.model_id))
+        .map(|upstream| upstream_to_model(upstream, started_at_unix))
+        .collect();
+    (models, total)
+}
+
+/// 从 modelId 推断 owned_by（用于对外展示）
+fn derive_owned_by(model_id: &str) -> &'static str {
+    let id = model_id.to_ascii_lowercase();
+    if id == "auto" {
+        "system"
+    } else if id.starts_with("claude-") {
+        "anthropic"
+    } else if id.starts_with("deepseek-") {
+        "deepseek"
+    } else if id.starts_with("minimax-") {
+        "minimax"
+    } else if id.starts_with("glm-") {
+        "zhipu"
+    } else if id.starts_with("qwen") {
+        "alibaba"
+    } else {
+        "unknown"
+    }
+}
+
+/// 上游 [`UpstreamModel`] -> 对外暴露的 [`Model`] 转换
+///
+/// - `created` 统一填服务启动时间（秒），便于客户端区分会话内的"批次"
+/// - `max_tokens` 从 `tokenLimits.maxOutputTokens` 取，缺失回退 64000（与原有 fallback 列表一致）
+/// - 上游缺失 `modelName` 时回退使用 `modelId` 作为展示名
+fn upstream_to_model(upstream: &UpstreamModel, started_at_unix: i64) -> Model {
+    let max_tokens = upstream
+        .token_limits
+        .as_ref()
+        .and_then(|t| t.max_output_tokens)
+        .unwrap_or(64_000) as i32;
+    let display_name = upstream
+        .model_name
+        .clone()
+        .unwrap_or_else(|| upstream.model_id.clone());
+    Model {
+        id: upstream.model_id.clone(),
+        object: "model".to_string(),
+        created: started_at_unix,
+        owned_by: derive_owned_by(&upstream.model_id).to_string(),
+        display_name,
+        model_type: "chat".to_string(),
+        max_tokens,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LOG_TAIL_BYTES, read_tail_lines};
+    use super::{
+        LOG_TAIL_BYTES, convert_and_filter_upstream_models, derive_owned_by,
+        is_supported_upstream_model, read_tail_lines, upstream_to_model,
+    };
+    use crate::kiro::model::list_models::{
+        ListAvailableModelsResponse, UpstreamModel, UpstreamTokenLimits,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn upstream_with(id: &str) -> UpstreamModel {
+        UpstreamModel {
+            model_id: id.to_string(),
+            model_name: Some(id.to_string()),
+            description: None,
+            rate_multiplier: None,
+            rate_unit: None,
+            supported_input_types: vec![],
+            token_limits: None,
+            prompt_caching: None,
+        }
+    }
+
+    #[test]
+    fn test_is_supported_upstream_model_keeps_claude_only() {
+        assert!(is_supported_upstream_model("claude-sonnet-4.5"));
+        assert!(is_supported_upstream_model("claude-opus-4.6"));
+        assert!(is_supported_upstream_model("claude-haiku-4.5"));
+        assert!(is_supported_upstream_model("CLAUDE-Sonnet-4.5"));
+
+        // 与 map_model 当前能力对齐，下列模型应被拒绝
+        assert!(!is_supported_upstream_model("auto"));
+        assert!(!is_supported_upstream_model("deepseek-3.2"));
+        assert!(!is_supported_upstream_model("minimax-m2.5"));
+        assert!(!is_supported_upstream_model("glm-5"));
+        assert!(!is_supported_upstream_model("qwen3-coder-next"));
+        assert!(!is_supported_upstream_model(""));
+    }
+
+    #[test]
+    fn test_convert_and_filter_drops_non_claude_models() {
+        let response = ListAvailableModelsResponse {
+            default_model: Some(upstream_with("auto")),
+            models: vec![
+                upstream_with("claude-sonnet-4.5"),
+                upstream_with("claude-opus-4.6"),
+                upstream_with("deepseek-3.2"),
+                upstream_with("minimax-m2.5"),
+                upstream_with("auto"),
+            ],
+            next_token: None,
+        };
+
+        let (filtered, total) = convert_and_filter_upstream_models(&response, 1_700_000_000);
+        assert_eq!(total, 5, "原始上游模型数量应保留");
+        assert_eq!(filtered.len(), 2, "应仅保留 claude-* 模型");
+        let ids: Vec<&str> = filtered.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"claude-sonnet-4.5"));
+        assert!(ids.contains(&"claude-opus-4.6"));
+        assert!(!ids.contains(&"deepseek-3.2"));
+        assert!(!ids.contains(&"auto"));
+    }
+
+    #[test]
+    fn test_convert_and_filter_handles_empty_response() {
+        let response = ListAvailableModelsResponse {
+            default_model: None,
+            models: vec![],
+            next_token: None,
+        };
+        let (filtered, total) = convert_and_filter_upstream_models(&response, 0);
+        assert_eq!(total, 0);
+        assert!(filtered.is_empty(), "空响应应返回空列表，由调用方负责保护");
+    }
+
+    #[test]
+    fn test_convert_and_filter_all_filtered_returns_empty() {
+        // 上游返回了模型，但全部被过滤（没有任何 claude-*）
+        // 此场景与 BUG #2 等价：调用方应将其视为"无可用模型"，保留旧缓存
+        let response = ListAvailableModelsResponse {
+            default_model: None,
+            models: vec![
+                upstream_with("auto"),
+                upstream_with("deepseek-3.2"),
+                upstream_with("minimax-m2.5"),
+            ],
+            next_token: None,
+        };
+        let (filtered, total) = convert_and_filter_upstream_models(&response, 0);
+        assert_eq!(total, 3);
+        assert!(
+            filtered.is_empty(),
+            "全部被过滤等价于空响应，调用方应保留旧缓存"
+        );
+    }
+
+    #[test]
+    fn test_derive_owned_by() {
+        assert_eq!(derive_owned_by("auto"), "system");
+        assert_eq!(derive_owned_by("AUTO"), "system");
+        assert_eq!(derive_owned_by("claude-sonnet-4.5"), "anthropic");
+        assert_eq!(derive_owned_by("claude-haiku-4.5"), "anthropic");
+        assert_eq!(derive_owned_by("deepseek-3.2"), "deepseek");
+        assert_eq!(derive_owned_by("minimax-m2.5"), "minimax");
+        assert_eq!(derive_owned_by("glm-5"), "zhipu");
+        assert_eq!(derive_owned_by("qwen3-coder-next"), "alibaba");
+        assert_eq!(derive_owned_by("some-unknown-model"), "unknown");
+    }
+
+    #[test]
+    fn test_upstream_to_model_full_fields() {
+        let upstream = UpstreamModel {
+            model_id: "claude-sonnet-4.5".to_string(),
+            model_name: Some("Claude Sonnet 4.5".to_string()),
+            description: Some("desc".to_string()),
+            rate_multiplier: Some(1.3),
+            rate_unit: Some("Credit".to_string()),
+            supported_input_types: vec!["TEXT".to_string(), "IMAGE".to_string()],
+            token_limits: Some(UpstreamTokenLimits {
+                max_input_tokens: Some(200_000),
+                max_output_tokens: Some(64_000),
+            }),
+            prompt_caching: None,
+        };
+        let model = upstream_to_model(&upstream, 1_700_000_000);
+        assert_eq!(model.id, "claude-sonnet-4.5");
+        assert_eq!(model.display_name, "Claude Sonnet 4.5");
+        assert_eq!(model.owned_by, "anthropic");
+        assert_eq!(model.max_tokens, 64_000);
+        assert_eq!(model.created, 1_700_000_000);
+        assert_eq!(model.model_type, "chat");
+        assert_eq!(model.object, "model");
+    }
+
+    #[test]
+    fn test_upstream_to_model_missing_fields_fallback() {
+        let upstream = UpstreamModel {
+            model_id: "minimax-m2.1".to_string(),
+            model_name: None,
+            description: None,
+            rate_multiplier: None,
+            rate_unit: None,
+            supported_input_types: vec![],
+            token_limits: None,
+            prompt_caching: None,
+        };
+        let model = upstream_to_model(&upstream, 0);
+        assert_eq!(model.id, "minimax-m2.1");
+        assert_eq!(model.display_name, "minimax-m2.1");
+        assert_eq!(model.owned_by, "minimax");
+        assert_eq!(model.max_tokens, 64_000);
+    }
 
     fn temp_log_path(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()

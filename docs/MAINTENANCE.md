@@ -62,21 +62,66 @@
 上游项目原始定位是 Anthropic/Claude 兼容代理。
 当前仓库额外实现了 OpenAI 协议兼容层，但模型本身仍然走 Kiro/Claude 体系，不是 OpenAI 官方模型服务。
 
-### 2. `/v1/models` 是静态模型表
+### 2. `/v1/models` 来自上游动态拉取
 
-当前 `GET /v1/models` 返回的是静态列表，不保证每个模型都对当前凭据实际可用。
+当前 `GET /v1/models` 不再是静态表，而是后台周期任务从上游 `ListAvailableModels` 拉取真实可用模型后缓存的结果。
+
+刷新机制（详见 `src/main.rs` 中的 `dynamic_models` 任务）：
+
+- 服务启动后约 `dynamicModels.initialDelaySecs` 秒（默认 5s）发起首次拉取
+- 之后每 `dynamicModels.refreshIntervalSecs` 秒（默认 1800s = 30 分钟）刷新一次
+- 单次失败采用指数退避（30s → 60s → 120s → … 最多 300s），不会高频重试，避免触发上游限流
+- 拉取成功后写入 `ModelsCacheHandle`，`/v1/models` 与 `/api/admin/models` 都直接读这份共享缓存
+- 通过单条 active 凭据请求一次（实际观测多个 KIRO FREE 凭据返回相同列表），不在每个凭据上重复扫描
+
+`config.json` 相关字段（缺省即可，全部带默认值）：
+
+```json
+{
+  "dynamicModels": {
+    "enabled": true,
+    "refreshIntervalSecs": 1800,
+    "initialDelaySecs": 5
+  }
+}
+```
+
+特殊情况：
+
+- 启动后首次拉取尚未成功 / `dynamicModels.enabled=false` / 上游连续失败时，会暂时回退到硬编码的 `fallback_models()` 列表（参见 `src/anthropic/handlers.rs`）
+- fallback 列表故意保留 `-thinking` 后缀变体，方便客户端在动态列表尚未就绪时继续走老 ID
+- 上游真实列表中 ID 是无 `-thinking` 后缀的形式（例如 `claude-sonnet-4.5`）。客户端在 ID 末尾追加 `-thinking` 仍可触发思考模式，由 `handlers` 层 `override_thinking_from_model_name` 处理
+- **`refresh_models` 在写入缓存前只放行 `claude-*` 系列**：handlers 的 `map_model` 当前只识别 `sonnet` / `opus` / `haiku` 关键字，若把 `auto` / `deepseek-*` / `minimax-*` / `glm-*` / `qwen*` 等模型也暴露给客户端，调用时会拿到 `400 invalid_request_error: 模型不支持`。如果未来 `map_model` 扩展，请同步放宽 `is_supported_upstream_model` 的过滤
+- **空数组保护**：上游返回空 / 全部被过滤掉 / 上游临时故障时，`refresh_models` 不替换缓存，仅记录 `last_error` 并返回 `Err`，让现有缓存继续生效（fallback 或上一次成功结果）
+
 如果调用某些模型时报：
 
 ```text
 INVALID_MODEL_ID
 ```
 
-通常不是服务挂了，而是当前凭据不具备该模型权限。
-
-已在当前环境实际跑通过的模型包括：
+通常不是服务挂了，而是当前凭据不具备该模型权限。已在当前环境实际跑通的模型至少包括：
 
 - `claude-sonnet-4-5-20250929`
 - `claude-haiku-4-5-20251001`
+
+校验当前缓存状态：
+
+```bash
+# 默认从 config.json 读取 host/port + 第一个有效 API Key
+python scripts/test_dynamic_models_refresh.py
+
+# 监听模式：每 5 秒轮询一次，观察 fallback → dynamic 切换
+python scripts/test_dynamic_models_refresh.py --watch 5
+
+# 同时校验 admin 接口与 v1 接口共享同一份缓存
+python scripts/test_dynamic_models_refresh.py --admin-key <ADMIN_API_KEY>
+```
+
+附属诊断脚本：
+
+- `scripts/test_list_models.py`：直接打上游 `ListAvailableModels`，验证凭据 / 代理是否能正常拿到模型列表
+- `scripts/diag_compare_models.py`：批量调用多条凭据并对比返回，观察是否需要切换为按凭据各自缓存（当前免费档全部一致，故只用单凭据策略）
 
 ### 3. 配置文件不进 Git
 

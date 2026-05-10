@@ -18,6 +18,7 @@ use tracing::Instrument;
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 use crate::monitoring::{RequestMetadata, RequestMetadataHandle, RequestMonitor};
+use crate::shared_state::ModelsCacheHandle;
 
 use super::types::ErrorResponse;
 
@@ -35,6 +36,8 @@ pub struct AppState {
     pub request_monitor: RequestMonitor,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// 动态模型列表缓存（与 admin 服务共享同一份）
+    pub models_cache: ModelsCacheHandle,
 }
 
 impl AppState {
@@ -44,6 +47,7 @@ impl AppState {
         config_path: PathBuf,
         request_monitor: RequestMonitor,
         extract_thinking: bool,
+        models_cache: ModelsCacheHandle,
     ) -> Self {
         Self {
             api_keys: Arc::new(RwLock::new(api_keys)),
@@ -51,6 +55,7 @@ impl AppState {
             kiro_provider: None,
             request_monitor,
             extract_thinking,
+            models_cache,
         }
     }
 

@@ -5,12 +5,14 @@
 //! - `events`: 响应事件类型
 //! - `requests`: 请求类型
 //! - `credentials`: OAuth 凭证
+//! - `list_models`: ListAvailableModels 响应
 //! - `token_refresh`: Token 刷新
 //! - `usage_limits`: 使用额度查询
 
 pub mod common;
 pub mod credentials;
 pub mod events;
+pub mod list_models;
 pub mod requests;
 pub mod token_refresh;
 pub mod usage_limits;

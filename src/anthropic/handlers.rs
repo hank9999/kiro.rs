@@ -70,10 +70,11 @@ fn map_provider_error(err: Error) -> Response {
         .into_response()
 }
 
-/// GET /v1/models
+/// 返回硬编码的 fallback 模型列表
 ///
-/// 返回可用的模型列表
-pub fn available_models() -> Vec<Model> {
+/// 该列表仅在动态模型刷新尚未成功（首次启动）或被显式禁用（`config.dynamicModels.enabled=false`）
+/// 时使用。正常运行时由后台周期任务从上游 `ListAvailableModels` 拉取真实可用模型并覆盖。
+pub fn fallback_models() -> Vec<Model> {
     vec![
         Model {
             id: "claude-opus-4-6".to_string(),
@@ -168,12 +169,12 @@ pub fn available_models() -> Vec<Model> {
     ]
 }
 
-pub async fn get_models() -> impl IntoResponse {
+pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
     Json(ModelsResponse {
         object: "list".to_string(),
-        data: available_models(),
+        data: state.models_cache.snapshot_models(),
     })
 }
 

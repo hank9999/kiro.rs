@@ -7,6 +7,7 @@ mod kiro;
 mod model;
 mod monitoring;
 mod openai;
+mod shared_state;
 pub mod token;
 
 use std::{
@@ -24,6 +25,7 @@ use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
 use model::arg::Args;
 use model::config::Config;
+use shared_state::ModelsCacheHandle;
 
 fn absolutize_path(path: &str) -> PathBuf {
     let path = PathBuf::from(path);
@@ -239,12 +241,17 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
+    // 创建动态模型列表缓存（首次启动用 fallback 列表填充）
+    // anthropic AppState 与 AdminService 共享同一个 handle
+    let models_cache = ModelsCacheHandle::new_with_fallback(anthropic::fallback_models());
+
     // 创建共享的 AppState
     let app_state = anthropic::middleware::AppState::new(
         api_keys.clone(),
         config_path.clone().into(),
         request_monitor.clone(),
         config.extract_thinking,
+        models_cache.clone(),
     );
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
@@ -252,6 +259,51 @@ async fn main() {
         app_state.clone(),
         Some(kiro_provider),
     );
+
+    // 总是构造 AdminService（用于后台周期刷新模型列表，即便 admin API 路由未启用）
+    let admin_service = Arc::new(admin::AdminService::new(
+        token_manager.clone(),
+        request_monitor.clone(),
+        log_path.clone(),
+        config_path.clone().into(),
+        endpoint_names.clone(),
+        models_cache.clone(),
+    ));
+
+    // 启动动态模型列表刷新后台任务
+    if config.dynamic_models.enabled {
+        tracing::info!(
+            interval_secs = config.dynamic_models.refresh_interval_secs,
+            initial_delay_secs = config.dynamic_models.initial_delay_secs,
+            "动态模型列表刷新已启用",
+        );
+        let svc = admin_service.clone();
+        let initial_delay = config.dynamic_models.initial_delay_secs;
+        let interval_secs = config.dynamic_models.refresh_interval_secs;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(initial_delay)).await;
+            let mut backoff_secs: u64 = 30;
+            loop {
+                match svc.refresh_models().await {
+                    Ok(_) => {
+                        backoff_secs = 30;
+                        tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            backoff_secs,
+                            "动态模型列表刷新失败，稍后重试",
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs.saturating_mul(2)).min(300);
+                    }
+                }
+            }
+        });
+    } else {
+        tracing::info!("动态模型列表刷新已禁用，使用静态 fallback 列表");
+    }
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
     // 安全检查：空字符串被视为未配置，防止空 key 绕过认证
@@ -266,14 +318,7 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
-            let admin_service = admin::AdminService::new(
-                token_manager.clone(),
-                request_monitor.clone(),
-                log_path,
-                config_path.into(),
-                endpoint_names.clone(),
-            );
-            let admin_state = admin::AdminState::new(admin_key, admin_service, app_state);
+            let admin_state = admin::AdminState::new(admin_key, admin_service.clone(), app_state);
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由
