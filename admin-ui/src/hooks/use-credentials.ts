@@ -4,11 +4,14 @@ import {
   setCredentialDisabled,
   setCredentialPriority,
   resetCredentialFailure,
+  resetAllCredentials,
+  clearImmediateFailureDisabled,
   forceRefreshToken,
   getCredentialBalance,
   addCredential,
   deleteCredential,
   getLoadBalancingMode,
+  getRuntimeMetrics,
   setLoadBalancingMode,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
@@ -67,6 +70,28 @@ export function useResetFailure() {
   })
 }
 
+// 启动所有账号并重置失败计数
+export function useResetAllCredentials() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: resetAllCredentials,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 批量清除 ImmediateFailure 已禁用凭据
+export function useClearImmediateFailureDisabled() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: clearImmediateFailureDisabled,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
 // 强制刷新 Token
 export function useForceRefreshToken() {
   const queryClient = useQueryClient()
@@ -108,6 +133,15 @@ export function useLoadBalancingMode() {
   })
 }
 
+// 获取运行时轻量指标
+export function useRuntimeMetrics() {
+  return useQuery({
+    queryKey: ['runtimeMetrics'],
+    queryFn: getRuntimeMetrics,
+    refetchInterval: 5000,
+  })
+}
+
 // 设置负载均衡模式
 export function useSetLoadBalancingMode() {
   const queryClient = useQueryClient()
@@ -115,6 +149,7 @@ export function useSetLoadBalancingMode() {
     mutationFn: setLoadBalancingMode,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+      queryClient.invalidateQueries({ queryKey: ['runtimeMetrics'] })
     },
   })
 }

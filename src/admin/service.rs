@@ -9,12 +9,13 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{MultiTokenManager, RuntimeMetrics};
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse,
+    ClearImmediateFailureDisabledResponse, CredentialStatusItem, CredentialsStatusResponse,
+    LoadBalancingModeResponse, ResetAllCredentialsResponse, SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -130,6 +131,57 @@ impl AdminService {
         self.token_manager
             .reset_and_enable(id)
             .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 批量重置所有凭据失败计数并重新启用
+    pub fn reset_and_enable_all(&self) -> Result<ResetAllCredentialsResponse, AdminServiceError> {
+        let result = self
+            .token_manager
+            .reset_and_enable_all()
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        let snapshot = self.token_manager.snapshot();
+        let message = format!(
+            "已启动 {} 个账号并重置失败计数，跳过 {} 个无效配置账号，{} 个账号无需变更",
+            result.reset_count, result.skipped_invalid_config_count, result.unchanged_count
+        );
+
+        Ok(ResetAllCredentialsResponse {
+            success: true,
+            message,
+            reset_count: result.reset_count,
+            skipped_invalid_config_count: result.skipped_invalid_config_count,
+            unchanged_count: result.unchanged_count,
+            available: snapshot.available,
+            current_id: snapshot.current_id,
+        })
+    }
+
+    /// 批量清除 `ImmediateFailure` 状态的已禁用凭据
+    pub fn clear_immediate_failure_disabled(
+        &self,
+    ) -> Result<ClearImmediateFailureDisabledResponse, AdminServiceError> {
+        let result = self
+            .token_manager
+            .clear_immediate_failure_disabled()
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        let snapshot = self.token_manager.snapshot();
+        let message = format!(
+            "已清除 {} 个 ImmediateFailure 已禁用凭据，跳过 {} 个其他禁用原因凭据，{} 个凭据无需变更",
+            result.cleared_count, result.skipped_other_disabled_count, result.unchanged_count
+        );
+
+        Ok(ClearImmediateFailureDisabledResponse {
+            success: true,
+            message,
+            cleared_count: result.cleared_count,
+            skipped_other_disabled_count: result.skipped_other_disabled_count,
+            unchanged_count: result.unchanged_count,
+            total: snapshot.total,
+            available: snapshot.available,
+            current_id: snapshot.current_id,
+        })
     }
 
     /// 获取凭据余额（带缓存）
@@ -280,15 +332,25 @@ impl AdminService {
         }
     }
 
+    /// 获取轻量运行时指标
+    pub fn get_runtime_metrics(&self) -> RuntimeMetrics {
+        self.token_manager.runtime_metrics()
+    }
+
     /// 设置负载均衡模式
     pub fn set_load_balancing_mode(
         &self,
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
         // 验证模式值
-        if req.mode != "priority" && req.mode != "balanced" {
+        if req.mode != "priority"
+            && req.mode != "balanced"
+            && req.mode != "round_robin"
+            && req.mode != "adaptive_round_robin"
+        {
             return Err(AdminServiceError::InvalidCredential(
-                "mode 必须是 'priority' 或 'balanced'".to_string(),
+                "mode 必须是 'priority'、'balanced'、'round_robin' 或 'adaptive_round_robin'"
+                    .to_string(),
             ));
         }
 
@@ -448,7 +510,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)

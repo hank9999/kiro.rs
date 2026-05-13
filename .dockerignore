@@ -5,7 +5,6 @@ Cargo.lock
 # Node.js dependencies and build artifacts
 admin-ui/node_modules/
 admin-ui/dist/
-admin-ui/pnpm-lock.yaml
 admin-ui/tsconfig.tsbuildinfo
 admin-ui/.vite/
 

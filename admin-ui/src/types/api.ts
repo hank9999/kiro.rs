@@ -46,6 +46,27 @@ export interface SuccessResponse {
   message: string
 }
 
+export interface ResetAllCredentialsResponse {
+  success: boolean
+  message: string
+  resetCount: number
+  skippedInvalidConfigCount: number
+  unchangedCount: number
+  available: number
+  currentId: number
+}
+
+export interface ClearImmediateFailureDisabledResponse {
+  success: boolean
+  message: string
+  clearedCount: number
+  skippedOtherDisabledCount: number
+  unchangedCount: number
+  total: number
+  available: number
+  currentId: number
+}
+
 // 错误响应
 export interface AdminErrorResponse {
   error: {

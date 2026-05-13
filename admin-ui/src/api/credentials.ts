@@ -4,6 +4,8 @@ import type {
   CredentialsStatusResponse,
   BalanceResponse,
   SuccessResponse,
+  ResetAllCredentialsResponse,
+  ClearImmediateFailureDisabledResponse,
   SetDisabledRequest,
   SetPriorityRequest,
   AddCredentialRequest,
@@ -65,6 +67,20 @@ export async function resetCredentialFailure(
   return data
 }
 
+// 启动所有账号并重置失败计数
+export async function resetAllCredentials(): Promise<ResetAllCredentialsResponse> {
+  const { data } = await api.post<ResetAllCredentialsResponse>('/credentials/reset-all')
+  return data
+}
+
+// 批量清除 ImmediateFailure 已禁用凭据
+export async function clearImmediateFailureDisabled(): Promise<ClearImmediateFailureDisabledResponse> {
+  const { data } = await api.post<ClearImmediateFailureDisabledResponse>(
+    '/credentials/clear-immediate-failures'
+  )
+  return data
+}
+
 // 强制刷新 Token
 export async function forceRefreshToken(
   id: number
@@ -94,13 +110,30 @@ export async function deleteCredential(id: number): Promise<SuccessResponse> {
 }
 
 // 获取负载均衡模式
-export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'balanced' }> {
-  const { data } = await api.get<{ mode: 'priority' | 'balanced' }>('/config/load-balancing')
+export type LoadBalancingMode = 'priority' | 'balanced' | 'round_robin' | 'adaptive_round_robin'
+
+export interface RuntimeMetrics {
+  loadBalancingMode: LoadBalancingMode
+  total: number
+  available: number
+  disabled: number
+  coolingDown: number
+  inFlight: number
+}
+
+export async function getLoadBalancingMode(): Promise<{ mode: LoadBalancingMode }> {
+  const { data } = await api.get<{ mode: LoadBalancingMode }>('/config/load-balancing')
   return data
 }
 
 // 设置负载均衡模式
-export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
-  const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
+export async function setLoadBalancingMode(mode: LoadBalancingMode): Promise<{ mode: LoadBalancingMode }> {
+  const { data } = await api.put<{ mode: LoadBalancingMode }>('/config/load-balancing', { mode })
+  return data
+}
+
+// 获取运行时轻量指标
+export async function getRuntimeMetrics(): Promise<RuntimeMetrics> {
+  const { data } = await api.get<RuntimeMetrics>('/runtime/metrics')
   return data
 }

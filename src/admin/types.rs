@@ -156,6 +156,33 @@ pub struct AddCredentialResponse {
     pub email: Option<String>,
 }
 
+/// 批量启动所有账号并重置失败计数响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetAllCredentialsResponse {
+    pub success: bool,
+    pub message: String,
+    pub reset_count: usize,
+    pub skipped_invalid_config_count: usize,
+    pub unchanged_count: usize,
+    pub available: usize,
+    pub current_id: u64,
+}
+
+/// 批量清除 ImmediateFailure 已禁用凭据响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearImmediateFailureDisabledResponse {
+    pub success: bool,
+    pub message: String,
+    pub cleared_count: usize,
+    pub skipped_other_disabled_count: usize,
+    pub unchanged_count: usize,
+    pub total: usize,
+    pub available: usize,
+    pub current_id: u64,
+}
+
 // ============ 余额查询 ============
 
 /// 余额查询响应
@@ -184,7 +211,7 @@ pub struct BalanceResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoadBalancingModeResponse {
-    /// 当前模式（"priority" 或 "balanced"）
+    /// 当前模式（"priority"、"balanced"、"round_robin" 或 "adaptive_round_robin"）
     pub mode: String,
 }
 
@@ -192,7 +219,7 @@ pub struct LoadBalancingModeResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetLoadBalancingModeRequest {
-    /// 模式（"priority" 或 "balanced"）
+    /// 模式（"priority"、"balanced"、"round_robin" 或 "adaptive_round_robin"）
     pub mode: String,
 }
 
