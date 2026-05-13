@@ -17,6 +17,13 @@ impl Default for TlsBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CacheMaxReadRatio {
+    Fixed(f64),
+    Range([f64; 2]),
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -87,6 +94,19 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
+    /// Redis 连接 URL（可选，启用缓存功能）
+    #[serde(default)]
+    pub redis_url: Option<String>,
+
+    /// 是否输出缓存断点与命中详情日志（可选）
+    #[serde(default)]
+    pub cache_debug_logging: bool,
+
+    /// Maximum ratio of input tokens that can be cached per request.
+    /// Use a number for a fixed ratio, or [min, max] to randomize per request.
+    #[serde(default = "default_cache_max_read_ratio")]
+    pub cache_max_read_ratio: CacheMaxReadRatio,
+
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
@@ -151,6 +171,10 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_cache_max_read_ratio() -> CacheMaxReadRatio {
+    CacheMaxReadRatio::Fixed(1.0)
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -180,6 +204,9 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            redis_url: None,
+            cache_debug_logging: false,
+            cache_max_read_ratio: default_cache_max_read_ratio(),
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),

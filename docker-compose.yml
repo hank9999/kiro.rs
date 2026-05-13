@@ -2,7 +2,7 @@ services:
   kiro-rs:
     # 使用国内镜像
     # image: ghcr.nju.edu.cn/${IMAGE_OWNER:-hank9999}/kiro-rs:${IMAGE_TAG:-latest}
-    image: ghcr.io/${IMAGE_OWNER:-hank9999}/kiro-rs:${IMAGE_TAG:-latest}
+    image: ghcr.io/nonepage/kiro-rs:latest
     container_name: kiro-rs
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -10,4 +10,23 @@ services:
       - "8990:8990"
     volumes:
       - ./config/:/app/config/
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: kiro-rs-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  redis-data:

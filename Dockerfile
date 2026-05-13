@@ -1,8 +1,8 @@
 FROM node:22-alpine AS frontend-builder
 
 WORKDIR /app/admin-ui
-COPY admin-ui/package.json ./
-RUN npm install -g pnpm && pnpm install
+COPY admin-ui/package.json admin-ui/pnpm-lock.yaml* ./
+RUN corepack enable && corepack prepare pnpm@latest --activate && pnpm install --ignore-scripts
 COPY admin-ui ./
 RUN pnpm build
 

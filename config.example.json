@@ -5,5 +5,8 @@
   "tlsBackend": "rustls",
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
-  "defaultEndpoint": "ide"
+  "defaultEndpoint": "ide",
+  "redisUrl": "redis://redis:6379",
+  "cacheDebugLogging": false,
+  "cacheMaxReadRatio": [0.8, 0.95]
 }

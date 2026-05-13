@@ -122,13 +122,16 @@ jobs:
             ${IMAGE}:${VERSION}-arm64
           docker manifest push ${IMAGE}:${VERSION}
 
-          # Create manifest for latest/beta alias tag
-          if [ "${IS_BETA}" = "true" ]; then
-            ALIAS_TAG="beta"
-          else
-            ALIAS_TAG="latest"
-          fi
-          docker manifest create ${IMAGE}:${ALIAS_TAG} \
+          # Always push latest
+          docker manifest create ${IMAGE}:latest \
             ${IMAGE}:${VERSION}-amd64 \
             ${IMAGE}:${VERSION}-arm64
-          docker manifest push ${IMAGE}:${ALIAS_TAG}
+          docker manifest push ${IMAGE}:latest
+
+          # Also push beta alias for branch pushes
+          if [ "${IS_BETA}" = "true" ]; then
+            docker manifest create ${IMAGE}:beta \
+              ${IMAGE}:${VERSION}-amd64 \
+              ${IMAGE}:${VERSION}-arm64
+            docker manifest push ${IMAGE}:beta
+          fi

@@ -157,6 +157,16 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
+    anthropic::cache::set_debug_logging(config.cache_debug_logging);
+    anthropic::cache::set_max_read_ratio(config.cache_max_read_ratio);
+
+    // 初始化 Redis（如果配置了）
+    if let Some(redis_url) = &config.redis_url {
+        if let Err(e) = anthropic::cache::init_redis(redis_url).await {
+            tracing::warn!("Failed to initialize Redis cache: {}", e);
+        }
+    }
+
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
