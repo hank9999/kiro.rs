@@ -2,11 +2,11 @@
 
 use std::{convert::Infallible, sync::Arc};
 
-use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
+use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
@@ -23,12 +23,18 @@ use uuid::Uuid;
 
 use crate::stats::StatsStore;
 
-use super::converter::{ConversionError, ConversionResult, convert_request, rebuild_with_truncated_history};
+use super::converter::{
+    ConversionError, ConversionResult, convert_request, get_context_window_size,
+    rebuild_with_truncated_history,
+};
 use super::history_manager::{HistoryManager, KiroSummaryGenerator};
 use super::history_store::global_store;
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::types::{
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
+    OutputConfig, Thinking,
+};
 use super::websearch;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -79,94 +85,112 @@ pub async fn get_models() -> impl IntoResponse {
 
     let models = vec![
         Model {
-            id: "claude-sonnet-4-5-20250929".to_string(),
+            id: "claude-opus-4-7".to_string(),
             object: "model".to_string(),
-            created: 1727568000,
+            created: 1776276000, // Apr 16, 2026
             owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5".to_string(),
+            display_name: "Claude Opus 4.7".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 64000,
         },
         Model {
-            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
+            id: "claude-opus-4-7-thinking".to_string(),
             object: "model".to_string(),
-            created: 1727568000,
+            created: 1776276000, // Apr 16, 2026
             owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
+            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101".to_string(),
-            object: "model".to_string(),
-            created: 1730419200,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1730419200,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
-            id: "claude-sonnet-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1770314400,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
-            id: "claude-sonnet-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1770314400,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 64000,
         },
         Model {
             id: "claude-opus-4-6".to_string(),
             object: "model".to_string(),
-            created: 1770314400,
+            created: 1770163200, // Feb 4, 2026
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.6".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 64000,
         },
         Model {
             id: "claude-opus-4-6-thinking".to_string(),
             object: "model".to_string(),
-            created: 1770314400,
+            created: 1770163200, // Feb 4, 2026
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.6 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-4-6".to_string(),
+            object: "model".to_string(),
+            created: 1771286400, // Feb 17, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.6".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-4-6-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1771286400, // Feb 17, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-5-20251101".to_string(),
+            object: "model".to_string(),
+            created: 1763942400, // Nov 24, 2025
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-5-20251101-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1763942400, // Nov 24, 2025
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-4-5-20250929".to_string(),
+            object: "model".to_string(),
+            created: 1759104000, // Sep 29, 2025
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1759104000, // Sep 29, 2025
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
         },
         Model {
             id: "claude-haiku-4-5-20251001".to_string(),
             object: "model".to_string(),
-            created: 1727740800,
+            created: 1760486400, // Oct 15, 2025
             owned_by: "anthropic".to_string(),
             display_name: "Claude Haiku 4.5".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 64000,
         },
         Model {
             id: "claude-haiku-4-5-20251001-thinking".to_string(),
             object: "model".to_string(),
-            created: 1727740800,
+            created: 1760486400, // Oct 15, 2025
             owned_by: "anthropic".to_string(),
             display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 64000,
         },
     ];
 
@@ -192,7 +216,7 @@ pub async fn post_messages(
         .and_then(|uid| uid.split("__session_").nth(1))
         .map(|s| s.to_string())
         .unwrap_or_else(|| "default".to_string());
-    
+
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
@@ -232,7 +256,14 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(state, provider, &payload, input_tokens, &session_id).await;
+        return websearch::handle_websearch_request(
+            state,
+            provider,
+            &payload,
+            input_tokens,
+            &session_id,
+        )
+        .await;
     }
 
     // 转换请求
@@ -246,9 +277,7 @@ pub async fn post_messages(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
-                ConversionError::InvalidRequest(msg) => {
-                    ("invalid_request_error", msg.clone())
-                }
+                ConversionError::InvalidRequest(msg) => ("invalid_request_error", msg.clone()),
             };
             tracing::warn!("请求转换失败: {}", e);
             return (
@@ -264,10 +293,10 @@ pub async fn post_messages(
         tracing::warn!(session_id = %session_id, "保存历史记录失败: {}", e);
     }
 
-    // 构建 Kiro 请求
+    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state.clone(),
-        profile_arn: state.profile_arn.clone(),
+        profile_arn: None,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -302,6 +331,8 @@ pub async fn post_messages(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
 
+    let tool_name_map = conversion_result.tool_name_map.clone();
+
     if payload.stream {
         // 流式响应
         handle_stream_request(
@@ -313,18 +344,22 @@ pub async fn post_messages(
             thinking_enabled,
             &session_id,
             conversion_result,
+            tool_name_map,
         )
         .await
     } else {
-        // 非流式响应
+        // 非流式响应：仅在配置开启时提取 thinking 块
+        let extract_thinking = state.extract_thinking && thinking_enabled;
         handle_non_stream_request(
             state,
             provider,
             &request_body,
             &payload.model,
             input_tokens,
+            extract_thinking,
             &session_id,
             conversion_result,
+            tool_name_map,
         )
         .await
     }
@@ -340,10 +375,11 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     session_id: &str,
     conversion_result: ConversionResult,
+    tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 截断重试配置（带摘要支持）
-    let mut history_manager = HistoryManager::with_defaults()
-        .with_cache_key(session_id.to_string());
+    let mut history_manager =
+        HistoryManager::with_defaults().with_cache_key(session_id.to_string());
     let max_retries = 2;
     let mut retry_count = 0;
     let mut current_history = conversion_result.original_history.clone();
@@ -351,10 +387,8 @@ async fn handle_stream_request(
 
     // 创建摘要生成器（使用配置的模型）
     let summary_model = state.get_summary_model();
-    let summary_generator = KiroSummaryGenerator::new(
-        provider.clone(),
-        state.profile_arn.clone(),
-    ).with_model(&summary_model);
+    let summary_generator = KiroSummaryGenerator::new(provider.clone(), state.profile_arn.clone())
+        .with_model(&summary_model);
 
     loop {
         // 调用 Kiro API（支持多凭据故障转移）
@@ -369,7 +403,12 @@ async fn handle_stream_request(
                 let request_body_clone = current_request_body.clone();
 
                 // 创建流处理上下文
-                let mut ctx = StreamContext::new_with_thinking(model.clone(), input_tokens, thinking_enabled);
+                let mut ctx = StreamContext::new_with_thinking(
+                    model.clone(),
+                    input_tokens,
+                    thinking_enabled,
+                    tool_name_map.clone(),
+                );
 
                 // 生成初始事件
                 let initial_events = ctx.generate_initial_events();
@@ -429,7 +468,11 @@ async fn handle_stream_request(
                         if should_retry {
                             tracing::info!(
                                 "内容长度超限（流式），尝试{}重试 (第 {} 次): {}",
-                                if history_manager.truncate_info().used_summary { "摘要" } else { "截断" },
+                                if history_manager.truncate_info().used_summary {
+                                    "摘要"
+                                } else {
+                                    "截断"
+                                },
                                 retry_count + 1,
                                 history_manager.truncate_info().message
                             );
@@ -439,11 +482,13 @@ async fn handle_stream_request(
                                 HistoryManager::fix_history_after_truncate(truncated_history);
 
                             // 重新构建请求
-                            let new_state =
-                                rebuild_with_truncated_history(&conversion_result, fixed_history.clone());
+                            let new_state = rebuild_with_truncated_history(
+                                &conversion_result,
+                                fixed_history.clone(),
+                            );
                             let new_request = KiroRequest {
                                 conversation_state: new_state,
-                                profile_arn: state.profile_arn.clone(),
+                                profile_arn: None,
                             };
 
                             match serde_json::to_string(&new_request) {
@@ -812,13 +857,13 @@ fn create_sse_stream(
                         // 检查是否收到上游错误事件，如果是则尝试重试或返回错误
                         let received_error = state.ctx.received_upstream_error;
                         let is_abnormally_short = state.ctx.output_tokens < STREAM_RETRY_MIN_OUTPUT_TOKENS;
-                        
+
                         // 当收到上游错误事件且输出很短时，返回 SSE error 事件让 Claude Code 重试
                         if received_error && is_abnormally_short {
                             let error_msg = state.ctx.upstream_error_message
                                 .as_deref()
                                 .unwrap_or("Upstream service error");
-                            
+
                             tracing::warn!(
                                 message_id = %state.ctx.message_id,
                                 output_tokens = state.ctx.output_tokens,
@@ -836,7 +881,7 @@ fn create_sse_stream(
                             }
 
                             state.finished = true;
-                            
+
                             // 返回 SSE error 事件，Claude Code 会自动重试
                             let error_event = format!(
                                 "event: error\ndata: {}\n\n",
@@ -922,9 +967,6 @@ fn create_sse_stream(
     initial_stream.chain(processing_stream)
 }
 
-/// Claude Code 上下文窗口大小（200k tokens）
-const CONTEXT_WINDOW_SIZE: i32 = 200_000;
-
 /// 输出警告的上下文使用率阈值（百分比）
 const CONTEXT_WARNING_THRESHOLD: f64 = 80.0;
 
@@ -935,12 +977,14 @@ async fn handle_non_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    thinking_enabled: bool,
     session_id: &str,
     conversion_result: ConversionResult,
+    tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 截断重试配置（带摘要支持）
-    let mut history_manager = HistoryManager::with_defaults()
-        .with_cache_key(session_id.to_string());
+    let mut history_manager =
+        HistoryManager::with_defaults().with_cache_key(session_id.to_string());
     let max_retries = 2;
     let mut retry_count = 0;
     let mut current_history = conversion_result.original_history.clone();
@@ -948,10 +992,8 @@ async fn handle_non_stream_request(
 
     // 创建摘要生成器（使用配置的模型）
     let summary_model = state.get_summary_model();
-    let summary_generator = KiroSummaryGenerator::new(
-        provider.clone(),
-        state.profile_arn.clone(),
-    ).with_model(&summary_model);
+    let summary_generator = KiroSummaryGenerator::new(provider.clone(), state.profile_arn.clone())
+        .with_model(&summary_model);
 
     loop {
         // 调用 Kiro API（支持多凭据故障转移）
@@ -969,7 +1011,11 @@ async fn handle_non_stream_request(
                     Err(e) => {
                         tracing::error!("读取响应体失败: {}", e);
                         if let Some(s) = &stats {
-                            s.record_error(credential_id, Some(model), format!("读取响应体失败: {}", e));
+                            s.record_error(
+                                credential_id,
+                                Some(model),
+                                format!("读取响应体失败: {}", e),
+                            );
                         }
                         return (
                             StatusCode::BAD_GATEWAY,
@@ -991,6 +1037,8 @@ async fn handle_non_stream_request(
                     stats,
                     session_id,
                     &state,
+                    thinking_enabled,
+                    tool_name_map,
                 )
                 .await;
             }
@@ -1013,7 +1061,11 @@ async fn handle_non_stream_request(
                         if should_retry {
                             tracing::info!(
                                 "内容长度超限，尝试{}重试 (第 {} 次): {}",
-                                if history_manager.truncate_info().used_summary { "摘要" } else { "截断" },
+                                if history_manager.truncate_info().used_summary {
+                                    "摘要"
+                                } else {
+                                    "截断"
+                                },
                                 retry_count + 1,
                                 history_manager.truncate_info().message
                             );
@@ -1023,11 +1075,13 @@ async fn handle_non_stream_request(
                                 HistoryManager::fix_history_after_truncate(truncated_history);
 
                             // 重新构建请求
-                            let new_state =
-                                rebuild_with_truncated_history(&conversion_result, fixed_history.clone());
+                            let new_state = rebuild_with_truncated_history(
+                                &conversion_result,
+                                fixed_history.clone(),
+                            );
                             let new_request = KiroRequest {
                                 conversation_state: new_state,
-                                profile_arn: state.profile_arn.clone(),
+                                profile_arn: None,
                             };
 
                             match serde_json::to_string(&new_request) {
@@ -1090,6 +1144,8 @@ async fn process_non_stream_response(
     stats: Option<Arc<StatsStore>>,
     session_id: &str,
     app_state: &AppState,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 解析事件流
     let mut decoder = EventStreamDecoder::new();
@@ -1128,7 +1184,8 @@ async fn process_non_stream_response(
 
                             // 缓存工具名称
                             if !tool_use.name.is_empty() {
-                                tool_names.insert(tool_use.tool_use_id.clone(), tool_use.name.clone());
+                                tool_names
+                                    .insert(tool_use.tool_use_id.clone(), tool_use.name.clone());
                             }
 
                             // 累积工具的 JSON 输入
@@ -1142,47 +1199,55 @@ async fn process_non_stream_response(
                                 let input: serde_json::Value = if buffer.is_empty() {
                                     serde_json::json!({})
                                 } else {
-                                    serde_json::from_str(buffer)
-                                        .unwrap_or_else(|e| {
-                                            tracing::warn!(
-                                                "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                                e, tool_use.tool_use_id
-                                            );
-                                            serde_json::json!({})
-                                        })
+                                    serde_json::from_str(buffer).unwrap_or_else(|e| {
+                                        tracing::warn!(
+                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}",
+                                            e,
+                                            tool_use.tool_use_id
+                                        );
+                                        serde_json::json!({})
+                                    })
                                 };
 
                                 // 获取工具名称（优先使用当前事件的 name，否则从缓存获取）
-                                let tool_name = if !tool_use.name.is_empty() {
+                                let raw_tool_name = if !tool_use.name.is_empty() {
                                     tool_use.name.clone()
                                 } else {
-                                    tool_names.get(&tool_use.tool_use_id).cloned().unwrap_or_default()
+                                    tool_names
+                                        .get(&tool_use.tool_use_id)
+                                        .cloned()
+                                        .unwrap_or_default()
                                 };
+
+                                let original_name = tool_name_map
+                                    .get(&raw_tool_name)
+                                    .cloned()
+                                    .unwrap_or_else(|| raw_tool_name.clone());
 
                                 tool_uses.push(json!({
                                     "type": "tool_use",
                                     "id": tool_use.tool_use_id,
-                                    "name": tool_name,
+                                    "name": original_name,
                                     "input": input
                                 }));
                             }
                         }
                         Event::ContextUsage(context_usage) => {
-                            // 用 200K 窗口计算实际使用的 tokens
-                            // 公式: percentage * 200000 / 100
+                            // 从上下文使用百分比计算实际的 input_tokens
+                            let window_size = get_context_window_size(model);
                             let actual_tokens = (context_usage.context_usage_percentage
-                                * (CONTEXT_WINDOW_SIZE as f64)
-                                / 100.0)
-                                as i32;
+                                * (window_size as f64)
+                                / 100.0) as i32;
 
                             context_input_tokens = Some(actual_tokens);
 
                             // 当上下文使用率 >= 80% 时输出警告
                             if context_usage.context_usage_percentage >= CONTEXT_WARNING_THRESHOLD {
                                 tracing::warn!(
-                                    "⚠️ 上下文使用率较高: {:.1}% (约 {} tokens / 200K)",
+                                    "⚠️ 上下文使用率较高: {:.1}% (约 {} tokens / {})",
                                     context_usage.context_usage_percentage,
-                                    actual_tokens
+                                    actual_tokens,
+                                    window_size
                                 );
                             }
 
@@ -1228,7 +1293,25 @@ async fn process_non_stream_response(
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
 
-    if !text_content.is_empty() {
+    if thinking_enabled {
+        // 从完整文本中提取 thinking 块
+        let (thinking, remaining_text) =
+            super::stream::extract_thinking_from_complete_text(&text_content);
+
+        if let Some(thinking_text) = thinking {
+            content.push(json!({
+                "type": "thinking",
+                "thinking": thinking_text
+            }));
+        }
+
+        if !remaining_text.is_empty() {
+            content.push(json!({
+                "type": "text",
+                "text": remaining_text
+            }));
+        }
+    } else if !text_content.is_empty() {
         content.push(json!({
             "type": "text",
             "text": text_content
@@ -1242,13 +1325,10 @@ async fn process_non_stream_response(
 
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let raw_input_tokens = context_input_tokens.unwrap_or(input_tokens);
-    
+
     // 使用会话级别状态确保 token 一致性
-    let (consistent_input, consistent_output) = app_state.update_session_tokens(
-        session_id,
-        raw_input_tokens,
-        output_tokens,
-    );
+    let (consistent_input, consistent_output) =
+        app_state.update_session_tokens(session_id, raw_input_tokens, output_tokens);
 
     // 记录成功 + 用量（按最终使用的凭据归集）
     if let Some(s) = &stats {
@@ -1290,14 +1370,10 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 =
-        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let is_opus_4_6 = model_lower.contains("opus")
+        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
 
-    let thinking_type = if is_opus_4_6 {
-        "adaptive"
-    } else {
-        "enabled"
-    };
+    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
 
     tracing::info!(
         model = %payload.model,
@@ -1309,7 +1385,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
-    
+
     if is_opus_4_6 {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
@@ -1399,7 +1475,14 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(state, provider, &payload, input_tokens, &session_id).await;
+        return websearch::handle_websearch_request(
+            state,
+            provider,
+            &payload,
+            input_tokens,
+            &session_id,
+        )
+        .await;
     }
 
     // 转换请求
@@ -1413,9 +1496,7 @@ pub async fn post_messages_cc(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
-                ConversionError::InvalidRequest(msg) => {
-                    ("invalid_request_error", msg.clone())
-                }
+                ConversionError::InvalidRequest(msg) => ("invalid_request_error", msg.clone()),
             };
             tracing::warn!("请求转换失败: {}", e);
             return (
@@ -1426,10 +1507,15 @@ pub async fn post_messages_cc(
         }
     };
 
-    // 构建 Kiro 请求
+    // 保存历史记录到文件
+    if let Err(e) = global_store().save(&session_id, conversion_result.original_history.clone()) {
+        tracing::warn!(session_id = %session_id, "保存历史记录失败: {}", e);
+    }
+
+    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state.clone(),
-        profile_arn: state.profile_arn.clone(),
+        profile_arn: None,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -1464,6 +1550,8 @@ pub async fn post_messages_cc(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
 
+    let tool_name_map = conversion_result.tool_name_map.clone();
+
     if payload.stream {
         // 流式响应（缓冲模式）
         handle_stream_request_buffered(
@@ -1474,18 +1562,22 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             &session_id,
+            tool_name_map,
         )
         .await
     } else {
-        // 非流式响应
+        // 非流式响应：仅在配置开启时提取 thinking 块
+        let extract_thinking = state.extract_thinking && thinking_enabled;
         handle_non_stream_request(
             state,
             provider,
             &request_body,
             &payload.model,
             input_tokens,
+            extract_thinking,
             &session_id,
             conversion_result,
+            tool_name_map,
         )
         .await
     }
@@ -1503,6 +1595,7 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     session_id: &str,
+    tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let api_result = provider
@@ -1531,7 +1624,12 @@ async fn handle_stream_request_buffered(
     let stats = provider.stats_store();
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled);
+    let ctx = BufferedStreamContext::new(
+        model,
+        estimated_input_tokens,
+        thinking_enabled,
+        tool_name_map,
+    );
 
     // 创建缓冲 SSE 流（带统计支持）
     let stream = create_buffered_sse_stream_with_stats(
@@ -1656,7 +1754,7 @@ fn create_buffered_sse_stream_with_stats(
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败（缓冲模式）: {}", e);
-                            
+
                             // 记录错误统计
                             if !state.stats_recorded {
                                 if let Some(s) = &state.stats {
@@ -1671,7 +1769,7 @@ fn create_buffered_sse_stream_with_stats(
 
                             // 发生错误，完成处理并返回所有事件
                             let (all_events, input_tokens, output_tokens) = state.ctx.finish_and_get_all_events_with_tokens();
-                            
+
                             // 记录用量（即使出错也记录已处理的部分）
                             if let Some(s) = &state.stats {
                                 s.add_usage(
@@ -1692,7 +1790,7 @@ fn create_buffered_sse_stream_with_stats(
                         None => {
                             // 流结束，完成处理并返回所有事件（已更正 input_tokens）
                             let (all_events, input_tokens, output_tokens) = state.ctx.finish_and_get_all_events_with_tokens();
-                            
+
                             // 记录成功统计和用量
                             if !state.stats_recorded {
                                 if let Some(s) = &state.stats {

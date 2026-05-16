@@ -306,8 +306,10 @@ impl StatsStore {
             // by_model
             if let Some(m) = model {
                 let model_bucket = stats.by_model.entry(m.to_string()).or_default();
-                model_bucket.input_tokens_total = model_bucket.input_tokens_total.saturating_add(in_u);
-                model_bucket.output_tokens_total = model_bucket.output_tokens_total.saturating_add(out_u);
+                model_bucket.input_tokens_total =
+                    model_bucket.input_tokens_total.saturating_add(in_u);
+                model_bucket.output_tokens_total =
+                    model_bucket.output_tokens_total.saturating_add(out_u);
             }
 
             inner.dirty = true;
@@ -420,11 +422,7 @@ impl StatsStore {
 }
 
 fn tokens_to_u64(v: i64) -> u64 {
-    if v <= 0 {
-        0
-    } else {
-        v as u64
-    }
+    if v <= 0 { 0 } else { v as u64 }
 }
 
 fn load_from_path(path: &Path) -> anyhow::Result<HashMap<u64, AccountStats>> {
@@ -432,8 +430,8 @@ fn load_from_path(path: &Path) -> anyhow::Result<HashMap<u64, AccountStats>> {
         return Ok(HashMap::new());
     }
 
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("读取统计文件失败: {:?}", path))?;
+    let content =
+        fs::read_to_string(path).with_context(|| format!("读取统计文件失败: {:?}", path))?;
 
     if content.trim().is_empty() {
         return Ok(HashMap::new());
@@ -445,8 +443,7 @@ fn load_from_path(path: &Path) -> anyhow::Result<HashMap<u64, AccountStats>> {
         Err(e) => {
             // 保护现场：把坏文件改名，避免服务启动失败。
             let ts = Utc::now().format("%Y%m%d-%H%M%S").to_string();
-            let backup = path
-                .with_file_name(format!("{}.corrupt.{}", file_stem(path), ts));
+            let backup = path.with_file_name(format!("{}.corrupt.{}", file_stem(path), ts));
             if let Err(re) = fs::rename(path, &backup) {
                 tracing::warn!(
                     "统计文件解析失败且备份失败（将忽略并从空统计开始）: parse={}, rename={}",
@@ -508,8 +505,7 @@ fn persist_to_path_blocking(path: &Path, json: &str) -> anyhow::Result<()> {
 
     let tmp_path = path.with_extension("json.tmp");
 
-    fs::write(&tmp_path, json)
-        .with_context(|| format!("写入临时统计文件失败: {:?}", tmp_path))?;
+    fs::write(&tmp_path, json).with_context(|| format!("写入临时统计文件失败: {:?}", tmp_path))?;
 
     // Windows 上 rename 不能覆盖已存在文件：先尝试删除旧文件。
     if path.exists() {
@@ -571,7 +567,10 @@ mod tests {
         assert_eq!(s.by_model.get("m1").map(|b| b.calls_total), Some(1));
         assert_eq!(s.by_model.get("m1").map(|b| b.calls_ok), Some(1));
         assert_eq!(s.by_model.get("m1").map(|b| b.input_tokens_total), Some(10));
-        assert_eq!(s.by_model.get("m1").map(|b| b.output_tokens_total), Some(20));
+        assert_eq!(
+            s.by_model.get("m1").map(|b| b.output_tokens_total),
+            Some(20)
+        );
         assert!(!s.by_day.is_empty());
 
         store.record_error(1, Some("m1"), "boom");

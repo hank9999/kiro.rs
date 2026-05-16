@@ -1,6 +1,6 @@
 //! Admin API 业务逻辑服务
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -39,10 +39,16 @@ pub struct AdminService {
     stats: Option<Arc<StatsStore>>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     cache_path: Option<PathBuf>,
+    /// 已注册的端点名称集合（用于 add_credential 校验）
+    known_endpoints: HashSet<String>,
 }
 
 impl AdminService {
-    pub fn new(token_manager: Arc<MultiTokenManager>, stats: Option<Arc<StatsStore>>) -> Self {
+    pub fn new(
+        token_manager: Arc<MultiTokenManager>,
+        stats: Option<Arc<StatsStore>>,
+        known_endpoints: impl IntoIterator<Item = String>,
+    ) -> Self {
         let cache_path = token_manager
             .cache_dir()
             .map(|d| d.join("kiro_balance_cache.json"));
@@ -54,6 +60,7 @@ impl AdminService {
             stats,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
+            known_endpoints: known_endpoints.into_iter().collect(),
         }
     }
 
@@ -80,6 +87,7 @@ impl AdminService {
     /// 获取所有凭据状态
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
         let snapshot = self.token_manager.snapshot();
+        let default_endpoint = self.token_manager.config().default_endpoint.clone();
 
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
@@ -98,6 +106,8 @@ impl AdminService {
                     has_profile_arn: entry.has_profile_arn,
 
                     refresh_token_hash: entry.refresh_token_hash,
+                    api_key_hash: entry.api_key_hash,
+                    masked_api_key: entry.masked_api_key,
                     email: entry.email,
                     account_email: entry.account_email,
                     user_id: entry.user_id,
@@ -117,6 +127,9 @@ impl AdminService {
                     last_success_at: stats.as_ref().and_then(|s| s.last_success_at.clone()),
                     last_error_at: stats.as_ref().and_then(|s| s.last_error_at.clone()),
                     last_error: stats.as_ref().and_then(|s| s.last_error.clone()),
+                    refresh_failure_count: entry.refresh_failure_count,
+                    disabled_reason: entry.disabled_reason,
+                    endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                 }
             })
             .collect();
@@ -157,7 +170,11 @@ impl AdminService {
     }
 
     /// 设置凭据启用的模型列表
-    pub fn set_enabled_models(&self, id: u64, enabled_models: Vec<String>) -> Result<(), AdminServiceError> {
+    pub fn set_enabled_models(
+        &self,
+        id: u64,
+        enabled_models: Vec<String>,
+    ) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_enabled_models(id, enabled_models)
             .map_err(|e| self.classify_error(e, id))
@@ -282,7 +299,10 @@ impl AdminService {
     }
 
     /// 获取指定凭据的统计详情
-    pub fn get_credential_stats(&self, id: u64) -> Result<CredentialStatsResponse, AdminServiceError> {
+    pub fn get_credential_stats(
+        &self,
+        id: u64,
+    ) -> Result<CredentialStatsResponse, AdminServiceError> {
         if !self.credential_exists(id) {
             return Err(AdminServiceError::NotFound { id });
         }
@@ -308,7 +328,11 @@ impl AdminService {
             .into_iter()
             .map(|(k, v)| Self::bucket_to_api(k, v))
             .collect();
-        by_model.sort_by(|a, b| b.calls_total.cmp(&a.calls_total).then_with(|| a.key.cmp(&b.key)));
+        by_model.sort_by(|a, b| {
+            b.calls_total
+                .cmp(&a.calls_total)
+                .then_with(|| a.key.cmp(&b.key))
+        });
 
         Ok(CredentialStatsResponse {
             id,
@@ -365,12 +389,25 @@ impl AdminService {
         &self,
         req: AddCredentialRequest,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
+        // 校验端点名：未指定则默认合法，指定则必须已注册
+        if let Some(ref name) = req.endpoint {
+            if !self.known_endpoints.contains(name) {
+                let mut known: Vec<&str> =
+                    self.known_endpoints.iter().map(|s| s.as_str()).collect();
+                known.sort();
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "未知端点 \"{}\"，已注册端点: {:?}",
+                    name, known
+                )));
+            }
+        }
+
         // 构建凭据对象
         let email = req.email.clone();
         let new_cred = KiroCredentials {
             id: None,
             access_token: None,
-            refresh_token: Some(req.refresh_token),
+            refresh_token: req.refresh_token,
             profile_arn: None,
             expires_at: None,
             auth_method: Some(req.auth_method),
@@ -391,6 +428,8 @@ impl AdminService {
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
             disabled: false, // 新添加的凭据默认启用
+            kiro_api_key: req.kiro_api_key,
+            endpoint: req.endpoint,
         };
 
         // 调用 token_manager 添加凭据
@@ -437,6 +476,14 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
+    }
+
+    /// 强制刷新指定凭据的 Token
+    pub async fn force_refresh_token(&self, id: u64) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .force_refresh_token_for(id)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))
     }
 
     // ============ 余额缓存持久化 ============
@@ -517,7 +564,12 @@ impl AdminService {
             return AdminServiceError::NotFound { id };
         }
 
-        // 2. 上游服务错误特征：HTTP 响应错误或网络错误
+        // 2. API Key 凭据不支持刷新：客户端请求错误，映射为 400
+        if msg.contains("API Key 凭据不支持刷新") {
+            return AdminServiceError::InvalidCredential(msg);
+        }
+
+        // 3. 上游服务错误特征：HTTP 响应错误或网络错误
         let is_upstream_error =
             // HTTP 响应错误（来自 refresh_*_token 的错误消息）
             msg.contains("凭证已过期或无效") ||
@@ -535,7 +587,7 @@ impl AdminService {
         if is_upstream_error {
             AdminServiceError::UpstreamError(msg)
         } else {
-            // 3. 默认归类为内部错误（本地验证失败、配置错误等）
+            // 4. 默认归类为内部错误（本地验证失败、配置错误等）
             // 包括：缺少 refreshToken、refreshToken 已被截断、无法生成 machineId 等
             AdminServiceError::InternalError(msg)
         }
@@ -551,6 +603,9 @@ impl AdminService {
             || msg.contains("refreshToken 已被截断")
             || msg.contains("凭据已存在")
             || msg.contains("refreshToken 重复")
+            || msg.contains("kiroApiKey 重复")
+            || msg.contains("缺少 kiroApiKey")
+            || msg.contains("kiroApiKey 为空")
             || msg.contains("凭证已过期或无效")
             || msg.contains("权限不足")
             || msg.contains("已被限流");
@@ -572,7 +627,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)

@@ -126,7 +126,13 @@ impl HistoryStore {
         // 清理 session_id 中的非法字符
         let safe_id: String = session_id
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         self.config.storage_dir.join(format!("{}.json", safe_id))
     }
@@ -156,11 +162,10 @@ impl HistoryStore {
 
         // 写入文件
         let path = self.get_file_path(session_id);
-        let json = serde_json::to_string_pretty(&history)
-            .map_err(|e| format!("序列化历史失败: {}", e))?;
-        
-        std::fs::write(&path, json)
-            .map_err(|e| format!("写入历史文件失败: {}", e))?;
+        let json =
+            serde_json::to_string_pretty(&history).map_err(|e| format!("序列化历史失败: {}", e))?;
+
+        std::fs::write(&path, json).map_err(|e| format!("写入历史文件失败: {}", e))?;
 
         tracing::debug!(
             session_id = %session_id,
@@ -194,11 +199,10 @@ impl HistoryStore {
 
         // 写入文件
         let path = self.get_file_path(session_id);
-        let json = serde_json::to_string_pretty(&history)
-            .map_err(|e| format!("序列化历史失败: {}", e))?;
-        
-        std::fs::write(&path, json)
-            .map_err(|e| format!("写入历史文件失败: {}", e))?;
+        let json =
+            serde_json::to_string_pretty(&history).map_err(|e| format!("序列化历史失败: {}", e))?;
+
+        std::fs::write(&path, json).map_err(|e| format!("写入历史文件失败: {}", e))?;
 
         tracing::debug!(
             session_id = %session_id,
@@ -277,8 +281,7 @@ impl HistoryStore {
         // 删除文件
         let path = self.get_file_path(session_id);
         if path.exists() {
-            std::fs::remove_file(&path)
-                .map_err(|e| format!("删除历史文件失败: {}", e))?;
+            std::fs::remove_file(&path).map_err(|e| format!("删除历史文件失败: {}", e))?;
         }
 
         tracing::debug!(session_id = %session_id, "历史记录已删除");
@@ -301,7 +304,7 @@ impl HistoryStore {
                 .filter(|(_, h)| h.is_expired(self.config.expire_secs))
                 .map(|(k, _)| k.clone())
                 .collect();
-            
+
             for key in expired_keys {
                 cache.remove(&key);
                 cleaned += 1;
@@ -360,14 +363,19 @@ impl HistoryStore {
     /// 获取存储统计
     pub fn stats(&self) -> HistoryStoreStats {
         let cache_size = self.cache.read().map(|c| c.len()).unwrap_or(0);
-        
+
         let (file_count, total_size) = if self.config.enabled {
             std::fs::read_dir(&self.config.storage_dir)
                 .map(|entries| {
                     let mut count = 0;
                     let mut size = 0u64;
                     for entry in entries.flatten() {
-                        if entry.path().extension().map(|e| e == "json").unwrap_or(false) {
+                        if entry
+                            .path()
+                            .extension()
+                            .map(|e| e == "json")
+                            .unwrap_or(false)
+                        {
                             count += 1;
                             size += entry.metadata().map(|m| m.len()).unwrap_or(0);
                         }

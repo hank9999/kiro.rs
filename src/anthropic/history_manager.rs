@@ -16,8 +16,8 @@ use tokio::sync::RwLock;
 
 use crate::common::truncate_with_ellipsis;
 use crate::kiro::model::requests::conversation::{
-    ConversationState, CurrentMessage, HistoryAssistantMessage,
-    HistoryUserMessage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
+    ConversationState, CurrentMessage, HistoryAssistantMessage, HistoryUserMessage, Message,
+    UserInputMessage, UserInputMessageContext, UserMessage,
 };
 use crate::kiro::model::requests::kiro::KiroRequest;
 
@@ -165,7 +165,7 @@ impl SummaryCache {
     /// 设置缓存的摘要
     pub async fn set(&self, key: String, summary: String, old_history_count: usize) {
         let mut entries = self.entries.write().await;
-        
+
         // 如果超过最大条目数，删除最旧的
         if entries.len() >= self.max_entries && !entries.contains_key(&key) {
             // 找到最旧的条目
@@ -249,7 +249,6 @@ pub struct HistoryManager {
     truncate_info: TruncateInfo,
     cache_key: Option<String>,
 }
-
 
 impl HistoryManager {
     /// 创建新的历史消息管理器
@@ -336,9 +335,7 @@ impl HistoryManager {
             .tools
             .iter()
             .map(|t| {
-                t.tool_specification.name.len()
-                    + t.tool_specification.description.len()
-                    + 200 // 估算 input_schema 的大小
+                t.tool_specification.name.len() + t.tool_specification.description.len() + 200 // 估算 input_schema 的大小
             })
             .sum();
 
@@ -481,7 +478,10 @@ impl HistoryManager {
         let formatted = Self::format_history_for_summary(history);
         // 限制输入长度（使用安全截断）
         let formatted = if formatted.len() > 10000 {
-            format!("{}...(truncated)", crate::common::truncate_str_safe(&formatted, 10000))
+            format!(
+                "{}...(truncated)",
+                crate::common::truncate_str_safe(&formatted, 10000)
+            )
         } else {
             formatted
         };
@@ -550,7 +550,6 @@ impl HistoryManager {
         result
     }
 
-
     /// 使用智能摘要压缩历史消息
     ///
     /// 返回 (压缩后的历史, 是否成功)
@@ -583,7 +582,10 @@ impl HistoryManager {
         let recent_history: Vec<Message> = recent_history.into_iter().map(|(_, m)| m).collect();
 
         // 尝试从缓存获取摘要
-        let cache_key = self.cache_key.as_ref().map(|k| format!("{}:{}", k, keep_recent));
+        let cache_key = self
+            .cache_key
+            .as_ref()
+            .map(|k| format!("{}:{}", k, keep_recent));
         let old_count = old_history.len();
 
         if let Some(ref key) = cache_key {
@@ -766,8 +768,7 @@ impl HistoryManager {
                         }
                     }
 
-                    let result =
-                        Self::build_summary_history(&summary, recent_history, model_id);
+                    let result = Self::build_summary_history(&summary, recent_history, model_id);
                     self.truncate_info = TruncateInfo::new_with_summary(
                         format!(
                             "错误重试摘要 (第 {} 次): {} -> {} 条消息 (摘要 {} 字符)",
@@ -848,7 +849,6 @@ impl HistoryManager {
             (truncated, false)
         }
     }
-
 
     /// 修复历史消息的 tool_use/tool_result 配对
     pub fn fix_tool_pairing(history: &mut [Message]) {
@@ -1086,10 +1086,12 @@ mod tests {
 
         // 第一条应该是包含摘要的用户消息
         if let Message::User(user_msg) = &result[0] {
-            assert!(user_msg
-                .user_input_message
-                .content
-                .contains("[Earlier conversation summary]"));
+            assert!(
+                user_msg
+                    .user_input_message
+                    .content
+                    .contains("[Earlier conversation summary]")
+            );
             assert!(user_msg.user_input_message.content.contains(summary));
         } else {
             panic!("第一条消息应该是用户消息");
@@ -1097,10 +1099,12 @@ mod tests {
 
         // 第二条应该是占位助手消息
         if let Message::Assistant(assistant_msg) = &result[1] {
-            assert!(assistant_msg
-                .assistant_response_message
-                .content
-                .contains("I understand the context"));
+            assert!(
+                assistant_msg
+                    .assistant_response_message
+                    .content
+                    .contains("I understand the context")
+            );
         } else {
             panic!("第二条消息应该是助手消息");
         }
@@ -1129,11 +1133,13 @@ mod tests {
 
         // 孤立的 tool_result 应该被清理
         if let Message::User(user_msg) = &history[2] {
-            assert!(user_msg
-                .user_input_message
-                .user_input_message_context
-                .tool_results
-                .is_empty());
+            assert!(
+                user_msg
+                    .user_input_message
+                    .user_input_message_context
+                    .tool_results
+                    .is_empty()
+            );
         }
     }
 
@@ -1182,22 +1188,19 @@ mod tests {
         let mock_gen = MockSummaryGenerator::new("这是生成的摘要内容");
 
         let (result, should_retry) = manager
-            .handle_length_error_with_summary(
-                history,
-                "claude-sonnet-4.5",
-                0,
-                Some(&mock_gen),
-            )
+            .handle_length_error_with_summary(history, "claude-sonnet-4.5", 0, Some(&mock_gen))
             .await;
 
         assert!(should_retry);
         assert!(manager.truncate_info.used_summary);
         // 结果应该包含摘要消息
         if let Some(Message::User(user_msg)) = result.first() {
-            assert!(user_msg
-                .user_input_message
-                .content
-                .contains("[Earlier conversation summary]"));
+            assert!(
+                user_msg
+                    .user_input_message
+                    .content
+                    .contains("[Earlier conversation summary]")
+            );
         }
     }
 
@@ -1208,12 +1211,7 @@ mod tests {
         let mock_gen = MockSummaryGenerator::failing();
 
         let (result, should_retry) = manager
-            .handle_length_error_with_summary(
-                history,
-                "claude-sonnet-4.5",
-                0,
-                Some(&mock_gen),
-            )
+            .handle_length_error_with_summary(history, "claude-sonnet-4.5", 0, Some(&mock_gen))
             .await;
 
         assert!(should_retry);
@@ -1232,15 +1230,11 @@ mod tests {
         cache.set(key.to_string(), summary.to_string(), 5).await;
 
         // 获取缓存（应该命中）
-        let result = cache
-            .get(key, 5, Duration::from_secs(60), 3)
-            .await;
+        let result = cache.get(key, 5, Duration::from_secs(60), 3).await;
         assert_eq!(result, Some(summary.to_string()));
 
         // 历史变化太大时不应命中
-        let result = cache
-            .get(key, 10, Duration::from_secs(60), 3)
-            .await;
+        let result = cache.get(key, 10, Duration::from_secs(60), 3).await;
         assert!(result.is_none());
     }
 
@@ -1275,55 +1269,45 @@ mod tests {
     }
 }
 
-    /// 集成测试：使用真实 Kiro API 生成摘要
-    /// 需要有效的 credentials.json 才能运行
-    /// 运行命令: cargo test test_kiro_summary_generator_integration -- --ignored --nocapture
-    #[tokio::test]
-    #[ignore]
-    async fn test_kiro_summary_generator_integration() {
-        use crate::kiro::model::credentials::CredentialsConfig;
-        use crate::kiro::token_manager::MultiTokenManager;
-        use crate::kiro::provider::KiroProvider;
-        use crate::model::config::Config;
-        use std::sync::Arc;
+/// 集成测试：使用真实 Kiro API 生成摘要
+/// 需要有效的 credentials.json 才能运行
+/// 运行命令: cargo test test_kiro_summary_generator_integration -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn test_kiro_summary_generator_integration() {
+    use crate::kiro::model::credentials::CredentialsConfig;
+    use crate::kiro::provider::KiroProvider;
+    use crate::kiro::token_manager::MultiTokenManager;
+    use crate::model::config::Config;
+    use std::sync::Arc;
 
-        // 加载配置和凭证
-        let config = Config::load("../config.json")
-            .expect("无法加载 config.json");
-        let credentials_config = CredentialsConfig::load("../credentials.json")
-            .expect("无法加载 credentials.json");
-        let credentials_list = credentials_config.into_sorted_credentials();
+    // 加载配置和凭证
+    let config = Config::load("../config.json").expect("无法加载 config.json");
+    let credentials_config =
+        CredentialsConfig::load("../credentials.json").expect("无法加载 credentials.json");
+    let credentials_list = credentials_config.into_sorted_credentials();
 
-        if credentials_list.is_empty() {
-            println!("⚠️ 没有可用凭证，跳过测试");
-            return;
-        }
+    if credentials_list.is_empty() {
+        println!("⚠️ 没有可用凭证，跳过测试");
+        return;
+    }
 
-        // 获取第一个凭证的 profile_arn
-        let profile_arn = credentials_list.first().and_then(|c| c.profile_arn.clone());
-        println!("profile_arn: {:?}", profile_arn);
+    // 获取第一个凭证的 profile_arn
+    let profile_arn = credentials_list.first().and_then(|c| c.profile_arn.clone());
+    println!("profile_arn: {:?}", profile_arn);
 
-        // 创建 token manager
-        let token_manager = MultiTokenManager::new(
-            config.clone(),
-            credentials_list,
-            None,
-            None,
-            false,
-        ).expect("无法创建 MultiTokenManager");
+    // 创建 token manager
+    let token_manager = MultiTokenManager::new(config.clone(), credentials_list, None, None, false)
+        .expect("无法创建 MultiTokenManager");
 
-        // 创建 provider
-        let provider = KiroProvider::new(Arc::new(token_manager))
-            .expect("无法创建 KiroProvider");
+    // 创建 provider
+    let provider = KiroProvider::new(Arc::new(token_manager)).expect("无法创建 KiroProvider");
 
-        // 创建摘要生成器
-        let generator = KiroSummaryGenerator::new(
-            Arc::new(provider),
-            profile_arn,
-        );
+    // 创建摘要生成器
+    let generator = KiroSummaryGenerator::new(Arc::new(provider), profile_arn);
 
-        // 测试摘要生成
-        let test_prompt = r#"请简洁地总结以下对话历史的关键信息：
+    // 测试摘要生成
+    let test_prompt = r#"请简洁地总结以下对话历史的关键信息：
 
 [user]: 我想创建一个 Rust 项目来处理 JSON 数据
 [assistant]: 好的，我可以帮你创建。你需要使用 serde 和 serde_json 库。
@@ -1332,118 +1316,105 @@ mod tests {
 
 请用中文输出摘要，控制在 500 字符以内："#;
 
-        println!("发送摘要请求...");
-        let result = generator.generate(test_prompt).await;
+    println!("发送摘要请求...");
+    let result = generator.generate(test_prompt).await;
 
-        match result {
-            Ok(summary) => {
-                println!("✅ 摘要生成成功！");
-                println!("摘要内容 ({} 字符):\n{}", summary.len(), summary);
-                assert!(!summary.is_empty(), "摘要不应为空");
-                assert!(summary.len() < 1000, "摘要应该简洁");
-            }
-            Err(e) => {
-                println!("❌ 摘要生成失败: {}", e);
-                panic!("摘要生成失败: {}", e);
-            }
+    match result {
+        Ok(summary) => {
+            println!("✅ 摘要生成成功！");
+            println!("摘要内容 ({} 字符):\n{}", summary.len(), summary);
+            assert!(!summary.is_empty(), "摘要不应为空");
+            assert!(summary.len() < 1000, "摘要应该简洁");
+        }
+        Err(e) => {
+            println!("❌ 摘要生成失败: {}", e);
+            panic!("摘要生成失败: {}", e);
         }
     }
+}
 
-    /// 集成测试：完整的摘要重试流程
-    /// 运行命令: cargo test test_full_summary_retry_flow -- --ignored --nocapture
-    #[tokio::test]
-    #[ignore]
-    async fn test_full_summary_retry_flow() {
-        use crate::kiro::model::credentials::CredentialsConfig;
-        use crate::kiro::token_manager::MultiTokenManager;
-        use crate::kiro::provider::KiroProvider;
-        use crate::model::config::Config;
-        use std::sync::Arc;
+/// 集成测试：完整的摘要重试流程
+/// 运行命令: cargo test test_full_summary_retry_flow -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn test_full_summary_retry_flow() {
+    use crate::kiro::model::credentials::CredentialsConfig;
+    use crate::kiro::provider::KiroProvider;
+    use crate::kiro::token_manager::MultiTokenManager;
+    use crate::model::config::Config;
+    use std::sync::Arc;
 
-        // 加载配置和凭证
-        let config = Config::load("../config.json")
-            .expect("无法加载 config.json");
-        let credentials_config = CredentialsConfig::load("../credentials.json")
-            .expect("无法加载 credentials.json");
-        let credentials_list = credentials_config.into_sorted_credentials();
+    // 加载配置和凭证
+    let config = Config::load("../config.json").expect("无法加载 config.json");
+    let credentials_config =
+        CredentialsConfig::load("../credentials.json").expect("无法加载 credentials.json");
+    let credentials_list = credentials_config.into_sorted_credentials();
 
-        if credentials_list.is_empty() {
-            println!("⚠️ 没有可用凭证，跳过测试");
-            return;
-        }
+    if credentials_list.is_empty() {
+        println!("⚠️ 没有可用凭证，跳过测试");
+        return;
+    }
 
-        // 获取第一个凭证的 profile_arn
-        let profile_arn = credentials_list.first().and_then(|c| c.profile_arn.clone());
-        println!("profile_arn: {:?}", profile_arn);
+    // 获取第一个凭证的 profile_arn
+    let profile_arn = credentials_list.first().and_then(|c| c.profile_arn.clone());
+    println!("profile_arn: {:?}", profile_arn);
 
-        // 创建 token manager
-        let token_manager = MultiTokenManager::new(
-            config.clone(),
-            credentials_list,
-            None,
-            None,
-            false,
-        ).expect("无法创建 MultiTokenManager");
+    // 创建 token manager
+    let token_manager = MultiTokenManager::new(config.clone(), credentials_list, None, None, false)
+        .expect("无法创建 MultiTokenManager");
 
-        // 创建 provider
-        let provider = Arc::new(
-            KiroProvider::new(Arc::new(token_manager))
-                .expect("无法创建 KiroProvider")
-        );
+    // 创建 provider
+    let provider =
+        Arc::new(KiroProvider::new(Arc::new(token_manager)).expect("无法创建 KiroProvider"));
 
-        // 创建摘要生成器
-        let generator = KiroSummaryGenerator::new(
-            provider.clone(),
-            profile_arn,
-        );
+    // 创建摘要生成器
+    let generator = KiroSummaryGenerator::new(provider.clone(), profile_arn);
 
-        // 创建一个较长的历史消息列表（模拟超限场景）
-        let mut history = Vec::new();
-        for i in 0..30 {
-            if i % 2 == 0 {
-                history.push(Message::User(HistoryUserMessage::new(
-                    format!("这是第 {} 条用户消息，包含一些测试内容来模拟真实对话。", i / 2 + 1),
-                    "claude-sonnet-4.5",
-                )));
-            } else {
-                history.push(Message::Assistant(HistoryAssistantMessage::new(
-                    &format!("这是第 {} 条助手回复，我会尽力帮助你完成任务。", i / 2 + 1),
-                )));
-            }
-        }
-
-        println!("创建了 {} 条历史消息", history.len());
-
-        // 创建 HistoryManager 并测试摘要重试
-        let mut manager = HistoryManager::with_defaults()
-            .with_cache_key("test_session".to_string());
-
-        println!("测试 handle_length_error_with_summary...");
-        let (result, should_retry) = manager
-            .handle_length_error_with_summary(
-                history,
+    // 创建一个较长的历史消息列表（模拟超限场景）
+    let mut history = Vec::new();
+    for i in 0..30 {
+        if i % 2 == 0 {
+            history.push(Message::User(HistoryUserMessage::new(
+                format!(
+                    "这是第 {} 条用户消息，包含一些测试内容来模拟真实对话。",
+                    i / 2 + 1
+                ),
                 "claude-sonnet-4.5",
-                0,
-                Some(&generator),
-            )
-            .await;
-
-        println!("should_retry: {}", should_retry);
-        println!("truncate_info: {:?}", manager.truncate_info());
-        println!("结果消息数: {}", result.len());
-
-        if manager.truncate_info().used_summary {
-            println!("✅ 使用了智能摘要！");
-            // 检查第一条消息是否包含摘要
-            if let Some(Message::User(user_msg)) = result.first() {
-                let content = &user_msg.user_input_message.content;
-                println!("摘要消息内容:\n{}", content);
-                assert!(content.contains("[Earlier conversation summary]"));
-            }
+            )));
         } else {
-            println!("⚠️ 回退到简单截断");
+            history.push(Message::Assistant(HistoryAssistantMessage::new(&format!(
+                "这是第 {} 条助手回复，我会尽力帮助你完成任务。",
+                i / 2 + 1
+            ))));
         }
-
-        assert!(should_retry, "应该建议重试");
-        assert!(result.len() < 30, "消息数应该减少");
     }
+
+    println!("创建了 {} 条历史消息", history.len());
+
+    // 创建 HistoryManager 并测试摘要重试
+    let mut manager = HistoryManager::with_defaults().with_cache_key("test_session".to_string());
+
+    println!("测试 handle_length_error_with_summary...");
+    let (result, should_retry) = manager
+        .handle_length_error_with_summary(history, "claude-sonnet-4.5", 0, Some(&generator))
+        .await;
+
+    println!("should_retry: {}", should_retry);
+    println!("truncate_info: {:?}", manager.truncate_info());
+    println!("结果消息数: {}", result.len());
+
+    if manager.truncate_info().used_summary {
+        println!("✅ 使用了智能摘要！");
+        // 检查第一条消息是否包含摘要
+        if let Some(Message::User(user_msg)) = result.first() {
+            let content = &user_msg.user_input_message.content;
+            println!("摘要消息内容:\n{}", content);
+            assert!(content.contains("[Earlier conversation summary]"));
+        }
+    } else {
+        println!("⚠️ 回退到简单截断");
+    }
+
+    assert!(should_retry, "应该建议重试");
+    assert!(result.len() < 30, "消息数应该减少");
+}

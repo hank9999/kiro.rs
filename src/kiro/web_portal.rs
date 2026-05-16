@@ -367,18 +367,29 @@ where
             .map(|b| format!("{:02x}", b))
             .collect::<Vec<_>>()
             .join(" ");
-        tracing::debug!("[KiroAPI] 响应体前 {} 字节 (hex): {}", preview_len, hex_preview);
+        tracing::debug!(
+            "[KiroAPI] 响应体前 {} 字节 (hex): {}",
+            preview_len,
+            hex_preview
+        );
 
         // 尝试将响应体解析为 UTF-8 字符串（如果是 JSON 错误响应）
         if let Ok(text) = std::str::from_utf8(&bytes) {
             if text.starts_with('{') || text.starts_with('[') {
-                tracing::warn!("[KiroAPI] 响应体是 JSON 而非 CBOR: {}", &text[..text.len().min(500)]);
+                tracing::warn!(
+                    "[KiroAPI] 响应体是 JSON 而非 CBOR: {}",
+                    &text[..text.len().min(500)]
+                );
             }
         }
     }
 
     if !status.is_success() {
-        tracing::error!("[KiroAPI] HTTP 错误: {} | 响应体长度: {}", status, bytes.len());
+        tracing::error!(
+            "[KiroAPI] HTTP 错误: {} | 响应体长度: {}",
+            status,
+            bytes.len()
+        );
 
         // 尽力解析 CBOR 错误体
         if let Ok(err) = ciborium::from_reader::<CborErrorResponse, _>(bytes.as_ref()) {
@@ -388,7 +399,11 @@ where
                 .and_then(|s| s.split('#').last())
                 .unwrap_or("HTTPError");
             let msg = err.message.unwrap_or_else(|| format!("HTTP {}", status));
-            tracing::error!("[KiroAPI] CBOR 错误响应: type={}, message={}", type_name, msg);
+            tracing::error!(
+                "[KiroAPI] CBOR 错误响应: type={}, message={}",
+                type_name,
+                msg
+            );
             anyhow::bail!("{}: {}", type_name, msg);
         }
 
@@ -627,40 +642,41 @@ pub fn aggregate_account_info(
     user_info: Option<UserInfoResponse>,
     usage: UsageAndLimitsResponse,
 ) -> AccountAggregateInfo {
-    let credit = usage
-        .usage_breakdown_list
-        .as_ref()
-        .and_then(|l| {
-            l.iter().find(|b| {
-                b.resource_type
+    let credit = usage.usage_breakdown_list.as_ref().and_then(|l| {
+        l.iter().find(|b| {
+            b.resource_type
+                .as_deref()
+                .map(|t| t.eq_ignore_ascii_case("CREDIT"))
+                .unwrap_or(false)
+                || b.display_name
                     .as_deref()
-                    .map(|t| t.eq_ignore_ascii_case("CREDIT"))
+                    .map(|t| t.eq_ignore_ascii_case("Credits"))
                     .unwrap_or(false)
-                    || b.display_name
-                        .as_deref()
-                        .map(|t| t.eq_ignore_ascii_case("Credits"))
-                        .unwrap_or(false)
-            })
-        });
+        })
+    });
 
-    let base_limit = credit.map(|c| pick_f64(c.usage_limit_with_precision, c.usage_limit)).unwrap_or(0.0);
+    let base_limit = credit
+        .map(|c| pick_f64(c.usage_limit_with_precision, c.usage_limit))
+        .unwrap_or(0.0);
     let base_current = credit
         .map(|c| pick_f64(c.current_usage_with_precision, c.current_usage))
         .unwrap_or(0.0);
 
-    let (free_trial_limit, free_trial_current, free_trial_expiry) = match credit.and_then(|c| c.free_trial_info.as_ref()) {
-        Some(t) if free_trial_is_effective(t) => (
-            pick_f64(t.usage_limit_with_precision, t.usage_limit),
-            pick_f64(t.current_usage_with_precision, t.current_usage),
-            t.free_trial_expiry.clone(),
-        ),
-        _ => (0.0, 0.0, None),
-    };
+    let (free_trial_limit, free_trial_current, free_trial_expiry) =
+        match credit.and_then(|c| c.free_trial_info.as_ref()) {
+            Some(t) if free_trial_is_effective(t) => (
+                pick_f64(t.usage_limit_with_precision, t.usage_limit),
+                pick_f64(t.current_usage_with_precision, t.current_usage),
+                t.free_trial_expiry.clone(),
+            ),
+            _ => (0.0, 0.0, None),
+        };
 
     let bonuses: Vec<CreditBonus> = credit
         .and_then(|c| c.bonuses.as_ref())
         .map(|bs| {
-            bs.iter().filter(|b| bonus_is_effective(b))
+            bs.iter()
+                .filter(|b| bonus_is_effective(b))
                 .map(|b| CreditBonus {
                     code: b.bonus_code.clone().unwrap_or_default(),
                     name: b.display_name.clone().unwrap_or_default(),
@@ -803,8 +819,7 @@ mod tests {
             return;
         }
 
-        let creds_content = std::fs::read_to_string(creds_path)
-            .expect("读取凭据文件失败");
+        let creds_content = std::fs::read_to_string(creds_path).expect("读取凭据文件失败");
         let creds: Vec<crate::kiro::model::credentials::KiroCredentials> =
             serde_json::from_str(&creds_content).expect("解析凭据文件失败");
 
@@ -827,7 +842,10 @@ mod tests {
                 Ok(response) => {
                     println!("成功获取用量信息！");
                     println!("订阅信息: {:?}", response.subscription_info);
-                    println!("用量明细数量: {:?}", response.usage_breakdown_list.as_ref().map(|l| l.len()));
+                    println!(
+                        "用量明细数量: {:?}",
+                        response.usage_breakdown_list.as_ref().map(|l| l.len())
+                    );
                     println!("下次重置时间: {:?}", response.next_date_reset);
 
                     // 打印用户信息
@@ -841,8 +859,13 @@ mod tests {
                             println!("  下次重置: {:?}", item.next_date_reset);
                             if let Some(bonuses) = &item.bonuses {
                                 for bonus in bonuses {
-                                    println!("  奖励: {:?} - 当前: {:?}, 限制: {:?}, 过期: {:?}",
-                                        bonus.display_name, bonus.current_usage, bonus.usage_limit, bonus.expires_at);
+                                    println!(
+                                        "  奖励: {:?} - 当前: {:?}, 限制: {:?}, 过期: {:?}",
+                                        bonus.display_name,
+                                        bonus.current_usage,
+                                        bonus.usage_limit,
+                                        bonus.expires_at
+                                    );
                                 }
                             }
                         }
@@ -989,15 +1012,28 @@ mod tests {
 
         // 验证
         assert!(response.next_date_reset.is_some());
-        let next_reset = response.next_date_reset.as_ref().expect("next_date_reset 为空");
-        assert!(next_reset.contains("2026"), "时间戳应该转换为 2026 年的日期: {}", next_reset);
+        let next_reset = response
+            .next_date_reset
+            .as_ref()
+            .expect("next_date_reset 为空");
+        assert!(
+            next_reset.contains("2026"),
+            "时间戳应该转换为 2026 年的日期: {}",
+            next_reset
+        );
 
         assert!(response.subscription_info.is_some());
-        let sub = response.subscription_info.as_ref().expect("subscription_info 为空");
+        let sub = response
+            .subscription_info
+            .as_ref()
+            .expect("subscription_info 为空");
         assert_eq!(sub.subscription_title, Some("KIRO FREE".to_string()));
 
         assert!(response.usage_breakdown_list.is_some());
-        let breakdown_list = response.usage_breakdown_list.as_ref().expect("usage_breakdown_list 为空");
+        let breakdown_list = response
+            .usage_breakdown_list
+            .as_ref()
+            .expect("usage_breakdown_list 为空");
         assert_eq!(breakdown_list.len(), 1);
 
         let item = &breakdown_list[0];

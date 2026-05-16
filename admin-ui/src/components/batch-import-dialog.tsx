@@ -19,7 +19,7 @@ interface BatchImportDialogProps {
 }
 
 interface CredentialInput {
-  refreshToken: string
+  refreshToken?: string
   clientId?: string
   clientSecret?: string
   region?: string
@@ -27,6 +27,9 @@ interface CredentialInput {
   apiRegion?: string
   priority?: number
   machineId?: string
+  kiroApiKey?: string
+  authMethod?: string
+  endpoint?: string
 }
 
 interface VerificationResult {
@@ -108,10 +111,15 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       }))
       setResults(initialResults)
 
-      // 3. 检测重复
-      const existingTokenHashes = new Set(
+      // 3. 检测重复：OAuth 与 API Key 分别使用对应的 hash 集合
+      const existingOauthHashes = new Set(
         existingCredentials?.credentials
           .map(c => c.refreshTokenHash)
+          .filter((hash): hash is string => Boolean(hash)) || []
+      )
+      const existingApiKeyHashes = new Set(
+        existingCredentials?.credentials
+          .map(c => c.apiKeyHash)
           .filter((hash): hash is string => Boolean(hash)) || []
       )
 
@@ -125,8 +133,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       // 4. 导入并验活
       for (let i = 0; i < credentials.length; i++) {
         const cred = credentials[i]
-        const token = cred.refreshToken.trim()
-        const tokenHash = await sha256Hex(token)
+        const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
 
         // 更新状态为检查中
         setCurrentProcessing(`正在处理凭据 ${i + 1}/${credentials.length}`)
@@ -136,22 +143,74 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           return newResults
         })
 
-        // 检查重复
-        if (existingTokenHashes.has(tokenHash)) {
-          duplicateCount++
-          const existingCred = existingCredentials?.credentials.find(c => c.refreshTokenHash === tokenHash)
-          setResults(prev => {
-            const newResults = [...prev]
-            newResults[i] = {
-              ...newResults[i],
-              status: 'duplicate',
-              error: '该凭据已存在',
-              email: existingCred?.email || undefined
-            }
-            return newResults
-          })
-          setProgress({ current: i + 1, total: credentials.length })
-          continue
+        // 客户端去重：OAuth 基于 refreshToken hash，API Key 基于 kiroApiKey hash
+        let credHash = ''
+        if (isApiKeyCred) {
+          const apiKey = cred.kiroApiKey?.trim() || ''
+          if (!apiKey) {
+            setResults(prev => {
+              const newResults = [...prev]
+              newResults[i] = {
+                ...newResults[i],
+                status: 'failed',
+                error: '缺少 kiroApiKey',
+              }
+              return newResults
+            })
+            failCount++
+            setProgress({ current: i + 1, total: credentials.length })
+            continue
+          }
+          credHash = await sha256Hex(apiKey)
+          if (existingApiKeyHashes.has(credHash)) {
+            duplicateCount++
+            const existingCred = existingCredentials?.credentials.find(c => c.apiKeyHash === credHash)
+            setResults(prev => {
+              const newResults = [...prev]
+              newResults[i] = {
+                ...newResults[i],
+                status: 'duplicate',
+                error: '该凭据已存在',
+                email: existingCred?.email || undefined
+              }
+              return newResults
+            })
+            setProgress({ current: i + 1, total: credentials.length })
+            continue
+          }
+        } else {
+          const token = cred.refreshToken?.trim() || ''
+          if (!token) {
+            setResults(prev => {
+              const newResults = [...prev]
+              newResults[i] = {
+                ...newResults[i],
+                status: 'failed',
+                error: '缺少 refreshToken',
+              }
+              return newResults
+            })
+            failCount++
+            setProgress({ current: i + 1, total: credentials.length })
+            continue
+          }
+          credHash = await sha256Hex(token)
+          if (existingOauthHashes.has(credHash)) {
+            duplicateCount++
+            const existingCred = existingCredentials?.credentials.find(c => c.refreshTokenHash === credHash)
+            setResults(prev => {
+              const newResults = [...prev]
+              newResults[i] = {
+                ...newResults[i],
+                status: 'duplicate',
+                error: '该凭据已存在',
+                email: existingCred?.email || undefined
+              }
+              return newResults
+            })
+            setProgress({ current: i + 1, total: credentials.length })
+            continue
+          }
         }
 
         // 更新状态为验活中
@@ -165,6 +224,46 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
         try {
           // 添加凭据
+          if (isApiKeyCred) {
+            // API Key 凭据
+            const addedCred = await addCredential({
+              authMethod: 'api_key',
+              kiroApiKey: cred.kiroApiKey?.trim(),
+              priority: cred.priority || 0,
+              authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
+              apiRegion: cred.apiRegion?.trim() || undefined,
+              machineId: cred.machineId?.trim() || undefined,
+              endpoint: cred.endpoint?.trim() || undefined,
+            })
+
+            addedCredId = addedCred.credentialId
+
+            // 延迟 1 秒
+            await new Promise(resolve => setTimeout(resolve, 1000))
+
+            // 验活
+            const balance = await getCredentialBalance(addedCred.credentialId)
+
+            successCount++
+            existingApiKeyHashes.add(credHash)
+            setCurrentProcessing(addedCred.email ? `验活成功: ${addedCred.email}` : `验活成功: 凭据 ${i + 1}`)
+            setResults(prev => {
+              const newResults = [...prev]
+              newResults[i] = {
+                ...newResults[i],
+                status: 'verified',
+                usage: `${balance.currentUsage}/${balance.usageLimit}`,
+                email: addedCred.email || undefined,
+                credentialId: addedCred.credentialId
+              }
+              return newResults
+            })
+            setProgress({ current: i + 1, total: credentials.length })
+            continue
+          }
+
+          // OAuth 凭据
+          const token = cred.refreshToken!.trim()
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
           const authMethod = clientId && clientSecret ? 'idc' : 'social'
@@ -183,6 +282,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             clientSecret,
             priority: cred.priority || 0,
             machineId: cred.machineId?.trim() || undefined,
+            endpoint: cred.endpoint?.trim() || undefined,
           })
 
           addedCredId = addedCred.credentialId
@@ -195,7 +295,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
           // 验活成功
           successCount++
-          existingTokenHashes.add(tokenHash)
+          existingOauthHashes.add(credHash)
           setCurrentProcessing(addedCred.email ? `验活成功: ${addedCred.email}` : `验活成功: 凭据 ${i + 1}`)
           setResults(prev => {
             const newResults = [...prev]
@@ -322,7 +422,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n例如: [{"refreshToken":"...","clientId":"...","clientSecret":"...","authRegion":"us-east-1","apiRegion":"us-west-2"}]\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}

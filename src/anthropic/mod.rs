@@ -32,6 +32,6 @@ mod stream;
 pub mod types;
 mod websearch;
 
-pub use history_store::{init_global_store, start_cleanup_task, HistoryStoreConfig};
+pub use history_store::{HistoryStoreConfig, init_global_store, start_cleanup_task};
 pub use middleware::AppState;
 pub use router::create_router_with_provider;

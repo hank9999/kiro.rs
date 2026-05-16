@@ -45,7 +45,7 @@ impl SessionTokenManager {
                 return session.clone();
             }
         }
-        
+
         // 不存在则创建
         let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
         sessions
@@ -53,23 +53,28 @@ impl SessionTokenManager {
             .or_insert_with(|| Arc::new(SessionTokens::default()))
             .clone()
     }
-    
+
     /// 更新会话的 token 统计
-    /// 
+    ///
     /// 更新会话的 input_tokens 和 output_tokens。
     /// input_tokens 代表当前对话的上下文大小，这是一个状态值，可能会因为 /compact 或删除文件而减少。
     /// 因此，这里不再强制单调递增，而是信任上游返回的最新值（只要它是有效的正数）。
-    /// 
+    ///
     /// 返回最终使用的 (input_tokens, output_tokens)
-    pub fn update_tokens(&self, session_id: &str, input_tokens: i32, output_tokens: i32) -> (i32, i32) {
+    pub fn update_tokens(
+        &self,
+        session_id: &str,
+        input_tokens: i32,
+        output_tokens: i32,
+    ) -> (i32, i32) {
         use std::sync::atomic::Ordering;
-        
+
         let session = self.get_or_create_session(session_id);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        
+
         // 直接更新 input_tokens，不强制单调递增
         // 因为 input_tokens 反映的是"当前上下文大小"，这个值随用户操作（如 /compact）变化是正常的
         if input_tokens > 0 {
@@ -78,7 +83,7 @@ impl SessionTokenManager {
             // 如果输入值为 0 或负数（可能是错误），则保留旧值或使用 0
             // 这里选择不做更新，防止异常数据覆盖
         }
-        
+
         // output_tokens 是本次请求的输出，通常在流结束时累加
         // 但这里的语义似乎是"会话累计"？
         // 根据调用点 (handlers.rs)，传入的是 state.ctx.output_tokens，即"本次响应的输出 tokens"
@@ -92,22 +97,24 @@ impl SessionTokenManager {
         // 所以这里应该直接存储本次的值，或者 SessionTokens 的设计意图就是"最近一次请求的 usage"。
         // 考虑到 input_tokens 是状态（上下文大小），output_tokens 是事件（本次消耗），
         // 这里的 update_tokens 实际上是在更新"该会话最近一次的 usage 快照"。
-        
+
         // 更新 output_tokens (直接覆盖，因为它是本次请求的计数)
         if output_tokens >= 0 {
-            session.output_tokens.store(output_tokens, Ordering::Release);
+            session
+                .output_tokens
+                .store(output_tokens, Ordering::Release);
         }
-        
+
         // 更新时间戳
         session.last_update_ms.store(now_ms, Ordering::Release);
-        
+
         // 返回当前存储的值
         (
             session.input_tokens.load(Ordering::Acquire),
-            session.output_tokens.load(Ordering::Acquire)
+            session.output_tokens.load(Ordering::Acquire),
         )
     }
-    
+
     /// 清理过期的会话（可选，用于内存管理）
     #[allow(dead_code)]
     pub fn cleanup_old_sessions(&self, max_sessions: usize) {
@@ -133,17 +140,20 @@ pub struct AppState {
     pub session_tokens: Arc<SessionTokenManager>,
     /// 智能摘要使用的模型
     pub summary_model: Arc<std::sync::RwLock<String>>,
+    /// 是否开启非流式响应的 thinking 块提取
+    pub extract_thinking: bool,
 }
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>) -> Self {
+    pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
             profile_arn: None,
             session_tokens: Arc::new(SessionTokenManager::default()),
             summary_model: Arc::new(std::sync::RwLock::new("claude-sonnet-4.5".to_string())),
+            extract_thinking,
         }
     }
 
@@ -179,11 +189,17 @@ impl AppState {
             *m = model.into();
         }
     }
-    
+
     /// 更新会话的 token 统计，返回一致的值（只增不减）
     /// session_id 通常从请求头或消息 ID 中提取
-    pub fn update_session_tokens(&self, session_id: &str, input_tokens: i32, output_tokens: i32) -> (i32, i32) {
-        self.session_tokens.update_tokens(session_id, input_tokens, output_tokens)
+    pub fn update_session_tokens(
+        &self,
+        session_id: &str,
+        input_tokens: i32,
+        output_tokens: i32,
+    ) -> (i32, i32) {
+        self.session_tokens
+            .update_tokens(session_id, input_tokens, output_tokens)
     }
 }
 

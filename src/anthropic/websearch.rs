@@ -43,6 +43,7 @@ pub struct McpArguments {
 
 /// MCP 响应
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct McpResponse {
     pub error: Option<McpError>,
     pub id: String,
@@ -59,6 +60,7 @@ pub struct McpError {
 
 /// MCP 结果
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct McpResult {
     pub content: Vec<McpContent>,
     #[serde(rename = "isError")]
@@ -75,6 +77,7 @@ pub struct McpContent {
 
 /// WebSearch 搜索结果
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct WebSearchResults {
     pub results: Vec<WebSearchResult>,
     #[serde(rename = "totalResults")]
@@ -85,6 +88,7 @@ pub struct WebSearchResults {
 
 /// 单个搜索结果
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct WebSearchResult {
     pub title: String,
     pub url: String,
@@ -219,8 +223,14 @@ pub fn create_websearch_sse_stream(
     input_tokens: i32,
     output_tokens: i32,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let events =
-        generate_websearch_events(&model, &query, &tool_use_id, search_results, input_tokens, output_tokens);
+    let events = generate_websearch_events(
+        &model,
+        &query,
+        &tool_use_id,
+        search_results,
+        input_tokens,
+        output_tokens,
+    );
 
     stream::iter(
         events
@@ -516,8 +526,14 @@ pub async fn handle_websearch_request(
 
     // 5. 生成 SSE 响应
     let model = payload.model.clone();
-    let stream =
-        create_websearch_sse_stream(model, query, tool_use_id, search_results, consistent_input, consistent_output);
+    let stream = create_websearch_sse_stream(
+        model,
+        query,
+        tool_use_id,
+        search_results,
+        consistent_input,
+        consistent_output,
+    );
 
     match Response::builder()
         .status(StatusCode::OK)

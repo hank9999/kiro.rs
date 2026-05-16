@@ -45,7 +45,10 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::error!("构建 Admin UI 响应失败: {}", e);
-                plain_response(StatusCode::INTERNAL_SERVER_ERROR, Body::from("Internal error"))
+                plain_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Body::from("Internal error"),
+                )
             }
         };
     }
@@ -75,7 +78,10 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
                     Ok(resp) => resp,
                     Err(e) => {
                         tracing::error!("构建 Admin UI 响应失败: {}", e);
-                        plain_response(StatusCode::INTERNAL_SERVER_ERROR, Body::from("Internal error"))
+                        plain_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Body::from("Internal error"),
+                        )
                     }
                 }
             }
@@ -112,15 +118,17 @@ fn serve_index() -> Response<Body> {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::error!("构建 Admin UI 响应失败: {}", e);
-                plain_response(StatusCode::INTERNAL_SERVER_ERROR, Body::from("Internal error"))
+                plain_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Body::from("Internal error"),
+                )
             }
         },
         None => match Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from(
                 "Admin UI not built. Run 'pnpm build' in admin-ui directory.",
-            ))
-        {
+            )) {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::error!("构建 Admin UI 响应失败: {}", e);

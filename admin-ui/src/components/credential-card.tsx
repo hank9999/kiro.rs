@@ -24,6 +24,7 @@ import {
   useResetFailure,
   useResetCredentialStats,
   useCredentialBalance,
+  useForceRefreshToken,
 } from '@/hooks/use-credentials'
 import { StatsDialog } from '@/components/stats-dialog'
 import { formatTokensPair } from '@/lib/format'
@@ -63,6 +64,7 @@ export function CredentialCard({
   const balanceQuery = useCredentialBalance(credential.id, {
     refetchInterval: 10 * 60 * 1000, // 每 10 分钟刷新一次
   })
+  const forceRefresh = useForceRefreshToken()
 
   useEffect(() => {
     setEnabledModelsDraft(normalizeEnabledModels(credential.enabledModels))
@@ -123,6 +125,17 @@ export function CredentialCard({
     })
   }
 
+  const handleForceRefresh = () => {
+    forceRefresh.mutate(credential.id, {
+      onSuccess: (res) => {
+        toast.success(res.message)
+      },
+      onError: (err) => {
+        toast.error('刷新失败: ' + (err as Error).message)
+      },
+    })
+  }
+
   const handleDelete = () => {
     if (!credential.disabled) {
       toast.error('请先禁用凭据再删除')
@@ -170,6 +183,20 @@ export function CredentialCard({
                 )}
                 {credential.disabled && (
                   <Badge variant="destructive">已禁用</Badge>
+                )}
+                {credential.disabled && credential.disabledReason && (
+                  <Badge variant="outline">{credential.disabledReason}</Badge>
+                )}
+                {credential.authMethod && (
+                  <Badge variant="secondary">
+                    {credential.authMethod === 'api_key' ? 'API Key' :
+                     credential.authMethod === 'idc' ? 'IdC' :
+                     credential.authMethod === 'social' ? 'Social' :
+                     credential.authMethod}
+                  </Badge>
+                )}
+                {credential.endpoint && (
+                  <Badge variant="outline">{credential.endpoint}</Badge>
                 )}
               </CardTitle>
             </div>
@@ -246,6 +273,12 @@ export function CredentialCard({
               </span>
             </div>
             <div>
+              <span className="text-muted-foreground">刷新失败：</span>
+              <span className={credential.refreshFailureCount > 0 ? 'text-red-500 font-medium' : ''}>
+                {credential.refreshFailureCount}
+              </span>
+            </div>
+            <div>
               <span className="text-muted-foreground">订阅等级：</span>
               <span className="font-medium">
                 {loadingBalance ? (
@@ -308,6 +341,12 @@ export function CredentialCard({
                 未配置时默认全开；保存会写回 credentials.json（多凭据数组格式才会回写）。
               </p>
             </div>
+            {credential.maskedApiKey && (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">API Key：</span>
+                <span className="font-mono font-medium">{credential.maskedApiKey}</span>
+              </div>
+            )}
             <div className="col-span-2">
               <span className="text-muted-foreground">调用次数：</span>
               <span className="font-medium ml-1">总 {credential.callsTotal}</span>
@@ -339,9 +378,30 @@ export function CredentialCard({
                 <span className="text-muted-foreground">-</span>
               )}
             </div>
+            <div>
+              <span className="text-muted-foreground">剩余用量：</span>
+              {loadingBalance ? (
+                <span className="text-sm ml-1">
+                  <Loader2 className="inline w-3 h-3 animate-spin" /> 加载中...
+                </span>
+              ) : balance ? (
+                <span className="font-medium ml-1">
+                  {balance.remaining.toFixed(2)} / {balance.usageLimit.toFixed(2)}
+                  <span className="text-xs text-muted-foreground ml-1">
+                    ({(100 - balance.usagePercentage).toFixed(1)}% 剩余)
+                  </span>
+                </span>
+              ) : (
+                <span className="text-sm text-muted-foreground ml-1">未知</span>
+              )}
+            </div>
             <div className="col-span-2">
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatTime(credential.lastCallAt)}</span>
+            </div>
+            <div className="col-span-2">
+              <span className="text-muted-foreground">最后使用：</span>
+              <span className="font-medium">{formatTime(credential.lastUsedAt)}</span>
             </div>
             {credential.lastError && (
               <div className="col-span-2">
@@ -354,6 +414,12 @@ export function CredentialCard({
                 </span>
               </div>
             )}
+            {credential.hasProxy && (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">代理：</span>
+                <span className="font-medium">{credential.proxyUrl}</span>
+              </div>
+            )}
             {credential.hasProfileArn && (
               <div className="col-span-2">
                 <Badge variant="secondary">有 Profile ARN</Badge>
@@ -363,17 +429,27 @@ export function CredentialCard({
 
           {/* 操作按钮 */}
           <div className="pt-3 border-t space-y-2">
-            {/* 第一行：常规操作 */}
-            <div className="grid grid-cols-4 gap-2">
+            <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-2">
               <Button
                 size="sm"
                 variant="outline"
                 className="w-full"
                 onClick={handleReset}
-                disabled={resetFailure.isPending || credential.failureCount === 0}
+                disabled={resetFailure.isPending || (credential.failureCount === 0 && credential.refreshFailureCount === 0)}
               >
                 <RefreshCw className="h-4 w-4 mr-1" />
                 重置失败
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="w-full"
+                onClick={handleForceRefresh}
+                disabled={forceRefresh.isPending || credential.disabled || credential.authMethod === 'api_key'}
+                title={credential.authMethod === 'api_key' ? 'API Key 凭据无需刷新 Token' : credential.disabled ? '已禁用的凭据无法刷新 Token' : '强制刷新 Token'}
+              >
+                <RefreshCw className={`h-4 w-4 mr-1 ${forceRefresh.isPending ? 'animate-spin' : ''}`} />
+                刷新 Token
               </Button>
               <Button
                 size="sm"
@@ -423,14 +499,14 @@ export function CredentialCard({
                 统计详情
               </Button>
             </div>
-            {/* 第二行：危险操作 + 查看余额 */}
-            <div className="grid grid-cols-3 gap-2">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
               <Button
                 size="sm"
                 variant="destructive"
                 className="w-full"
                 onClick={() => setShowDeleteDialog(true)}
-                disabled={deleteCredential.isPending}
+                disabled={deleteCredential.isPending || !credential.disabled}
+                title={!credential.disabled ? '需要先禁用凭据才能删除' : undefined}
               >
                 <Trash className="h-4 w-4 mr-1" />
                 删除凭据

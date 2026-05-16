@@ -7,11 +7,11 @@ use axum::{
 
 use super::{
     handlers::{
-    add_credential, delete_credential, get_all_credentials, get_credential_account_info,
-    get_credential_balance, get_credential_stats, get_load_balancing_mode, get_summary_model,
-    reset_all_stats, reset_credential_stats, reset_failure_count, set_credential_disabled,
-    set_credential_enabled_models, set_credential_priority, set_load_balancing_mode,
-    set_summary_model,
+        add_credential, delete_credential, force_refresh_token, get_all_credentials,
+        get_credential_account_info, get_credential_balance, get_credential_stats,
+        get_load_balancing_mode, get_summary_model, reset_all_stats, reset_credential_stats,
+        reset_failure_count, set_credential_disabled, set_credential_enabled_models,
+        set_credential_priority, set_load_balancing_mode, set_summary_model,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -25,6 +25,7 @@ use super::{
 /// - `POST /credentials/:id/disabled` - 设置凭据禁用状态
 /// - `POST /credentials/:id/priority` - 设置凭据优先级
 /// - `POST /credentials/:id/reset` - 重置失败计数
+/// - `POST /credentials/:id/refresh` - 强制刷新 Token
 /// - `GET /credentials/:id/balance` - 获取凭据余额
 /// - `GET /settings/summary-model` - 获取摘要模型设置
 /// - `POST /settings/summary-model` - 设置摘要模型
@@ -44,12 +45,22 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
-        .route("/credentials/{id}/models", post(set_credential_enabled_models))
+        .route(
+            "/credentials/{id}/models",
+            post(set_credential_enabled_models),
+        )
         .route("/credentials/{id}/reset", post(reset_failure_count))
+        .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
-        .route("/credentials/{id}/account", get(get_credential_account_info))
+        .route(
+            "/credentials/{id}/account",
+            get(get_credential_account_info),
+        )
         .route("/credentials/{id}/stats", get(get_credential_stats))
-        .route("/credentials/{id}/stats/reset", post(reset_credential_stats))
+        .route(
+            "/credentials/{id}/stats/reset",
+            post(reset_credential_stats),
+        )
         .route("/stats/reset", post(reset_all_stats))
         .route(
             "/settings/summary-model",

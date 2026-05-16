@@ -3,10 +3,10 @@
 //! 核心组件，负责与 Kiro API 通信
 //! 支持流式和非流式请求
 //! 支持多凭据故障转移和重试
+//! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
 use reqwest::Client;
-use reqwest::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, HeaderMap, HeaderValue};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -14,13 +14,15 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::common::truncate_str_safe;
-use crate::http_client::{build_client, build_stream_client, ProxyConfig};
+use crate::http_client::{ProxyConfig, build_client, build_stream_client};
+use crate::kiro::endpoint::{IdeEndpoint, KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{CallContext, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use crate::stats::StatsStore;
 use parking_lot::Mutex;
+use reqwest::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, HeaderMap, HeaderValue};
 
 /// 全局标志：是否需要在下次请求时输出详细日志
 static VERBOSE_NEXT_REQUEST: AtomicBool = AtomicBool::new(false);
@@ -80,19 +82,14 @@ impl DiagnosticLog {
 
         let body = self.sections.join("\n\n");
 
-        tracing::error!(
-            "{}\n\n{}\n\n{}",
-            header,
-            body,
-            separator
-        );
+        tracing::error!("{}\n\n{}\n\n{}", header, body, separator);
     }
 }
 
 /// 格式化凭据信息用于诊断
 fn format_credential_info(ctx: &CallContext, config_region: &str) -> String {
     let cred = &ctx.credentials;
-    
+
     // Token 分析
     let token_info = if ctx.token.is_empty() {
         "Token: <空>".to_string()
@@ -107,7 +104,7 @@ fn format_credential_info(ctx: &CallContext, config_region: &str) -> String {
         } else {
             ctx.token.clone()
         };
-        
+
         // 尝试解析 JWT token 的 payload（如果是 JWT 格式）
         let jwt_info = if ctx.token.contains('.') {
             let parts: Vec<&str> = ctx.token.split('.').collect();
@@ -123,35 +120,30 @@ fn format_credential_info(ctx: &CallContext, config_region: &str) -> String {
         } else {
             "\n    Token 格式: 非 JWT".to_string()
         };
-        
+
         format!(
             "Token 长度: {} 字符\n    Token 预览: {}\n    Token 完整值: {}{}",
-            token_len,
-            token_preview,
-            ctx.token,
-            jwt_info
+            token_len, token_preview, ctx.token, jwt_info
         )
     };
 
     // expires_at 分析
     let expiry_info = match &cred.expires_at {
-        Some(exp) => {
-            match chrono::DateTime::parse_from_rfc3339(exp) {
-                Ok(dt) => {
-                    let now = chrono::Utc::now();
-                    let diff = dt.signed_duration_since(now);
-                    let status = if diff.num_seconds() < 0 {
-                        format!("已过期 {} 秒", -diff.num_seconds())
-                    } else if diff.num_minutes() < 5 {
-                        format!("即将过期，剩余 {} 秒", diff.num_seconds())
-                    } else {
-                        format!("有效，剩余 {} 分钟", diff.num_minutes())
-                    };
-                    format!("expires_at: {} ({})", exp, status)
-                }
-                Err(_) => format!("expires_at: {} (无法解析)", exp),
+        Some(exp) => match chrono::DateTime::parse_from_rfc3339(exp) {
+            Ok(dt) => {
+                let now = chrono::Utc::now();
+                let diff = dt.signed_duration_since(now);
+                let status = if diff.num_seconds() < 0 {
+                    format!("已过期 {} 秒", -diff.num_seconds())
+                } else if diff.num_minutes() < 5 {
+                    format!("即将过期，剩余 {} 秒", diff.num_seconds())
+                } else {
+                    format!("有效，剩余 {} 分钟", diff.num_minutes())
+                };
+                format!("expires_at: {} ({})", exp, status)
             }
-        }
+            Err(_) => format!("expires_at: {} (无法解析)", exp),
+        },
         None => "expires_at: <未设置>".to_string(),
     };
 
@@ -177,9 +169,18 @@ fn format_credential_info(ctx: &CallContext, config_region: &str) -> String {
         config_region,
         expiry_info,
         cred.profile_arn,
-        cred.client_id.as_ref().map(|s| format!("{}...({} chars)", &s[..s.len().min(10)], s.len())).unwrap_or_else(|| "<无>".to_string()),
-        cred.client_secret.as_ref().map(|s| format!("{}...({} chars)", &s[..s.len().min(5)], s.len())).unwrap_or_else(|| "<无>".to_string()),
-        cred.refresh_token.as_ref().map(|s| format!("{}...({} chars)", &s[..s.len().min(20)], s.len())).unwrap_or_else(|| "<无>".to_string()),
+        cred.client_id
+            .as_ref()
+            .map(|s| format!("{}...({} chars)", &s[..s.len().min(10)], s.len()))
+            .unwrap_or_else(|| "<无>".to_string()),
+        cred.client_secret
+            .as_ref()
+            .map(|s| format!("{}...({} chars)", &s[..s.len().min(5)], s.len()))
+            .unwrap_or_else(|| "<无>".to_string()),
+        cred.refresh_token
+            .as_ref()
+            .map(|s| format!("{}...({} chars)", &s[..s.len().min(20)], s.len()))
+            .unwrap_or_else(|| "<无>".to_string()),
         cred.account_email,
         cred.user_id,
         cred.machine_id,
@@ -195,7 +196,7 @@ fn base64_decode_jwt_payload(payload: &str) -> Option<String> {
     let mut payload = payload.replace('-', "+").replace('_', "/");
     let padding = (4 - payload.len() % 4) % 4;
     payload.push_str(&"=".repeat(padding));
-    
+
     match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &payload) {
         Ok(bytes) => String::from_utf8(bytes).ok(),
         Err(_) => None,
@@ -235,13 +236,23 @@ fn format_request_body(body: &str) -> String {
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
         // 提取关键字段
         let mut key_fields = Vec::new();
-        
+
         if let Some(obj) = json.as_object() {
-            for key in ["conversationState", "profileArn", "source", "currentMessage"] {
+            for key in [
+                "conversationState",
+                "profileArn",
+                "source",
+                "currentMessage",
+            ] {
                 if let Some(val) = obj.get(key) {
-                    let val_str = serde_json::to_string(val).unwrap_or_else(|_| "<序列化失败>".to_string());
+                    let val_str =
+                        serde_json::to_string(val).unwrap_or_else(|_| "<序列化失败>".to_string());
                     let truncated = if val_str.len() > 500 {
-                        format!("{}... ({} chars)", truncate_str_safe(&val_str, 500), val_str.len())
+                        format!(
+                            "{}... ({} chars)",
+                            truncate_str_safe(&val_str, 500),
+                            val_str.len()
+                        )
                     } else {
                         val_str
                     };
@@ -249,19 +260,23 @@ fn format_request_body(body: &str) -> String {
                 }
             }
         }
-        
+
         let key_fields_str = if key_fields.is_empty() {
             "    <无关键字段>".to_string()
         } else {
             key_fields.join("\n")
         };
-        
+
         let full_body = if body.len() > 3000 {
-            format!("{}... (truncated, total {} bytes)", truncate_str_safe(body, 3000), body.len())
+            format!(
+                "{}... (truncated, total {} bytes)",
+                truncate_str_safe(body, 3000),
+                body.len()
+            )
         } else {
             body.to_string()
         };
-        
+
         format!(
             "关键字段:\n{}\n\n完整请求体 ({} bytes):\n{}",
             key_fields_str,
@@ -271,7 +286,11 @@ fn format_request_body(body: &str) -> String {
     } else {
         // 非 JSON 格式
         if body.len() > 3000 {
-            format!("(非 JSON, {} bytes): {}... (truncated)", body.len(), truncate_str_safe(body, 3000))
+            format!(
+                "(非 JSON, {} bytes): {}... (truncated)",
+                body.len(),
+                truncate_str_safe(body, 3000)
+            )
         } else {
             format!("(非 JSON, {} bytes): {}", body.len(), body)
         }
@@ -289,26 +308,29 @@ fn log_full_diagnostic(
     config: &crate::model::config::Config,
 ) {
     diag.add_section("阶段", phase.to_string());
-    
-    diag.add_section("配置信息", format!(
-        "config.region: {}\n\
+
+    diag.add_section(
+        "配置信息",
+        format!(
+            "config.region: {}\n\
          config.kiro_version: {}\n\
          config.system_version: {}\n\
          config.node_version: {}\n\
          config.tls_backend: {:?}",
-        config.region,
-        config.kiro_version,
-        config.system_version,
-        config.node_version,
-        config.tls_backend
-    ));
-    
+            config.region,
+            config.kiro_version,
+            config.system_version,
+            config.node_version,
+            config.tls_backend
+        ),
+    );
+
     diag.add_section("凭据信息", format_credential_info(ctx, &config.region));
-    
+
     diag.add_section("请求 URL", url.to_string());
-    
+
     diag.add_section("请求头", format_headers(headers));
-    
+
     diag.add_section("请求体", format_request_body(request_body));
 }
 
@@ -318,49 +340,57 @@ fn log_response_diagnostic(
     status: reqwest::StatusCode,
     response_body: &str,
 ) {
-    diag.add_section("响应状态", format!(
-        "HTTP 状态码: {} ({})\n\
+    diag.add_section(
+        "响应状态",
+        format!(
+            "HTTP 状态码: {} ({})\n\
          是否成功: {}\n\
          是否客户端错误: {}\n\
          是否服务端错误: {}",
-        status.as_u16(),
-        status.canonical_reason().unwrap_or("Unknown"),
-        status.is_success(),
-        status.is_client_error(),
-        status.is_server_error()
-    ));
-    
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("Unknown"),
+            status.is_success(),
+            status.is_client_error(),
+            status.is_server_error()
+        ),
+    );
+
     // 尝试解析响应体
-    let response_analysis = if let Ok(json) = serde_json::from_str::<serde_json::Value>(response_body) {
-        let mut analysis = Vec::new();
-        
-        if let Some(obj) = json.as_object() {
-            if let Some(msg) = obj.get("message") {
-                analysis.push(format!("message: {}", msg));
+    let response_analysis =
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(response_body) {
+            let mut analysis = Vec::new();
+
+            if let Some(obj) = json.as_object() {
+                if let Some(msg) = obj.get("message") {
+                    analysis.push(format!("message: {}", msg));
+                }
+                if let Some(reason) = obj.get("reason") {
+                    analysis.push(format!("reason: {}", reason));
+                }
+                if let Some(error) = obj.get("error") {
+                    analysis.push(format!("error: {}", error));
+                }
             }
-            if let Some(reason) = obj.get("reason") {
-                analysis.push(format!("reason: {}", reason));
+
+            if analysis.is_empty() {
+                "无特殊错误字段".to_string()
+            } else {
+                analysis.join("\n")
             }
-            if let Some(error) = obj.get("error") {
-                analysis.push(format!("error: {}", error));
-            }
-        }
-        
-        if analysis.is_empty() {
-            "无特殊错误字段".to_string()
         } else {
-            analysis.join("\n")
-        }
-    } else {
-        "响应体非 JSON 格式".to_string()
-    };
-    
+            "响应体非 JSON 格式".to_string()
+        };
+
     let body_display = if response_body.len() > 2000 {
-        format!("{}... (truncated, {} bytes)", truncate_str_safe(response_body, 2000), response_body.len())
+        format!(
+            "{}... (truncated, {} bytes)",
+            truncate_str_safe(response_body, 2000),
+            response_body.len()
+        )
     } else {
         response_body.to_string()
     };
-    
+
     diag.add_section("响应分析", response_analysis);
     diag.add_section("响应体", body_display);
 }
@@ -369,6 +399,7 @@ fn log_response_diagnostic(
 ///
 /// 核心组件，负责与 Kiro API 通信
 /// 支持多凭据故障转移和重试机制
+/// 按凭据 `endpoint` 字段选择 [`KiroEndpoint`] 实现
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
     /// 全局代理配置（用于凭据无自定义代理时的回退）
@@ -381,19 +412,40 @@ pub struct KiroProvider {
     /// TLS 后端配置
     tls_backend: TlsBackend,
     stats: Option<Arc<StatsStore>>,
+    /// 端点实现注册表（key: endpoint 名称）
+    endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
+    /// 默认端点名称（凭据未指定 endpoint 时使用）
+    default_endpoint: String,
 }
 
 impl KiroProvider {
     /// 创建新的 KiroProvider 实例
     pub fn new(token_manager: Arc<MultiTokenManager>) -> anyhow::Result<Self> {
-        Self::with_proxy(token_manager, None)
+        let default_endpoint = token_manager.config().default_endpoint.clone();
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            IdeEndpoint::new().name().to_string(),
+            Arc::new(IdeEndpoint::new()),
+        );
+        Self::with_proxy(token_manager, None, endpoints, default_endpoint)
     }
 
-    /// 创建带代理配置的 KiroProvider 实例
+    /// 创建带代理配置和端点注册表的 KiroProvider 实例
+    ///
+    /// # Arguments
+    /// * `token_manager` - 多凭据 Token 管理器
+    /// * `proxy` - 全局代理配置
+    /// * `endpoints` - 端点名 → 实现的注册表（至少包含 `default_endpoint` 对应条目）
+    /// * `default_endpoint` - 凭据未显式指定 endpoint 时使用的名称
     pub fn with_proxy(
         token_manager: Arc<MultiTokenManager>,
         proxy: Option<ProxyConfig>,
+        endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
+        default_endpoint: String,
     ) -> anyhow::Result<Self> {
+        if !endpoints.contains_key(&default_endpoint) {
+            anyhow::bail!("默认端点 {} 未在 endpoints 注册表中", default_endpoint);
+        }
         let tls_backend = token_manager.config().tls_backend;
 
         // 预热：构建全局代理对应的 Client
@@ -413,6 +465,8 @@ impl KiroProvider {
             stream_client_cache: Mutex::new(stream_client_cache),
             tls_backend,
             stats: None,
+            endpoints,
+            default_endpoint,
         })
     }
 
@@ -473,7 +527,10 @@ impl KiroProvider {
 
     /// 获取 API 基础域名（使用 config 级 api_region）
     pub fn base_domain(&self) -> String {
-        format!("q.{}.amazonaws.com", self.token_manager.config().effective_api_region())
+        format!(
+            "q.{}.amazonaws.com",
+            self.token_manager.config().effective_api_region()
+        )
     }
 
     /// 获取凭据级 API 基础 URL
@@ -485,6 +542,7 @@ impl KiroProvider {
     }
 
     /// 获取凭据级 MCP API URL
+    #[allow(dead_code)]
     fn mcp_url_for(&self, credentials: &KiroCredentials) -> String {
         format!(
             "https://q.{}.amazonaws.com/mcp",
@@ -493,6 +551,7 @@ impl KiroProvider {
     }
 
     /// 获取凭据级 API 基础域名
+    #[allow(dead_code)]
     fn base_domain_for(&self, credentials: &KiroCredentials) -> String {
         format!(
             "q.{}.amazonaws.com",
@@ -521,11 +580,11 @@ impl KiroProvider {
     ///
     /// # Arguments
     /// * `ctx` - API 调用上下文，包含凭据和 token
+    #[allow(dead_code)]
     fn build_headers(&self, ctx: &CallContext) -> anyhow::Result<HeaderMap> {
         let config = self.token_manager.config();
 
-        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config)
-            .ok_or_else(|| anyhow::anyhow!("无法生成 machine_id，请检查凭证配置"))?;
+        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
 
         let kiro_version = &config.kiro_version;
         let os_name = &config.system_version;
@@ -581,11 +640,11 @@ impl KiroProvider {
     }
 
     /// 构建 MCP 请求头
+    #[allow(dead_code)]
     fn build_mcp_headers(&self, ctx: &CallContext) -> anyhow::Result<HeaderMap> {
         let config = self.token_manager.config();
 
-        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config)
-            .ok_or_else(|| anyhow::anyhow!("无法生成 machine_id，请检查凭证配置"))?;
+        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
 
         let kiro_version = &config.kiro_version;
         let os_name = &config.system_version;
@@ -604,13 +663,23 @@ impl KiroProvider {
         headers.insert("content-type", HeaderValue::from_static("application/json"));
         headers.insert(
             "x-amz-user-agent",
-            HeaderValue::from_str(&x_amz_user_agent).unwrap(),
+            HeaderValue::from_str(&x_amz_user_agent)
+                .map_err(|e| anyhow::anyhow!("x-amz-user-agent header 无效: {}", e))?,
         );
-        headers.insert("user-agent", HeaderValue::from_str(&user_agent).unwrap());
-        headers.insert("host", HeaderValue::from_str(&self.base_domain_for(&ctx.credentials)).unwrap());
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_str(&user_agent)
+                .map_err(|e| anyhow::anyhow!("user-agent header 无效: {}", e))?,
+        );
+        headers.insert(
+            "host",
+            HeaderValue::from_str(&self.base_domain_for(&ctx.credentials))
+                .map_err(|e| anyhow::anyhow!("host header 无效: {}", e))?,
+        );
         headers.insert(
             "amz-sdk-invocation-id",
-            HeaderValue::from_str(&Uuid::new_v4().to_string()).unwrap(),
+            HeaderValue::from_str(&Uuid::new_v4().to_string())
+                .map_err(|e| anyhow::anyhow!("amz-sdk-invocation-id header 无效: {}", e))?,
         );
         headers.insert(
             "amz-sdk-request",
@@ -618,26 +687,29 @@ impl KiroProvider {
         );
         headers.insert(
             "Authorization",
-            HeaderValue::from_str(&format!("Bearer {}", ctx.token)).unwrap(),
+            HeaderValue::from_str(&format!("Bearer {}", ctx.token))
+                .map_err(|e| anyhow::anyhow!("Authorization header 无效: {}", e))?,
         );
         headers.insert("Connection", HeaderValue::from_static("close"));
 
         Ok(headers)
     }
 
+    /// 根据凭据选择 endpoint 实现
+    fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
+        let name = credentials
+            .endpoint
+            .as_deref()
+            .unwrap_or(&self.default_endpoint);
+        self.endpoints
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+    }
+
     /// 发送非流式 API 请求
     ///
-    /// 支持多凭据故障转移：
-    /// - 400 Bad Request: 直接返回错误，不计入凭据失败
-    /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
-    /// - 402 MONTHLY_REQUEST_COUNT: 视为额度用尽，禁用凭据并切换
-    /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
-    ///
-    /// # Arguments
-    /// * `request_body` - JSON 格式的请求体字符串
-    ///
-    /// # Returns
-    /// 返回原始的 HTTP Response，不做解析
+    /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
         let (_id, resp) = self.call_api_with_retry(request_body, false, None).await?;
         Ok(resp)
@@ -653,18 +725,6 @@ impl KiroProvider {
     }
 
     /// 发送流式 API 请求
-    ///
-    /// 支持多凭据故障转移：
-    /// - 400 Bad Request: 直接返回错误，不计入凭据失败
-    /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
-    /// - 402 MONTHLY_REQUEST_COUNT: 视为额度用尽，禁用凭据并切换
-    /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
-    ///
-    /// # Arguments
-    /// * `request_body` - JSON 格式的请求体字符串
-    ///
-    /// # Returns
-    /// 返回原始的 HTTP Response，调用方负责处理流式数据
     pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
         let (_id, resp) = self.call_api_with_retry(request_body, true, None).await?;
         Ok(resp)
@@ -679,15 +739,7 @@ impl KiroProvider {
         self.call_api_with_retry(request_body, true, model).await
     }
 
-    /// 发送 MCP API 请求
-    ///
-    /// 用于 WebSearch 等工具调用
-    ///
-    /// # Arguments
-    /// * `request_body` - JSON 格式的 MCP 请求体字符串
-    ///
-    /// # Returns
-    /// 返回原始的 HTTP Response
+    /// 发送 MCP API 请求（WebSearch 等工具调用）
     pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
         self.call_mcp_with_retry(request_body).await
     }
@@ -697,9 +749,9 @@ impl KiroProvider {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
+        let mut force_refreshed: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
-            // 获取调用上下文
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
             let ctx = match self.token_manager.acquire_context().await {
                 Ok(c) => c,
@@ -709,24 +761,38 @@ impl KiroProvider {
                 }
             };
 
-            let url = self.mcp_url_for(&ctx.credentials);
-            let headers = match self.build_mcp_headers(&ctx) {
-                Ok(h) => h,
+            let config = self.token_manager.config();
+            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
+
+            let endpoint = match self.endpoint_for(&ctx.credentials) {
+                Ok(e) => e,
                 Err(e) => {
                     last_error = Some(e);
+                    // endpoint 解析失败：记为失败，换下一张凭据
+                    self.token_manager.report_failure(ctx.id);
                     continue;
                 }
             };
 
-            // 发送请求
-            let response = match self
+            let rctx = RequestContext {
+                credentials: &ctx.credentials,
+                token: &ctx.token,
+                machine_id: &machine_id,
+                config,
+            };
+
+            let url = endpoint.mcp_url(&rctx);
+            let body = endpoint.transform_mcp_body(request_body, &rctx);
+
+            let base = self
                 .client_for(&ctx.credentials)?
                 .post(&url)
-                .headers(headers)
-                .body(request_body.to_string())
-                .send()
-                .await
-            {
+                .body(body)
+                .header("content-type", "application/json")
+                .header("Connection", "close");
+            let request = endpoint.decorate_mcp(base, &rctx);
+
+            let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
@@ -755,7 +821,7 @@ impl KiroProvider {
             let body = response.text().await.unwrap_or_default();
 
             // 402 额度用尽
-            if status.as_u16() == 402 && Self::is_monthly_request_limit(&body) {
+            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
@@ -771,6 +837,22 @@ impl KiroProvider {
 
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
+                // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
+                if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
+                    force_refreshed.insert(ctx.id);
+                    tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
+                    if self
+                        .token_manager
+                        .force_refresh_token_for(ctx.id)
+                        .await
+                        .is_ok()
+                    {
+                        tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
+                        continue;
+                    }
+                    tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
+                }
+
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
@@ -830,10 +912,13 @@ impl KiroProvider {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
+        let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
-        // 尝试从请求体中提取模型信息
-        let model = Self::extract_model_from_request(request_body);
+        // 优先使用调用方传入的模型；缺省时从请求体提取。
+        let model = model
+            .map(|m| m.to_string())
+            .or_else(|| Self::extract_model_from_request(request_body));
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
@@ -861,34 +946,14 @@ impl KiroProvider {
                 }
             };
 
-            // 动态注入凭据的 profileArn 到请求体（仅对 IdC 凭据）
-            // 这确保了 IdC 凭据能够使用其对应的 profileArn
-            // Social 凭据保持原有模式，不做特殊处理
-            let final_request_body = match Self::inject_profile_arn_for_idc(
-                request_body,
-                &ctx.credentials.profile_arn,
-                &ctx.credentials.auth_method,
-            ) {
-                Ok(body) => body,
-                Err(e) => {
-                    tracing::warn!(
-                        "注入 profileArn 失败（尝试 {}/{}，credential_id={}）: {}",
-                        attempt + 1,
-                        max_retries,
-                        ctx.id,
-                        e
-                    );
-                    // 注入失败时使用原始请求体
-                    request_body.to_string()
-                }
-            };
+            let config = self.token_manager.config();
+            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
 
-            let url = self.base_url_for(&ctx.credentials);
-            let headers = match self.build_headers(&ctx) {
-                Ok(h) => h,
+            let endpoint = match self.endpoint_for(&ctx.credentials) {
+                Ok(e) => e,
                 Err(e) => {
                     tracing::warn!(
-                        "构建请求头失败（尝试 {}/{}，credential_id={}）: {}",
+                        "选择 Kiro 端点失败（尝试 {}/{}，credential_id={}）: {}",
                         attempt + 1,
                         max_retries,
                         ctx.id,
@@ -900,7 +965,10 @@ impl KiroProvider {
                     }
 
                     last_error = Some(e);
-                    sleep(Self::retry_delay(attempt)).await;
+                    self.token_manager.report_failure(ctx.id);
+                    if attempt + 1 < max_retries {
+                        sleep(Self::retry_delay(attempt)).await;
+                    }
                     continue;
                 }
             };
@@ -909,19 +977,60 @@ impl KiroProvider {
                 stats.record_attempt(ctx.id, model.as_deref());
             }
 
+            let rctx = RequestContext {
+                credentials: &ctx.credentials,
+                token: &ctx.token,
+                machine_id: &machine_id,
+                config,
+            };
+
+            let url = endpoint.api_url(&rctx);
+            let final_request_body = endpoint.transform_api_body(request_body, &rctx);
+
+            let client = if is_stream {
+                self.stream_client_for(&ctx.credentials)?
+            } else {
+                self.client_for(&ctx.credentials)?
+            };
+
+            let base = client
+                .post(&url)
+                .body(final_request_body.clone())
+                .header("content-type", "application/json")
+                .header("Connection", "close");
+            let request = endpoint.decorate_api(base, &rctx);
+
             // 检查是否需要输出详细日志（上次请求遇到 401/403 后设置）
             let should_log_verbose = VERBOSE_NEXT_REQUEST.swap(false, Ordering::SeqCst);
+            let diagnostic_headers = if should_log_verbose {
+                request
+                    .try_clone()
+                    .and_then(|r| r.build().ok())
+                    .map(|r| r.headers().clone())
+                    .unwrap_or_else(HeaderMap::new)
+            } else {
+                HeaderMap::new()
+            };
+
             let mut diag = if should_log_verbose {
                 let mut d = DiagnosticLog::new();
-                d.add_step("开始请求", format!(
-                    "尝试 {}/{}, 凭据 #{}, 模型: {:?}, API 类型: {}",
-                    attempt + 1, max_retries, ctx.id, model, api_type
-                ));
+                d.add_step(
+                    "开始请求",
+                    format!(
+                        "尝试 {}/{}, 凭据 #{}, 模型: {:?}, API 类型: {}, endpoint: {}",
+                        attempt + 1,
+                        max_retries,
+                        ctx.id,
+                        model,
+                        api_type,
+                        endpoint.name()
+                    ),
+                );
                 log_full_diagnostic(
                     &mut d,
                     "请求准备完成",
                     &url,
-                    &headers,
+                    &diagnostic_headers,
                     &final_request_body,
                     &ctx,
                     self.token_manager.config(),
@@ -931,24 +1040,11 @@ impl KiroProvider {
                 None
             };
 
-            // 发送请求
-            let client = if is_stream {
-                self.stream_client_for(&ctx.credentials)?
-            } else {
-                self.client_for(&ctx.credentials)?
-            };
-
             if let Some(ref mut d) = diag {
                 d.add_step("发送请求", format!("POST {}", url));
             }
 
-            let response = match client
-                .post(&url)
-                .headers(headers.clone())
-                .body(final_request_body.clone())
-                .send()
-                .await
-            {
+            let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
                     if let Some(ref mut d) = diag {
@@ -1001,12 +1097,14 @@ impl KiroProvider {
             }
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
-            if status.as_u16() == 402 && Self::is_monthly_request_limit(&body) {
+            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
                 if let Some(ref mut d) = diag {
-                    d.add_step("错误类型", "402 额度用尽 (MONTHLY_REQUEST_COUNT)".to_string());
+                    d.add_step(
+                        "错误类型",
+                        "402 额度用尽 (MONTHLY_REQUEST_COUNT)".to_string(),
+                    );
                     d.output();
                 }
-
                 tracing::warn!(
                     "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -1039,7 +1137,10 @@ impl KiroProvider {
                 // 特殊处理：内容长度超限错误
                 if Self::is_content_length_exceeded(&body) {
                     if let Some(ref mut d) = diag {
-                        d.add_step("错误类型", "400 内容长度超限 (CONTENT_LENGTH_EXCEEDS_THRESHOLD)".to_string());
+                        d.add_step(
+                            "错误类型",
+                            "400 内容长度超限 (CONTENT_LENGTH_EXCEEDS_THRESHOLD)".to_string(),
+                        );
                         d.output();
                     }
 
@@ -1052,12 +1153,16 @@ impl KiroProvider {
                         stats.record_error(
                             ctx.id,
                             model.as_deref(),
-                            truncate_error("内容长度超限 (CONTENT_LENGTH_EXCEEDS_THRESHOLD)".to_string()),
+                            truncate_error(
+                                "内容长度超限 (CONTENT_LENGTH_EXCEEDS_THRESHOLD)".to_string(),
+                            ),
                         );
                     }
 
                     // 返回特殊错误标记，让上层识别并返回 stop_reason=max_tokens
-                    anyhow::bail!("ContentLengthExceeded: Input is too long (CONTENT_LENGTH_EXCEEDS_THRESHOLD)");
+                    anyhow::bail!(
+                        "ContentLengthExceeded: Input is too long (CONTENT_LENGTH_EXCEEDS_THRESHOLD)"
+                    );
                 }
 
                 if let Some(ref mut d) = diag {
@@ -1081,21 +1186,30 @@ impl KiroProvider {
                 // 如果当前没有诊断日志，创建一个完整的
                 if diag.is_none() {
                     let mut d = DiagnosticLog::new();
-                    d.add_step("401/403 错误触发诊断", format!(
-                        "尝试 {}/{}, 凭据 #{}, HTTP {}",
-                        attempt + 1, max_retries, ctx.id, status
-                    ));
+                    d.add_step(
+                        "401/403 错误触发诊断",
+                        format!(
+                            "尝试 {}/{}, 凭据 #{}, HTTP {}",
+                            attempt + 1,
+                            max_retries,
+                            ctx.id,
+                            status
+                        ),
+                    );
                     log_full_diagnostic(
                         &mut d,
                         &format!("401/403 错误 - 尝试 {}/{}", attempt + 1, max_retries),
                         &url,
-                        &headers,
+                        &diagnostic_headers,
                         &final_request_body,
                         &ctx,
                         self.token_manager.config(),
                     );
                     log_response_diagnostic(&mut d, status, &body);
-                    d.add_step("后续操作", "设置 VERBOSE_NEXT_REQUEST 标志，下次请求将输出完整诊断".to_string());
+                    d.add_step(
+                        "后续操作",
+                        "设置 VERBOSE_NEXT_REQUEST 标志，下次请求将输出完整诊断".to_string(),
+                    );
                     d.output();
                 } else if let Some(ref mut d) = diag {
                     d.add_step("错误类型", format!("{} 凭据/权限错误", status.as_u16()));
@@ -1119,6 +1233,22 @@ impl KiroProvider {
                         model.as_deref(),
                         truncate_error(format!("{} API 请求失败: {} {}", api_type, status, body)),
                     );
+                }
+
+                // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
+                if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
+                    force_refreshed.insert(ctx.id);
+                    tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
+                    if self
+                        .token_manager
+                        .force_refresh_token_for(ctx.id)
+                        .await
+                        .is_ok()
+                    {
+                        tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
+                        continue;
+                    }
+                    tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
                 }
 
                 let has_available = self.token_manager.report_failure(ctx.id);
@@ -1159,7 +1289,12 @@ impl KiroProvider {
                     );
                 }
 
-                last_error = Some(anyhow::anyhow!("{} API 请求失败: {} {}", api_type, status, body));
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -1195,7 +1330,12 @@ impl KiroProvider {
                 );
             }
 
-            last_error = Some(anyhow::anyhow!("{} API 请求失败: {} {}", api_type, status, body));
+            last_error = Some(anyhow::anyhow!(
+                "{} API 请求失败: {} {}",
+                api_type,
+                status,
+                body
+            ));
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
@@ -1311,27 +1451,28 @@ impl KiroProvider {
             .map_err(|e| anyhow::anyhow!("解析请求体 JSON 失败: {}", e))?;
 
         // 检查原始请求体中的 profileArn
-        let original_arn = json.get("profileArn").and_then(|v| v.as_str()).map(|s| s.to_string());
-        
+        let original_arn = json
+            .get("profileArn")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         // 注入凭据的 profileArn
         if let Some(obj) = json.as_object_mut() {
-            obj.insert("profileArn".to_string(), serde_json::Value::String(arn.clone()));
+            obj.insert(
+                "profileArn".to_string(),
+                serde_json::Value::String(arn.clone()),
+            );
         }
 
         // 如果原始 profileArn 和凭据的 profileArn 不同，记录日志
         if let Some(orig) = original_arn {
             if orig != *arn {
-                tracing::debug!(
-                    "IdC profileArn 替换: {} -> {}",
-                    orig,
-                    arn
-                );
+                tracing::debug!("IdC profileArn 替换: {} -> {}", orig, arn);
             }
         }
 
         // 序列化回字符串
-        serde_json::to_string(&json)
-            .map_err(|e| anyhow::anyhow!("序列化请求体 JSON 失败: {}", e))
+        serde_json::to_string(&json).map_err(|e| anyhow::anyhow!("序列化请求体 JSON 失败: {}", e))
     }
 }
 
@@ -1360,7 +1501,13 @@ mod tests {
     }
 
     fn create_test_provider(config: Config, credentials: KiroCredentials) -> KiroProvider {
-        let tm = must_ok(MultiTokenManager::new(config, vec![credentials], None, None, false));
+        let tm = must_ok(MultiTokenManager::new(
+            config,
+            vec![credentials],
+            None,
+            None,
+            false,
+        ));
         must_ok(KiroProvider::new(Arc::new(tm)))
     }
 
@@ -1405,7 +1552,9 @@ mod tests {
             Some("application/json".as_bytes())
         );
         assert_eq!(
-            headers.get("x-amzn-codewhisperer-optout").map(|v| v.as_bytes()),
+            headers
+                .get("x-amzn-codewhisperer-optout")
+                .map(|v| v.as_bytes()),
             Some("true".as_bytes())
         );
         assert_eq!(
@@ -1445,7 +1594,8 @@ mod tests {
 
     #[test]
     fn test_is_content_length_exceeded_detects_reason() {
-        let body = r#"{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#;
+        let body =
+            r#"{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#;
         assert!(KiroProvider::is_content_length_exceeded(body));
     }
 
@@ -1482,11 +1632,11 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_hello_request_with_credential_18() {
+        use crate::kiro::model::events::Event;
         use crate::kiro::model::requests::conversation::{
             ConversationState, CurrentMessage, UserInputMessage,
         };
         use crate::kiro::model::requests::kiro::KiroRequest;
-        use crate::kiro::model::events::Event;
         use crate::kiro::parser::decoder::EventStreamDecoder;
         use futures::StreamExt;
 
@@ -1570,8 +1720,11 @@ mod tests {
             .with_agent_task_type("vibe")
             .with_chat_trigger_type("MANUAL")
             .with_current_message(CurrentMessage::new(
-                UserInputMessage::new("Hello! Please respond with a short greeting.", "claude-sonnet-4.5")
-                    .with_origin("AI_EDITOR"),
+                UserInputMessage::new(
+                    "Hello! Please respond with a short greeting.",
+                    "claude-sonnet-4.5",
+                )
+                .with_origin("AI_EDITOR"),
             ));
 
         let request = KiroRequest {
@@ -1619,23 +1772,22 @@ mod tests {
 
                     for result in decoder.decode_iter() {
                         match result {
-                            Ok(frame) => {
-                                match Event::from_frame(frame) {
-                                    Ok(event) => {
-                                        match &event {
-                                            Event::AssistantResponse(ar) => {
-                                                print!("{}", ar.content);
-                                                response_text.push_str(&ar.content);
-                                            }
-                                            Event::ContextUsage(cu) => {
-                                                println!("\n[上下文用量] {:.2}%", cu.context_usage_percentage);
-                                            }
-                                            _ => {}
-                                        }
+                            Ok(frame) => match Event::from_frame(frame) {
+                                Ok(event) => match &event {
+                                    Event::AssistantResponse(ar) => {
+                                        print!("{}", ar.content);
+                                        response_text.push_str(&ar.content);
                                     }
-                                    Err(e) => eprintln!("[解析错误] {}", e),
-                                }
-                            }
+                                    Event::ContextUsage(cu) => {
+                                        println!(
+                                            "\n[上下文用量] {:.2}%",
+                                            cu.context_usage_percentage
+                                        );
+                                    }
+                                    _ => {}
+                                },
+                                Err(e) => eprintln!("[解析错误] {}", e),
+                            },
                             Err(e) => eprintln!("[帧解析错误] {}", e),
                         }
                     }
@@ -1649,7 +1801,11 @@ mod tests {
 
         println!("\n{}", "=".repeat(60));
         println!("流式响应结束");
-        println!("共接收 {} 字节，解码 {} 帧", total_bytes, decoder.frames_decoded());
+        println!(
+            "共接收 {} 字节，解码 {} 帧",
+            total_bytes,
+            decoder.frames_decoded()
+        );
         println!("响应内容长度: {} 字符", response_text.len());
 
         assert!(!response_text.is_empty(), "响应内容不应为空");

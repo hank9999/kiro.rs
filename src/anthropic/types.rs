@@ -113,6 +113,7 @@ pub struct Metadata {
 
 /// Messages 请求体
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct MessagesRequest {
     pub model: String,
     pub max_tokens: i32,
@@ -222,15 +223,6 @@ pub struct Tool {
     /// 最大使用次数（仅 WebSearch 工具）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<i32>,
-}
-
-impl Tool {
-    /// 检查是否为 WebSearch 工具
-    pub fn is_web_search(&self) -> bool {
-        self.tool_type
-            .as_ref()
-            .is_some_and(|t| t.starts_with("web_search"))
-    }
 }
 
 /// 内容块

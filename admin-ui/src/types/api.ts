@@ -18,6 +18,8 @@ export interface CredentialStatusItem {
   hasProfileArn: boolean
 
   refreshTokenHash?: string | null
+  apiKeyHash?: string | null
+  maskedApiKey?: string | null
   email?: string | null
   accountEmail?: string | null
   userId?: string | null
@@ -38,6 +40,9 @@ export interface CredentialStatusItem {
   lastSuccessAt: string | null
   lastErrorAt: string | null
   lastError: string | null
+  refreshFailureCount: number
+  disabledReason?: string | null
+  endpoint: string
 }
 
 // 余额响应
@@ -111,8 +116,8 @@ export interface SetEnabledModelsRequest {
 
 // 添加凭据请求
 export interface AddCredentialRequest {
-  refreshToken: string
-  authMethod?: 'social' | 'idc'
+  refreshToken?: string
+  authMethod?: 'social' | 'idc' | 'api_key'
   clientId?: string
   clientSecret?: string
   priority?: number
@@ -126,6 +131,8 @@ export interface AddCredentialRequest {
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
+  kiroApiKey?: string
+  endpoint?: string
 }
 
 // 添加凭据响应

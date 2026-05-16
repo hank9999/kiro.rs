@@ -9,6 +9,7 @@ mod stats;
 pub mod token;
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -18,6 +19,7 @@ use crate::stats::StatsStore;
 
 use anyhow::Context;
 use clap::Parser;
+use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -165,8 +167,8 @@ async fn run() -> AppResult<()> {
     let config_path = args
         .config
         .unwrap_or_else(|| Config::default_config_path().to_string());
-    let config = Config::load(&config_path)
-        .with_context(|| format!("加载配置失败: {}", config_path))?;
+    let config =
+        Config::load(&config_path).with_context(|| format!("加载配置失败: {}", config_path))?;
 
     // 加载凭证（支持单对象或数组格式）
     let credentials_path = args
@@ -179,7 +181,24 @@ async fn run() -> AppResult<()> {
     let is_multiple_format = credentials_config.is_multiple();
 
     // 转换为按优先级排序的凭据列表
-    let credentials_list = credentials_config.into_sorted_credentials();
+    let mut credentials_list = credentials_config.into_sorted_credentials();
+
+    // 检查 KIRO_API_KEY 环境变量，自动创建 API Key 凭据
+    if let Ok(kiro_api_key) = std::env::var("KIRO_API_KEY") {
+        if kiro_api_key.is_empty() {
+            tracing::warn!("KIRO_API_KEY 环境变量已设置但为空，视为未配置");
+        } else {
+            tracing::info!("检测到 KIRO_API_KEY 环境变量，添加 API Key 凭据（最高优先级）");
+            let api_key_cred = KiroCredentials {
+                kiro_api_key: Some(kiro_api_key),
+                auth_method: Some("api_key".to_string()),
+                priority: 0,
+                ..Default::default()
+            };
+            credentials_list.insert(0, api_key_cred);
+        }
+    }
+
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
 
     // 加载/初始化统计存储（按凭据 ID）
@@ -189,7 +208,8 @@ async fn run() -> AppResult<()> {
     tracing::info!("统计文件: {}", stats_path.display());
 
     // 初始化历史存储（与统计文件同目录）
-    let history_dir = stats_path.parent()
+    let history_dir = stats_path
+        .parent()
         .map(|p| p.join("history"))
         .unwrap_or_else(|| PathBuf::from("history"));
     init_global_store(HistoryStoreConfig {
@@ -202,9 +222,7 @@ async fn run() -> AppResult<()> {
     // 启动定期清理任务（每小时清理一次过期历史）
     start_cleanup_task(Duration::from_secs(60 * 60));
 
-    let first_profile_arn = credentials_list
-        .first()
-        .and_then(|c| c.profile_arn.clone());
+    let first_profile_arn = credentials_list.first().and_then(|c| c.profile_arn.clone());
 
     // 获取 API Key
     let api_key = config
@@ -225,6 +243,35 @@ async fn run() -> AppResult<()> {
         tracing::info!("已配置 HTTP 代理: {}", url);
     }
 
+    // 构建端点注册表
+    let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+    {
+        let ide = IdeEndpoint::new();
+        endpoints.insert(ide.name().to_string(), Arc::new(ide));
+    }
+
+    // 校验默认端点存在
+    if !endpoints.contains_key(&config.default_endpoint) {
+        tracing::error!("默认端点 \"{}\" 未注册", config.default_endpoint);
+        std::process::exit(1);
+    }
+
+    // 校验所有凭据声明的端点都已注册
+    for cred in &credentials_list {
+        let name = cred.endpoint.as_deref().unwrap_or(&config.default_endpoint);
+        if !endpoints.contains_key(name) {
+            tracing::error!(
+                "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
+                cred.id,
+                name,
+                endpoints.keys().collect::<Vec<_>>()
+            );
+            std::process::exit(1);
+        }
+    }
+
+    let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
+
     // 创建 MultiTokenManager 和 KiroProvider
     let token_manager = MultiTokenManager::new(
         config.clone(),
@@ -240,9 +287,14 @@ async fn run() -> AppResult<()> {
 
     let token_manager = Arc::new(token_manager);
 
-    let kiro_provider = KiroProvider::with_proxy(token_manager.clone(), proxy_config.clone())
-        .context("创建 KiroProvider 失败")?
-        .with_stats(stats_store.clone());
+    let kiro_provider = KiroProvider::with_proxy(
+        token_manager.clone(),
+        proxy_config.clone(),
+        endpoints,
+        config.default_endpoint.clone(),
+    )
+    .context("创建 KiroProvider 失败")?
+    .with_stats(stats_store.clone());
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
@@ -253,12 +305,13 @@ async fn run() -> AppResult<()> {
         tls_backend: config.tls_backend,
     });
 
-    // 构建 Anthropic API 路由
+    // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let (anthropic_app, app_state) = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),
         first_profile_arn,
         Some(config.summary_model.clone()),
+        config.extract_thinking,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -274,9 +327,13 @@ async fn run() -> AppResult<()> {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
-            let admin_service = admin::AdminService::new(token_manager.clone(), Some(stats_store.clone()));
-            let admin_state = admin::AdminState::new(admin_key, admin_service)
-                .with_app_state(app_state);
+            let admin_service = admin::AdminService::new(
+                token_manager.clone(),
+                Some(stats_store.clone()),
+                endpoint_names.clone(),
+            );
+            let admin_state =
+                admin::AdminState::new(admin_key, admin_service).with_app_state(app_state);
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由
@@ -358,7 +415,12 @@ async fn serve_with_restart(addr: String, app: axum::Router) -> AppResult<()> {
                 l
             }
             Err(e) => {
-                tracing::error!("绑定端口失败（{}），{} 秒后重试: {}", addr, backoff.as_secs(), e);
+                tracing::error!(
+                    "绑定端口失败（{}），{} 秒后重试: {}",
+                    addr,
+                    backoff.as_secs(),
+                    e
+                );
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(max_backoff);
                 continue;
@@ -385,7 +447,10 @@ async fn serve_with_restart(addr: String, app: axum::Router) -> AppResult<()> {
 
         match serve_res {
             Ok(()) => {
-                tracing::error!("服务异常停止（serve 返回 Ok，但未收到 shutdown），{} 秒后重启", backoff.as_secs());
+                tracing::error!(
+                    "服务异常停止（serve 返回 Ok，但未收到 shutdown），{} 秒后重启",
+                    backoff.as_secs()
+                );
             }
             Err(e) => {
                 tracing::error!("服务运行时错误，{} 秒后重启: {}", backoff.as_secs(), e);

@@ -9,9 +9,9 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-    AddCredentialRequest, CredentialAccountInfoResponse, SetDisabledRequest,
-    SetEnabledModelsRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-    SetSummaryModelRequest, SummaryModelResponse, SuccessResponse, AVAILABLE_SUMMARY_MODELS,
+        AVAILABLE_SUMMARY_MODELS, AddCredentialRequest, CredentialAccountInfoResponse,
+        SetDisabledRequest, SetEnabledModelsRequest, SetLoadBalancingModeRequest,
+        SetPriorityRequest, SetSummaryModelRequest, SuccessResponse, SummaryModelResponse,
     },
 };
 
@@ -217,6 +217,22 @@ pub async fn set_summary_model(
             )),
         )
             .into_response()
+    }
+}
+
+/// POST /api/admin/credentials/:id/refresh
+/// 强制刷新凭据 Token
+pub async fn force_refresh_token(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.force_refresh_token(id).await {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} Token 已强制刷新",
+            id
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
 

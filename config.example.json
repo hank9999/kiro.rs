@@ -4,5 +4,6 @@
   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
   "tlsBackend": "rustls",
   "region": "us-east-1",
-  "adminApiKey": "sk-admin-your-secret-key"
+  "adminApiKey": "sk-admin-your-secret-key",
+  "defaultEndpoint": "ide"
 }
