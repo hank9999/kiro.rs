@@ -429,7 +429,7 @@ export function CredentialCard({
 
           {/* 操作按钮 */}
           <div className="pt-3 border-t space-y-2">
-            <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-2">
+            <div className="grid grid-cols-2 gap-2">
               <Button
                 size="sm"
                 variant="outline"
@@ -492,14 +492,14 @@ export function CredentialCard({
               <Button
                 size="sm"
                 variant="outline"
-                className="w-full"
+                className="w-full col-span-2"
                 onClick={() => setStatsDialogOpen(true)}
               >
                 <BarChart3 className="h-4 w-4 mr-1" />
                 统计详情
               </Button>
             </div>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+            <div className="grid grid-cols-2 gap-2">
               <Button
                 size="sm"
                 variant="destructive"
@@ -531,7 +531,7 @@ export function CredentialCard({
               <Button
                 size="sm"
                 variant="default"
-                className="w-full"
+                className="w-full col-span-2"
                 onClick={() => {
                   void balanceQuery.refetch()
                   onViewBalance(credential.id)
