@@ -146,7 +146,10 @@ async fn refresh_social_token(
 ) -> anyhow::Result<KiroCredentials> {
     tracing::info!("正在刷新 Social Token...");
 
-    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let refresh_token = credentials
+        .refresh_token
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("缺少 refreshToken"))?;
     // 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
     let region = credentials.effective_auth_region(config);
 
@@ -229,7 +232,10 @@ async fn refresh_idc_token(
 ) -> anyhow::Result<KiroCredentials> {
     tracing::info!("正在刷新 IdC Token...");
 
-    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let refresh_token = credentials
+        .refresh_token
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("缺少 refreshToken"))?;
     let client_id = credentials
         .client_id
         .as_ref()
@@ -316,8 +322,141 @@ async fn refresh_idc_token(
         new_credentials.profile_arn = Some(profile_arn);
     }
 
+    // 如果凭据没有 profileArn，自动调用 ListAvailableProfiles 获取
+    if new_credentials.profile_arn.is_none() {
+        tracing::info!("IdC 凭据缺少 profileArn，正在调用 ListAvailableProfiles 自动获取...");
+        match fetch_profile_arn_for_idc(&new_credentials, config, proxy).await {
+            Ok(Some(arn)) => {
+                tracing::info!("成功获取 profileArn: {}", arn);
+                new_credentials.profile_arn = Some(arn);
+            }
+            Ok(None) => {
+                tracing::warn!("ListAvailableProfiles 返回空列表，无法获取 profileArn");
+            }
+            Err(e) => {
+                tracing::warn!("获取 profileArn 失败（不影响 Token 刷新）: {}", e);
+            }
+        }
+    }
+
     Ok(new_credentials)
 }
+
+/// ListAvailableProfiles API 所需的 x-amz-user-agent header 前缀
+const LIST_PROFILES_AMZ_USER_AGENT_PREFIX: &str = "aws-sdk-js/1.0.0";
+
+/// 为 IdC 凭据获取 profileArn
+///
+/// 调用 ListAvailableProfiles API 获取该凭据可用的 profile，
+/// 返回第一个可用的 profileArn。
+pub(crate) async fn fetch_profile_arn_for_idc(
+    credentials: &KiroCredentials,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<Option<String>> {
+    use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
+
+    let token = credentials
+        .access_token
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("缺少 access_token"))?;
+
+    // 使用 config.region 作为 API 调用的 region
+    let region = &config.region;
+    let host = format!("q.{}.amazonaws.com", region);
+    // 注意：路径是 /ListAvailableProfiles（大写 L）
+    let url = format!("https://{}/ListAvailableProfiles", host);
+
+    let machine_id = crate::kiro::machine_id::generate_from_credentials(credentials, config);
+    let kiro_version = &config.kiro_version;
+
+    let x_amz_user_agent = format!(
+        "{} KiroIDE-{}-{}",
+        LIST_PROFILES_AMZ_USER_AGENT_PREFIX, kiro_version, machine_id
+    );
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        config.system_version, config.node_version, kiro_version, machine_id
+    );
+
+    tracing::info!(
+        "[ListAvailableProfiles] 开始获取 profileArn\n\
+         URL: {}\n\
+         Token 长度: {} 字符",
+        url,
+        token.len()
+    );
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    let invocation_id = uuid::Uuid::new_v4().to_string();
+
+    // POST 请求，请求体为空 JSON 对象 {}
+    let response = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("x-amz-user-agent", &x_amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", &invocation_id)
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Connection", "close")
+        .body("{}")
+        .send()
+        .await?;
+
+    let status = response.status();
+
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        tracing::warn!(
+            "[ListAvailableProfiles] 请求失败: HTTP {} - {}",
+            status,
+            body_text
+        );
+        bail!("ListAvailableProfiles 失败: {} {}", status, body_text);
+    }
+
+    let body_text = response.text().await.unwrap_or_default();
+    tracing::info!(
+        "[ListAvailableProfiles] 请求成功: HTTP {} - 响应长度 {} 字节",
+        status,
+        body_text.len()
+    );
+
+    let data: ListAvailableProfilesResponse = serde_json::from_str(&body_text)
+        .map_err(|e| anyhow::anyhow!("解析 ListAvailableProfiles 响应失败: {}", e))?;
+
+    // 返回第一个有效的 profileArn
+    if let Some(profiles) = data.profiles {
+        tracing::info!(
+            "[ListAvailableProfiles] 获取到 {} 个 profile",
+            profiles.len()
+        );
+        for (i, profile) in profiles.iter().enumerate() {
+            tracing::debug!(
+                "[ListAvailableProfiles] profile[{}]: arn={:?}, name={:?}",
+                i,
+                profile.arn,
+                profile.profile_name
+            );
+            if let Some(arn) = &profile.arn {
+                if !arn.is_empty() {
+                    tracing::info!("[ListAvailableProfiles] 选择 profileArn: {}", arn);
+                    return Ok(Some(arn.clone()));
+                }
+            }
+        }
+    } else {
+        tracing::warn!("[ListAvailableProfiles] 响应中没有 profiles 字段");
+    }
+
+    tracing::warn!("[ListAvailableProfiles] 未找到有效的 profileArn");
+    Ok(None)
+}
+
+/// getUsageLimits API 所需的 x-amz-user-agent header 前缀
+const USAGE_LIMITS_AMZ_USER_AGENT_PREFIX: &str = "aws-sdk-js/1.0.0";
 
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
@@ -352,10 +491,7 @@ pub(crate) async fn get_usage_limits(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
         os_name, node_version, kiro_version, machine_id
     );
-    let amz_user_agent = format!(
-        "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
-        kiro_version, machine_id
-    );
+    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
@@ -470,6 +606,12 @@ pub struct CredentialEntrySnapshot {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 账户邮箱（尽力从 token 中解析，仅用于展示）
+    pub account_email: Option<String>,
+    /// 用户 ID（从 API 获取，持久化保存）
+    pub user_id: Option<String>,
+    /// 该凭据启用的模型列表（None 表示默认全开）
+    pub enabled_models: Option<Vec<String>>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -532,6 +674,97 @@ pub struct MultiTokenManager {
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+
+/// Admin/UI 默认"全开"的模型集合（canonical id）
+const DEFAULT_ENABLED_MODELS: [&str; 4] = [
+    "claude-sonnet-4.5",
+    "claude-sonnet-4",
+    "claude-haiku-4.5",
+    "claude-opus-4.5",
+];
+
+/// 将不同来源的模型字符串归一化到"凭据模型开关"的 canonical id。
+///
+/// - Anthropic 风格：`claude-sonnet-4-5-20250929` → `claude-sonnet-4.5`
+/// - Canonical：`claude-opus-4.5` → `claude-opus-4.5`
+/// - 仅对本项目默认的 4 种模型做归一化；未知模型返回 None（保持原行为，不做过滤）
+fn normalize_model_for_credential_policy(model: &str) -> Option<&'static str> {
+    let m = model.trim().to_ascii_lowercase();
+    if m.is_empty() {
+        return None;
+    }
+
+    if m.contains("sonnet") {
+        if m.contains("4.5") || m.contains("4-5") || m.contains("4_5") {
+            Some("claude-sonnet-4.5")
+        } else if m.contains("sonnet-4") || m.contains("sonnet 4") || m.contains("sonnet4") {
+            Some("claude-sonnet-4")
+        } else {
+            // 未显式版本时，沿用当前"sonnet 默认 4.5"的行为
+            Some("claude-sonnet-4.5")
+        }
+    } else if m.contains("opus") {
+        Some("claude-opus-4.5")
+    } else if m.contains("haiku") {
+        Some("claude-haiku-4.5")
+    } else {
+        None
+    }
+}
+
+/// 检查凭据是否启用了指定模型
+fn is_model_enabled_for_credential(credentials: &KiroCredentials, normalized_model: &str) -> bool {
+    match &credentials.enabled_models {
+        None => true, // 未配置时默认全开
+        Some(list) => list
+            .iter()
+            .any(|m| m.trim().eq_ignore_ascii_case(normalized_model)),
+    }
+}
+
+/// 归一化并验证用户输入的模型列表（用于持久化）
+fn normalize_enabled_models_for_persist(
+    models: Vec<String>,
+) -> anyhow::Result<Option<Vec<String>>> {
+    use std::collections::HashSet;
+
+    // 用 &'static str 存 canonical，避免重复分配
+    let mut seen: HashSet<&'static str> = HashSet::new();
+
+    for raw in models {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let normalized = normalize_model_for_credential_policy(raw).ok_or_else(|| {
+            anyhow::anyhow!(
+                "不支持的模型值: {}（允许值: {:?}）",
+                raw,
+                DEFAULT_ENABLED_MODELS
+            )
+        })?;
+        seen.insert(normalized);
+    }
+
+    // 允许显式配置为空数组：表示该凭据不启用任何模型
+    if seen.is_empty() {
+        return Ok(Some(vec![]));
+    }
+
+    // 按默认顺序输出
+    let out: Vec<String> = DEFAULT_ENABLED_MODELS
+        .iter()
+        .filter(|m| seen.contains(**m))
+        .map(|m| (*m).to_string())
+        .collect();
+
+    // 如果全开，返回 None（表示未配置，向后兼容）
+    if out.len() == DEFAULT_ENABLED_MODELS.len() {
+        Ok(None)
+    } else {
+        Ok(Some(out))
+    }
+}
 
 /// API 调用上下文
 ///
@@ -672,6 +905,123 @@ impl MultiTokenManager {
         Ok(manager)
     }
 
+    /// 启动时为缺少 profileArn 的 IdC 凭据尝试获取
+    ///
+    /// 对每个缺少 profileArn 的 IdC 凭据，最多尝试 3 次获取
+    /// 成功获取后会持久化到配置文件
+    pub async fn fetch_missing_profile_arns(&self) {
+        // 收集需要获取 profileArn 的 IdC 凭据
+        let idc_credentials_without_arn: Vec<(u64, KiroCredentials)> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .filter(|e| {
+                    let is_idc = e
+                        .credentials
+                        .auth_method
+                        .as_ref()
+                        .map(|m| m.eq_ignore_ascii_case("idc"))
+                        .unwrap_or(false)
+                        || (e.credentials.client_id.is_some()
+                            && e.credentials.client_secret.is_some());
+                    is_idc && e.credentials.profile_arn.is_none()
+                })
+                .map(|e| (e.id, e.credentials.clone()))
+                .collect()
+        };
+
+        if idc_credentials_without_arn.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            "[启动初始化] 发现 {} 个 IdC 凭据缺少 profileArn，开始尝试获取...",
+            idc_credentials_without_arn.len()
+        );
+
+        let mut updated_count = 0;
+        const MAX_RETRIES: u32 = 3;
+
+        for (id, cred) in idc_credentials_without_arn {
+            // 检查凭据是否有有效的 access_token
+            if cred.access_token.is_none() {
+                tracing::warn!(
+                    "[启动初始化] 凭据 #{} 没有 access_token，跳过 profileArn 获取",
+                    id
+                );
+                continue;
+            }
+
+            let mut success = false;
+            for attempt in 1..=MAX_RETRIES {
+                tracing::info!(
+                    "[启动初始化] 凭据 #{} 尝试获取 profileArn（第 {}/{} 次）",
+                    id,
+                    attempt,
+                    MAX_RETRIES
+                );
+
+                match fetch_profile_arn_for_idc(&cred, &self.config, self.proxy.as_ref()).await {
+                    Ok(Some(arn)) => {
+                        tracing::info!("[启动初始化] 凭据 #{} 成功获取 profileArn: {}", id, arn);
+                        // 更新凭据
+                        {
+                            let mut entries = self.entries.lock();
+                            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                                entry.credentials.profile_arn = Some(arn);
+                            }
+                        }
+                        success = true;
+                        updated_count += 1;
+                        break;
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            "[启动初始化] 凭据 #{} 未找到可用的 profileArn（第 {}/{} 次）",
+                            id,
+                            attempt,
+                            MAX_RETRIES
+                        );
+                        // 没有可用的 profile，不需要重试
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[启动初始化] 凭据 #{} 获取 profileArn 失败（第 {}/{} 次）: {}",
+                            id,
+                            attempt,
+                            MAX_RETRIES,
+                            e
+                        );
+                        if attempt < MAX_RETRIES {
+                            // 等待一小段时间后重试
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        }
+                    }
+                }
+            }
+
+            if !success {
+                tracing::warn!(
+                    "[启动初始化] 凭据 #{} 获取 profileArn 失败，已达到最大重试次数",
+                    id
+                );
+            }
+        }
+
+        // 如果有更新，持久化到配置文件
+        if updated_count > 0 {
+            if let Err(e) = self.persist_credentials() {
+                tracing::warn!("[启动初始化] 持久化 profileArn 更新失败: {}", e);
+            } else {
+                tracing::info!(
+                    "[启动初始化] 已成功获取并持久化 {} 个凭据的 profileArn",
+                    updated_count
+                );
+            }
+        }
+    }
+
     /// 获取配置的引用
     pub fn config(&self) -> &Config {
         &self.config
@@ -687,6 +1037,56 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
+    /// 获取"支持指定模型"的可用凭据数量
+    ///
+    /// 注意：`normalized_model` 必须是 `normalize_model_for_credential_policy` 的返回值（canonical id）。
+    fn available_count_for_model(&self, normalized_model: &str) -> usize {
+        self.entries
+            .lock()
+            .iter()
+            .filter(|e| {
+                !e.disabled && is_model_enabled_for_credential(&e.credentials, normalized_model)
+            })
+            .count()
+    }
+
+    fn configured_count_for_model(&self, normalized_model: &str) -> usize {
+        self.entries
+            .lock()
+            .iter()
+            .filter(|e| is_model_enabled_for_credential(&e.credentials, normalized_model))
+            .count()
+    }
+
+    fn reactivate_failure_disabled_credentials(&self, normalized_model: Option<&str>) -> bool {
+        let mut entries = self.entries.lock();
+        let should_reactivate = entries.iter().any(|e| {
+            e.disabled
+                && e.disabled_reason == Some(DisabledReason::TooManyFailures)
+                && normalized_model
+                    .map(|m| is_model_enabled_for_credential(&e.credentials, m))
+                    .unwrap_or(true)
+        });
+
+        if !should_reactivate {
+            return false;
+        }
+
+        tracing::warn!("所有候选凭据均因连续失败被自动禁用，重置失败计数并重新启用");
+        for entry in entries.iter_mut() {
+            if entry.disabled_reason == Some(DisabledReason::TooManyFailures)
+                && normalized_model
+                    .map(|m| is_model_enabled_for_credential(&entry.credentials, m))
+                    .unwrap_or(true)
+            {
+                entry.disabled = false;
+                entry.disabled_reason = None;
+                entry.failure_count = 0;
+            }
+        }
+        true
+    }
+
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
@@ -696,6 +1096,8 @@ impl MultiTokenManager {
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
+
+        let normalized_model = model.and_then(normalize_model_for_credential_policy);
 
         // 检查是否是 opus 模型
         let is_opus = model
@@ -712,6 +1114,9 @@ impl MultiTokenManager {
                 // 如果是 opus 模型，需要检查订阅等级
                 if is_opus && !e.credentials.supports_opus() {
                     return false;
+                }
+                if let Some(m) = normalized_model {
+                    return is_model_enabled_for_credential(&e.credentials, m);
                 }
                 true
             })
@@ -749,19 +1154,74 @@ impl MultiTokenManager {
     ///
     /// 如果 Token 过期或即将过期，会自动刷新
     /// Token 刷新失败会累计到当前凭据，达到阈值后禁用并切换
+    pub async fn acquire_context(&self) -> anyhow::Result<CallContext> {
+        self.acquire_context_for_model(None).await
+    }
+
+    /// 获取 API 调用上下文（按模型过滤可用凭据）
     ///
-    /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+    /// - 若模型可归一化到默认模型集合，则只在"启用该模型"的凭据中选择
+    /// - 若模型无法归一化（未知模型），保持原行为（不做过滤）
+    pub async fn acquire_context_for_model(
+        &self,
+        model: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
+        let normalized_model = model.and_then(normalize_model_for_credential_policy);
+
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
         let total = self.total_count();
+        if total == 0 {
+            anyhow::bail!("没有配置任何凭据");
+        }
+
+        // 如果模型可归一化但配置层面没有任何凭据支持该模型，直接失败。
+        if let Some(m) = normalized_model {
+            let configured = self.configured_count_for_model(m);
+            if configured == 0 {
+                anyhow::bail!(
+                    "没有任何凭据支持模型 {}（canonical: {}）",
+                    model.unwrap_or(m),
+                    m
+                );
+            }
+        }
+
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
 
         loop {
+            // 未知模型：保持原行为（用 total 做上限）
+            // 已知模型：只在 eligible 集合内尝试
+            let max_tries = match normalized_model {
+                Some(m) => self.available_count_for_model(m),
+                None => self.available_count(),
+            };
+
+            if max_tries == 0 {
+                if self.reactivate_failure_disabled_credentials(normalized_model) {
+                    continue;
+                }
+                if let Some(m) = normalized_model {
+                    anyhow::bail!(
+                        "没有任何可用凭据支持模型 {}（canonical: {}）",
+                        model.unwrap_or(m),
+                        m
+                    );
+                }
+                anyhow::bail!("所有凭据均已禁用（0/{}）", total);
+            }
+
             if attempt_count >= max_attempts {
                 anyhow::bail!(
-                    "所有凭据均无法获取有效 Token（可用: {}/{}）",
-                    self.available_count(),
+                    "所有{}凭据均无法获取有效 Token（可用: {}/{}）",
+                    if normalized_model.is_some() {
+                        "支持该模型的"
+                    } else {
+                        ""
+                    },
+                    max_tries,
                     total
                 );
             }
@@ -769,7 +1229,20 @@ impl MultiTokenManager {
             let (id, credentials) = {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
+                let supports = |e: &CredentialEntry| -> bool {
+                    if e.disabled {
+                        return false;
+                    }
+                    if is_opus && !e.credentials.supports_opus() {
+                        return false;
+                    }
+                    match normalized_model {
+                        Some(m) => is_model_enabled_for_credential(&e.credentials, m),
+                        None => true,
+                    }
+                };
+
+                // balanced 模式：每次请求都轮询选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
                 let current_hit = if is_balanced {
                     None
@@ -778,7 +1251,7 @@ impl MultiTokenManager {
                     let current_id = *self.current_id.lock();
                     entries
                         .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
+                        .find(|e| e.id == current_id && supports(e))
                         .map(|e| (e.id, e.credentials.clone()))
                 };
 
@@ -820,6 +1293,44 @@ impl MultiTokenManager {
                         // 因为 available_count() 会尝试获取 entries 锁，
                         // 而此时我们已经持有该锁，会导致死锁
                         let available = entries.iter().filter(|e| !e.disabled).count();
+                        if available == 0 {
+                            anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                        }
+
+                        if is_opus {
+                            let eligible_opus = entries
+                                .iter()
+                                .filter(|e| !e.disabled && e.credentials.supports_opus())
+                                .count();
+                            if eligible_opus == 0 {
+                                anyhow::bail!(
+                                    "没有任何可用凭据支持模型 {}（需要付费订阅，available: {}/{}）",
+                                    model.unwrap_or("opus"),
+                                    available,
+                                    total
+                                );
+                            }
+                        }
+
+                        if let Some(m) = normalized_model {
+                            let eligible = entries
+                                .iter()
+                                .filter(|e| {
+                                    supports(e)
+                                        && is_model_enabled_for_credential(&e.credentials, m)
+                                })
+                                .count();
+                            if eligible == 0 {
+                                anyhow::bail!(
+                                    "没有任何可用凭据支持模型 {}（canonical: {}，可用: {}/{}）",
+                                    model.unwrap_or(m),
+                                    m,
+                                    available,
+                                    total
+                                );
+                            }
+                        }
+
                         anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                     }
                 }
@@ -831,15 +1342,14 @@ impl MultiTokenManager {
                     return Ok(ctx);
                 }
                 Err(e) => {
-                    // refreshToken 永久失效 → 立即禁用，不累计重试
-                    let has_available =
-                        if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
-                            tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
-                            self.report_refresh_token_invalid(id)
-                        } else {
-                            tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
-                            self.report_refresh_failure(id)
-                        };
+                    // refreshToken 永久失效：立即禁用，不累计重试
+                    let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                        tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
+                        self.report_refresh_token_invalid(id)
+                    } else {
+                        tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
+                        self.report_refresh_failure(id)
+                    };
                     attempt_count += 1;
                     if !has_available {
                         anyhow::bail!("所有凭据均已禁用（0/{}）", total);
@@ -1389,6 +1899,19 @@ impl MultiTokenManager {
         }
     }
 
+    /// 获取使用额度信息
+    pub async fn get_usage_limits(&self) -> anyhow::Result<UsageLimitsResponse> {
+        let ctx = self.acquire_context().await?;
+        let effective_proxy = ctx.credentials.effective_proxy(self.proxy.as_ref());
+        get_usage_limits(
+            &ctx.credentials,
+            &self.config,
+            &ctx.token,
+            effective_proxy.as_ref(),
+        )
+        .await
+    }
+
     // ========================================================================
     // Admin API 方法
     // ========================================================================
@@ -1411,7 +1934,8 @@ impl MultiTokenManager {
                         Some("api_key".to_string())
                     } else {
                         e.credentials.auth_method.as_deref().map(|m| {
-                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
+                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam")
+                            {
                                 "idc".to_string()
                             } else {
                                 m.to_string()
@@ -1440,19 +1964,25 @@ impl MultiTokenManager {
                         None
                     },
                     email: e.credentials.email.clone(),
+                    account_email: e.credentials.account_email.clone(),
+                    user_id: e.credentials.user_id.clone(),
+                    enabled_models: e.credentials.enabled_models.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
-                    disabled_reason: e.disabled_reason.map(|r| match r {
-                        DisabledReason::Manual => "Manual",
-                        DisabledReason::TooManyFailures => "TooManyFailures",
-                        DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
-                        DisabledReason::QuotaExceeded => "QuotaExceeded",
-                        DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
-                        DisabledReason::InvalidConfig => "InvalidConfig",
-                    }.to_string()),
+                    disabled_reason: e.disabled_reason.map(|r| {
+                        match r {
+                            DisabledReason::Manual => "Manual",
+                            DisabledReason::TooManyFailures => "TooManyFailures",
+                            DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
+                            DisabledReason::QuotaExceeded => "QuotaExceeded",
+                            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
+                            DisabledReason::InvalidConfig => "InvalidConfig",
+                        }
+                        .to_string()
+                    }),
                     endpoint: e.credentials.endpoint.clone(),
                 })
                 .collect(),
@@ -1481,6 +2011,25 @@ impl MultiTokenManager {
             }
         }
         // 持久化更改
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置凭据启用模型列表（Admin API）
+    ///
+    /// - 入参会被归一化为 canonical id
+    /// - 全开会存为 None（表示未配置，向后兼容）
+    /// - 空数组会存为 Some(vec![])（表示不启用任何模型）
+    pub fn set_enabled_models(&self, id: u64, enabled_models: Vec<String>) -> anyhow::Result<()> {
+        let normalized = normalize_enabled_models_for_persist(enabled_models)?;
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.enabled_models = normalized;
+        }
         self.persist_credentials()?;
         Ok(())
     }
@@ -1514,10 +2063,7 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             if entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
-                anyhow::bail!(
-                    "凭据 #{} 因配置无效被禁用，请修正配置后重启服务",
-                    id
-                );
+                anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
             }
             entry.failure_count = 0;
             entry.refresh_failure_count = 0;
@@ -1602,7 +2148,8 @@ impl MultiTokenManager {
         };
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let usage_limits =
+            get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -1611,8 +2158,7 @@ impl MultiTokenManager {
                 if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                     let old_title = entry.credentials.subscription_title.clone();
                     if old_title.as_deref() != Some(subscription_title) {
-                        entry.credentials.subscription_title =
-                            Some(subscription_title.to_string());
+                        entry.credentials.subscription_title = Some(subscription_title.to_string());
                         tracing::info!(
                             "凭据 #{} 订阅等级已更新: {:?} -> {}",
                             id,
@@ -1636,6 +2182,101 @@ impl MultiTokenManager {
         }
 
         Ok(usage_limits)
+    }
+
+    /// 获取指定凭据的账号信息（Admin API）
+    ///
+    /// 调用 Kiro Web Portal API 获取账号聚合信息（用量、邮箱、订阅等）
+    pub async fn get_account_info_for(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<crate::kiro::web_portal::AccountAggregateInfo> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        // 检查是否需要刷新 token
+        let needs_refresh = is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
+
+        let (token, updated_creds) = if needs_refresh {
+            let _guard = self.refresh_lock.lock().await;
+            let current_creds = {
+                let entries = self.entries.lock();
+                entries
+                    .iter()
+                    .find(|e| e.id == id)
+                    .map(|e| e.credentials.clone())
+                    .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+            };
+
+            if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
+                let new_creds =
+                    refresh_token(&current_creds, &self.config, self.proxy.as_ref()).await?;
+                {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                        entry.credentials = new_creds.clone();
+                    }
+                }
+                if let Err(e) = self.persist_credentials() {
+                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
+                }
+                let token = new_creds
+                    .access_token
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?;
+                (token, new_creds)
+            } else {
+                let token = current_creds
+                    .access_token
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?;
+                (token, current_creds)
+            }
+        } else {
+            let token = credentials
+                .access_token
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?;
+            (token, credentials)
+        };
+
+        // 获取 IDP（身份提供商）
+        let idp = updated_creds.provider.as_deref().unwrap_or("Google");
+
+        // 调用 Web Portal API
+        let info =
+            crate::kiro::web_portal::get_account_aggregate_info(&token, idp, self.proxy.as_ref())
+                .await?;
+
+        // 更新凭据中的 email 和 user_id（如果 API 返回了这些信息）
+        if info.email.is_some() || info.user_id.is_some() {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                if info.email.is_some() {
+                    entry.credentials.account_email = info.email.clone();
+                }
+                if info.user_id.is_some() {
+                    entry.credentials.user_id = info.user_id.clone();
+                }
+            }
+            drop(entries);
+            if let Err(e) = self.persist_credentials() {
+                tracing::warn!("更新账号信息后持久化失败: {}", e);
+            }
+        }
+
+        Ok(info)
+    }
+
+    /// 删除凭据（别名，用于兼容 Admin Service）
+    pub fn remove_credential(&self, id: u64) -> anyhow::Result<()> {
+        self.delete_credential(id)
     }
 
     /// 添加新凭据（Admin API）
@@ -1746,6 +2387,35 @@ impl MultiTokenManager {
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
 
+        // 5. 如果是 IdC 凭据且缺少 profileArn，尝试获取
+        let is_idc = validated_cred
+            .auth_method
+            .as_ref()
+            .map(|m| m.eq_ignore_ascii_case("idc"))
+            .unwrap_or(false)
+            || (validated_cred.client_id.is_some() && validated_cred.client_secret.is_some());
+
+        if is_idc && validated_cred.profile_arn.is_none() {
+            tracing::info!(
+                "新添加的 IdC 凭据 #{} 缺少 profileArn，正在尝试获取...",
+                new_id
+            );
+            match fetch_profile_arn_for_idc(&validated_cred, &self.config, self.proxy.as_ref())
+                .await
+            {
+                Ok(Some(arn)) => {
+                    tracing::info!("凭据 #{} 成功获取 profileArn: {}", new_id, arn);
+                    validated_cred.profile_arn = Some(arn);
+                }
+                Ok(None) => {
+                    tracing::warn!("凭据 #{} 未找到可用的 profileArn", new_id);
+                }
+                Err(e) => {
+                    tracing::warn!("凭据 #{} 获取 profileArn 失败: {}", new_id, e);
+                }
+            }
+        }
+
         {
             let mut entries = self.entries.lock();
             entries.push(CredentialEntry {
@@ -1852,8 +2522,7 @@ impl MultiTokenManager {
 
         // 无条件调用 refresh_token
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let new_creds =
-            refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
+        let new_creds = refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
 
         // 更新 entries 中对应凭据
         {
@@ -2072,11 +2741,13 @@ mod tests {
 
         let result = manager.add_credential(duplicate).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("kiroApiKey 重复"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("kiroApiKey 重复")
+        );
     }
 
     #[tokio::test]
@@ -2090,11 +2761,13 @@ mod tests {
 
         let result = manager.add_credential(cred).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("kiroApiKey 为空"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("kiroApiKey 为空")
+        );
     }
 
     #[tokio::test]
@@ -2108,11 +2781,13 @@ mod tests {
 
         let result = manager.add_credential(cred).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("缺少 kiroApiKey"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("缺少 kiroApiKey")
+        );
     }
 
     #[tokio::test]
@@ -2277,21 +2952,14 @@ mod tests {
 
     #[test]
     fn test_set_load_balancing_mode_persists_to_config_file() {
-        let config_path = std::env::temp_dir().join(format!(
-            "kiro-load-balancing-{}.json",
-            uuid::Uuid::new_v4()
-        ));
+        let config_path =
+            std::env::temp_dir().join(format!("kiro-load-balancing-{}.json", uuid::Uuid::new_v4()));
         std::fs::write(&config_path, r#"{"loadBalancingMode":"priority"}"#).unwrap();
 
         let config = Config::load(&config_path).unwrap();
-        let manager = MultiTokenManager::new(
-            config,
-            vec![KiroCredentials::default()],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
 
         manager
             .set_load_balancing_mode("balanced".to_string())
@@ -2305,7 +2973,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multi_token_manager_acquire_context_auto_recovers_all_disabled() {
+    async fn test_multi_token_manager_acquire_context_auto_recovers_all_disabled()
+    -> anyhow::Result<()> {
         let config = Config::default();
         let mut cred1 = KiroCredentials::default();
         cred1.access_token = Some("t1".to_string());
@@ -2314,8 +2983,7 @@ mod tests {
         cred2.access_token = Some("t2".to_string());
         cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false)?;
 
         // 凭据会自动分配 ID（从 1 开始）
         for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
@@ -2328,13 +2996,15 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context().await?;
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled() {
+    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled()
+    -> anyhow::Result<()> {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
 
@@ -2347,22 +3017,21 @@ mod tests {
         good_cred.access_token = Some("good-token".to_string());
         good_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-        let manager =
-            MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false)?;
 
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context().await?;
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
+        Ok(())
     }
 
     #[test]
-    fn test_multi_token_manager_report_refresh_failure() {
+    fn test_multi_token_manager_report_refresh_failure() -> anyhow::Result<()> {
         let config = Config::default();
         let cred1 = KiroCredentials::default();
         let cred2 = KiroCredentials::default();
 
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false)?;
 
         assert_eq!(manager.available_count(), 2);
         for _ in 0..(MAX_FAILURES_PER_CREDENTIAL - 1) {
@@ -2374,20 +3043,25 @@ mod tests {
         assert_eq!(manager.available_count(), 1);
 
         let snapshot = manager.snapshot();
-        let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        let first = snapshot
+            .entries
+            .iter()
+            .find(|e| e.id == 1)
+            .ok_or_else(|| anyhow::anyhow!("未找到凭据 #1"))?;
         assert!(first.disabled);
         assert_eq!(first.refresh_failure_count, MAX_FAILURES_PER_CREDENTIAL);
         assert_eq!(snapshot.current_id, 2);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_multi_token_manager_refresh_failure_disabled_is_not_auto_recovered() {
+    async fn test_multi_token_manager_refresh_failure_disabled_is_not_auto_recovered()
+    -> anyhow::Result<()> {
         let config = Config::default();
         let cred1 = KiroCredentials::default();
         let cred2 = KiroCredentials::default();
 
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false)?;
 
         for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
             manager.report_refresh_failure(1);
@@ -2395,12 +3069,16 @@ mod tests {
         }
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = match manager.acquire_context().await {
+            Ok(_) => anyhow::bail!("所有凭据已因刷新失败禁用，acquire_context 应返回错误"),
+            Err(err) => err.to_string(),
+        };
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
             err
         );
+        Ok(())
     }
 
     #[test]
@@ -2435,7 +3113,7 @@ mod tests {
         manager.report_quota_exhausted(2);
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager.acquire_context().await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",

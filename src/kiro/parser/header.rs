@@ -274,14 +274,18 @@ mod tests {
 
     #[test]
     fn test_header_value_type_conversion() {
-        assert_eq!(
-            HeaderValueType::try_from(0).unwrap(),
-            HeaderValueType::BoolTrue
-        );
-        assert_eq!(
-            HeaderValueType::try_from(7).unwrap(),
-            HeaderValueType::String
-        );
+        let t0 = match HeaderValueType::try_from(0) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
+        assert_eq!(t0, HeaderValueType::BoolTrue);
+
+        let t7 = match HeaderValueType::try_from(7) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
+        assert_eq!(t7, HeaderValueType::String);
+
         assert!(HeaderValueType::try_from(10).is_err());
     }
 
@@ -311,7 +315,10 @@ mod tests {
         // 值类型: 7 (String)
         // 值: "ab" (长度 2)
         let data = [1u8, b'x', 7, 0, 2, b'a', b'b'];
-        let headers = parse_headers(&data, data.len()).unwrap();
+        let headers = match parse_headers(&data, data.len()) {
+            Ok(v) => v,
+            Err(e) => panic!("{:?}", e),
+        };
         assert_eq!(headers.get_string("x"), Some("ab"));
     }
 }

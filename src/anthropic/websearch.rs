@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
+use super::middleware::AppState;
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, MessagesRequest};
 
@@ -220,9 +221,16 @@ pub fn create_websearch_sse_stream(
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    output_tokens: i32,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let events =
-        generate_websearch_events(&model, &query, &tool_use_id, search_results, input_tokens);
+    let events = generate_websearch_events(
+        &model,
+        &query,
+        &tool_use_id,
+        search_results,
+        input_tokens,
+        output_tokens,
+    );
 
     stream::iter(
         events
@@ -238,6 +246,7 @@ fn generate_websearch_events(
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    output_tokens: i32,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let message_id = format!(
@@ -259,7 +268,7 @@ fn generate_websearch_events(
                 "stop_reason": null,
                 "usage": {
                     "input_tokens": input_tokens,
-                    "output_tokens": 0,
+                    "output_tokens": output_tokens,
                     "cache_creation_input_tokens": 0,
                     "cache_read_input_tokens": 0
                 }
@@ -472,9 +481,11 @@ fn generate_search_summary(query: &str, results: &Option<WebSearchResults>) -> S
 
 /// 处理 WebSearch 请求
 pub async fn handle_websearch_request(
+    state: AppState,
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
+    session_id: &str,
 ) -> Response {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
@@ -505,18 +516,45 @@ pub async fn handle_websearch_request(
         }
     };
 
-    // 4. 生成 SSE 响应
-    let model = payload.model.clone();
-    let stream =
-        create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+    // 4. 使用会话级别状态确保 token 一致性
+    // WebSearch 响应的 output_tokens 估算为 0（实际内容很少）
+    let (consistent_input, consistent_output) = state.update_session_tokens(
+        session_id,
+        input_tokens,
+        0, // WebSearch 响应的 output_tokens 很少
+    );
 
-    Response::builder()
+    // 5. 生成 SSE 响应
+    let model = payload.model.clone();
+    let stream = create_websearch_sse_stream(
+        model,
+        query,
+        tool_use_id,
+        search_results,
+        consistent_input,
+        consistent_output,
+    );
+
+    match Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(stream))
-        .unwrap()
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::error!("构建 WebSearch SSE 响应失败: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "internal_error",
+                    format!("构建响应失败: {}", e),
+                )),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// 调用 Kiro MCP API

@@ -290,6 +290,63 @@ impl EventStreamDecoder {
         }
     }
 
+    /// 重置解码器到初始状态。
+    pub fn reset(&mut self) {
+        self.buffer.clear();
+        self.state = DecoderState::Ready;
+        self.frames_decoded = 0;
+        self.error_count = 0;
+        self.bytes_skipped = 0;
+    }
+
+    /// 获取当前状态。
+    pub fn state(&self) -> DecoderState {
+        self.state
+    }
+
+    /// 检查是否处于 Ready 状态。
+    pub fn is_ready(&self) -> bool {
+        self.state == DecoderState::Ready
+    }
+
+    /// 检查是否处于 Stopped 状态。
+    pub fn is_stopped(&self) -> bool {
+        self.state == DecoderState::Stopped
+    }
+
+    /// 检查是否处于 Recovering 状态。
+    pub fn is_recovering(&self) -> bool {
+        self.state == DecoderState::Recovering
+    }
+
+    /// 获取已解码的帧数量。
+    pub fn frames_decoded(&self) -> usize {
+        self.frames_decoded
+    }
+
+    /// 获取当前连续错误计数。
+    pub fn error_count(&self) -> usize {
+        self.error_count
+    }
+
+    /// 获取跳过的字节数。
+    pub fn bytes_skipped(&self) -> usize {
+        self.bytes_skipped
+    }
+
+    /// 获取缓冲区中待处理的字节数。
+    pub fn buffer_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// 从 Stopped 状态恢复到 Ready 状态，保留缓冲区内容。
+    pub fn try_resume(&mut self) {
+        if self.state == DecoderState::Stopped {
+            self.error_count = 0;
+            self.state = DecoderState::Ready;
+            tracing::info!("解码器从 Stopped 状态恢复");
+        }
+    }
 }
 
 /// 解码迭代器
@@ -329,9 +386,50 @@ mod tests {
     #[test]
     fn test_decoder_insufficient_data() {
         let mut decoder = EventStreamDecoder::new();
-        decoder.feed(&[0u8; 10]).unwrap();
+        match decoder.feed(&[0u8; 10]) {
+            Ok(()) => {}
+            Err(e) => panic!("{:?}", e),
+        }
 
         let result = decoder.decode();
         assert!(matches!(result, Ok(None)));
+        assert_eq!(decoder.state(), DecoderState::Ready);
+    }
+
+    #[test]
+    fn test_decoder_reset() {
+        let mut decoder = EventStreamDecoder::new();
+        match decoder.feed(&[1, 2, 3, 4]) {
+            Ok(()) => {}
+            Err(e) => panic!("{:?}", e),
+        }
+
+        decoder.reset();
+        assert_eq!(decoder.state(), DecoderState::Ready);
+        assert_eq!(decoder.buffer_len(), 0);
+        assert_eq!(decoder.frames_decoded(), 0);
+    }
+
+    #[test]
+    fn test_decoder_state_transitions() {
+        let decoder = EventStreamDecoder::new();
+
+        // 初始状态
+        assert!(decoder.is_ready());
+        assert!(!decoder.is_stopped());
+        assert!(!decoder.is_recovering());
+    }
+
+    #[test]
+    fn test_decoder_try_resume() {
+        let mut decoder = EventStreamDecoder::new();
+
+        // 手动设置为 Stopped 状态进行测试
+        decoder.state = DecoderState::Stopped;
+        decoder.error_count = 5;
+
+        decoder.try_resume();
+        assert!(decoder.is_ready());
+        assert_eq!(decoder.error_count(), 0);
     }
 }

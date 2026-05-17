@@ -24,10 +24,14 @@
 
 mod converter;
 mod handlers;
-mod middleware;
+pub mod history_manager;
+pub mod history_store;
+pub mod middleware;
 mod router;
 mod stream;
 pub mod types;
 mod websearch;
 
+pub use history_store::{HistoryStoreConfig, init_global_store, start_cleanup_task};
+pub use middleware::AppState;
 pub use router::create_router_with_provider;

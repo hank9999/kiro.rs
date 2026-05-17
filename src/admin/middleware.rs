@@ -12,6 +12,7 @@ use axum::{
 
 use super::service::AdminService;
 use super::types::AdminErrorResponse;
+use crate::anthropic::middleware::AppState;
 use crate::common::auth;
 
 /// Admin API 共享状态
@@ -21,6 +22,8 @@ pub struct AdminState {
     pub admin_api_key: String,
     /// Admin 服务
     pub service: Arc<AdminService>,
+    /// Anthropic AppState（用于访问摘要模型设置）
+    pub app_state: Option<AppState>,
 }
 
 impl AdminState {
@@ -28,7 +31,13 @@ impl AdminState {
         Self {
             admin_api_key: admin_api_key.into(),
             service: Arc::new(service),
+            app_state: None,
         }
+    }
+
+    pub fn with_app_state(mut self, app_state: AppState) -> Self {
+        self.app_state = Some(app_state);
+        self
     }
 }
 

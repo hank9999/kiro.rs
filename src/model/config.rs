@@ -87,6 +87,12 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
+    /// 智能摘要使用的模型（可选，默认 claude-sonnet-4.5）
+    /// 可选值：claude-sonnet-4.5, claude-sonnet-4, claude-haiku-4.5
+    /// 注意：不支持 claude-opus-4.5
+    #[serde(default = "default_summary_model")]
+    pub summary_model: String,
+
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
@@ -151,6 +157,10 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_summary_model() -> String {
+    "claude-sonnet-4.5".to_string()
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -180,6 +190,7 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            summary_model: default_summary_model(),
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
@@ -236,7 +247,8 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content).with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        fs::write(path, content)
+            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
     }
 }
