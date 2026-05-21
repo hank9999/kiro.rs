@@ -272,6 +272,29 @@ impl KiroCredentials {
                 .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
                 .unwrap_or(false)
     }
+
+    /// 检查是否为 AWS SSO OIDC / Builder 凭据。
+    ///
+    /// 这类凭据在实际请求阶段不应携带 `profileArn` 相关 header/body/query 参数，
+    /// 否则可能被上游判定为无效 bearer token。
+    pub fn is_aws_sso_oidc_credential(&self) -> bool {
+        self.auth_method
+            .as_deref()
+            .map(|m| m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("idc"))
+            .unwrap_or(false)
+            || (self.client_id.is_some() && self.client_secret.is_some())
+    }
+
+    /// 返回请求阶段允许携带的 profileArn。
+    ///
+    /// Social 凭据可以携带；Builder/IdC 凭据必须省略。
+    pub fn profile_arn_for_request(&self) -> Option<&str> {
+        if self.is_aws_sso_oidc_credential() {
+            None
+        } else {
+            self.profile_arn.as_deref()
+        }
+    }
 }
 
 #[cfg(test)]
