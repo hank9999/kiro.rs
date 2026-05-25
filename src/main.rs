@@ -18,6 +18,7 @@ use std::{
     sync::Arc,
 };
 
+use chrono::{DateTime, Datelike, FixedOffset, TimeZone, Utc};
 use clap::Parser;
 use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
@@ -62,6 +63,42 @@ fn resolve_log_path(config_path: &str) -> PathBuf {
         .join("kiro.log")
 }
 
+fn next_monthly_enable_time_utc(now_utc: DateTime<Utc>) -> DateTime<Utc> {
+    let utc_plus_one = FixedOffset::east_opt(3600).expect("UTC+01:00 是有效固定时区");
+    let now_local = now_utc.with_timezone(&utc_plus_one);
+
+    let mut year = now_local.year();
+    let mut month = now_local.month();
+
+    let this_month = utc_plus_one
+        .with_ymd_and_hms(year, month, 1, 0, 0, 0)
+        .single()
+        .expect("每月 1 号 00:00 在固定时区中唯一存在");
+
+    let next_local = if now_local <= this_month {
+        this_month
+    } else {
+        if month == 12 {
+            year += 1;
+            month = 1;
+        } else {
+            month += 1;
+        }
+
+        utc_plus_one
+            .with_ymd_and_hms(year, month, 1, 0, 0, 0)
+            .single()
+            .expect("每月 1 号 00:00 在固定时区中唯一存在")
+    };
+
+    next_local.with_timezone(&Utc)
+}
+
+fn duration_until(target_utc: DateTime<Utc>) -> std::time::Duration {
+    let delta = target_utc - Utc::now();
+    delta.to_std().unwrap_or_else(|_| std::time::Duration::ZERO)
+}
+
 fn init_file_logger(log_path: &Path) -> tracing_appender::non_blocking::WorkerGuard {
     if let Some(log_dir) = log_path.parent() {
         if let Err(error) = std::fs::create_dir_all(log_dir) {
@@ -88,6 +125,33 @@ fn init_file_logger(log_path: &Path) -> tracing_appender::non_blocking::WorkerGu
         .init();
 
     log_guard
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_monthly_enable_time_utc;
+    use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn next_monthly_enable_time_uses_next_month_when_after_first_utc_plus_one() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 25, 8, 0, 0).unwrap();
+        let next = next_monthly_enable_time_utc(now);
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 5, 31, 23, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn next_monthly_enable_time_keeps_current_month_before_first_utc_plus_one() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 30, 22, 30, 0).unwrap();
+        let next = next_monthly_enable_time_utc(now);
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 4, 30, 23, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn next_monthly_enable_time_runs_immediately_at_exact_first_utc_plus_one() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 30, 23, 0, 0).unwrap();
+        let next = next_monthly_enable_time_utc(now);
+        assert_eq!(next, now);
+    }
 }
 
 #[tokio::main]
@@ -191,10 +255,7 @@ async fn main() {
 
     // 校验所有凭据声明的端点都已注册
     for cred in &credentials_list {
-        let name = cred
-            .endpoint
-            .as_deref()
-            .unwrap_or(&config.default_endpoint);
+        let name = cred.endpoint.as_deref().unwrap_or(&config.default_endpoint);
         if !endpoints.contains_key(name) {
             tracing::error!(
                 "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
@@ -207,7 +268,6 @@ async fn main() {
     }
 
     let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
-
 
     // 创建 MultiTokenManager 和 KiroProvider
     let token_manager = MultiTokenManager::new(
@@ -255,10 +315,8 @@ async fn main() {
     );
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
-    let anthropic_app = anthropic::create_router_with_provider(
-        app_state.clone(),
-        Some(kiro_provider),
-    );
+    let anthropic_app =
+        anthropic::create_router_with_provider(app_state.clone(), Some(kiro_provider));
 
     // 总是构造 AdminService（用于后台周期刷新模型列表，即便 admin API 路由未启用）
     let admin_service = Arc::new(admin::AdminService::new(
@@ -303,6 +361,34 @@ async fn main() {
         });
     } else {
         tracing::info!("动态模型列表刷新已禁用，使用静态 fallback 列表");
+    }
+
+    // 每月 1 号 UTC+01:00 自动启用全部可恢复凭据。
+    // 这里仅恢复禁用状态与失败计数，配置无效的凭据仍保持禁用，避免月初反复触发无效账号。
+    {
+        let svc = admin_service.clone();
+        tokio::spawn(async move {
+            loop {
+                let next_run = next_monthly_enable_time_utc(Utc::now());
+                tracing::info!(
+                    next_run_utc = %next_run.to_rfc3339(),
+                    "凭据月初自动启用任务已计划"
+                );
+
+                tokio::time::sleep(duration_until(next_run)).await;
+
+                match svc.enable_all_credentials() {
+                    Ok(count) => tracing::info!(enabled = count, "月初自动启用凭据任务完成"),
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        "月初自动启用凭据任务失败"
+                    ),
+                }
+
+                // 防止在调度点附近因时钟精度立刻重复命中同一月份。
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
     }
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -352,6 +438,8 @@ async fn main() {
         tracing::info!("  POST /api/admin/credentials/:index/priority");
         tracing::info!("  POST /api/admin/credentials/:index/reset");
         tracing::info!("  GET  /api/admin/credentials/:index/balance");
+        tracing::info!("  POST /api/admin/credentials/query-balances-enable");
+        tracing::info!("  POST /api/admin/credentials/enable-all");
         tracing::info!("Admin UI:");
         tracing::info!("  GET  /admin");
     }

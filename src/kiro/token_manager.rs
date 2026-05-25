@@ -21,10 +21,10 @@ use std::sync::Arc;
 use crate::http_client::{ProxyConfig, ProxyPool, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::list_models::ListAvailableModelsResponse;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
-use crate::kiro::model::list_models::ListAvailableModelsResponse;
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 
@@ -970,14 +970,13 @@ impl MultiTokenManager {
                 }
                 Err(e) => {
                     // refreshToken 永久失效 → 立即禁用，不累计重试
-                    let has_available =
-                        if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
-                            tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
-                            self.report_refresh_token_invalid(id)
-                        } else {
-                            tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
-                            self.report_refresh_failure(id)
-                        };
+                    let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                        tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
+                        self.report_refresh_token_invalid(id)
+                    } else {
+                        tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
+                        self.report_refresh_failure(id)
+                    };
                     attempt_count += 1;
                     if !has_available {
                         anyhow::bail!("所有凭据均已禁用（0/{}）", total);
@@ -998,7 +997,7 @@ impl MultiTokenManager {
         if let Some(best) = entries
             .iter()
             .filter(|e| !e.disabled)
-            .min_by_key(|e| e.credentials.priority)
+            .min_by_key(|e| (e.credentials.priority, e.id))
         {
             if best.id != *current_id {
                 tracing::info!(
@@ -1009,6 +1008,9 @@ impl MultiTokenManager {
                 );
                 *current_id = best.id;
             }
+        } else if *current_id != 0 {
+            tracing::warn!("当前没有可用凭据，current_id 已重置为 0");
+            *current_id = 0;
         }
     }
 
@@ -1549,7 +1551,8 @@ impl MultiTokenManager {
                         Some("api_key".to_string())
                     } else {
                         e.credentials.auth_method.as_deref().map(|m| {
-                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
+                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam")
+                            {
                                 "idc".to_string()
                             } else {
                                 m.to_string()
@@ -1623,7 +1626,43 @@ impl MultiTokenManager {
         }
         // 持久化更改
         self.persist_credentials()?;
+        if !disabled {
+            self.select_highest_priority();
+        }
         Ok(())
+    }
+
+    /// 重新启用所有可修复凭据（Admin API / 月初定时任务）
+    ///
+    /// 对除 `InvalidConfig` 之外的所有禁用原因执行恢复，同时清空失败计数。
+    /// `InvalidConfig` 表示凭据本身缺字段，直接启用只会再次失败，因此保留禁用状态。
+    pub fn enable_all_recoverable(&self) -> anyhow::Result<usize> {
+        let enabled_count = {
+            let mut entries = self.entries.lock();
+            let mut enabled_count = 0usize;
+
+            for entry in entries.iter_mut() {
+                if entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
+                    continue;
+                }
+
+                let was_disabled = entry.disabled;
+                entry.failure_count = 0;
+                entry.refresh_failure_count = 0;
+                entry.disabled = false;
+                entry.disabled_reason = None;
+
+                if was_disabled {
+                    enabled_count += 1;
+                }
+            }
+
+            enabled_count
+        };
+
+        self.persist_credentials()?;
+        self.select_highest_priority();
+        Ok(enabled_count)
     }
 
     /// 设置凭据优先级（Admin API）
@@ -1699,10 +1738,7 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             if entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
-                anyhow::bail!(
-                    "凭据 #{} 因配置无效被禁用，请修正配置后重启服务",
-                    id
-                );
+                anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
             }
             entry.failure_count = 0;
             entry.refresh_failure_count = 0;
@@ -1711,6 +1747,7 @@ impl MultiTokenManager {
         }
         // 持久化更改
         self.persist_credentials()?;
+        self.select_highest_priority();
         Ok(())
     }
 
@@ -2315,7 +2352,8 @@ mod tests {
         let mut existing = KiroCredentials::default();
         existing.refresh_token = Some("a".repeat(150));
 
-        let manager = MultiTokenManager::new(config, vec![existing], None, None, None, false).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![existing], None, None, None, false).unwrap();
 
         let mut duplicate = KiroCredentials::default();
         duplicate.refresh_token = Some("a".repeat(150));
@@ -2350,7 +2388,8 @@ mod tests {
         existing.kiro_api_key = Some("ksk_existing_key".to_string());
         existing.auth_method = Some("api_key".to_string());
 
-        let manager = MultiTokenManager::new(config, vec![existing], None, None, None, false).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![existing], None, None, None, false).unwrap();
 
         let mut duplicate = KiroCredentials::default();
         duplicate.kiro_api_key = Some("ksk_existing_key".to_string());
@@ -2358,11 +2397,13 @@ mod tests {
 
         let result = manager.add_credential(duplicate).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("kiroApiKey 重复"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("kiroApiKey 重复")
+        );
     }
 
     #[tokio::test]
@@ -2376,11 +2417,13 @@ mod tests {
 
         let result = manager.add_credential(cred).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("kiroApiKey 为空"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("kiroApiKey 为空")
+        );
     }
 
     #[tokio::test]
@@ -2394,11 +2437,13 @@ mod tests {
 
         let result = manager.add_credential(cred).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("缺少 kiroApiKey"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("缺少 kiroApiKey")
+        );
     }
 
     #[tokio::test]
@@ -2408,7 +2453,8 @@ mod tests {
         let mut oauth_cred = KiroCredentials::default();
         oauth_cred.refresh_token = Some("a".repeat(150));
 
-        let manager = MultiTokenManager::new(config, vec![oauth_cred], None, None, None, false).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![oauth_cred], None, None, None, false).unwrap();
 
         let mut api_key_cred = KiroCredentials::default();
         api_key_cred.kiro_api_key = Some("ksk_new_key".to_string());
@@ -2478,7 +2524,8 @@ mod tests {
         good_cred.refresh_token = Some("valid_token".to_string());
 
         let manager =
-            MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, None, false).unwrap();
+            MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, None, false)
+                .unwrap();
         assert_eq!(manager.total_count(), 2);
         assert_eq!(manager.available_count(), 1); // bad_cred 被禁用，只剩 1 个可用
     }
@@ -2568,9 +2615,15 @@ mod tests {
         std::fs::write(&config_path, r#"{"loadBalancingMode":"priority"}"#).unwrap();
 
         let config = Config::load(&config_path).unwrap();
-        let manager =
-            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, None, false)
-                .unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
 
         manager
             .set_load_balancing_mode("balanced".to_string())
@@ -2674,9 +2727,15 @@ mod tests {
         std::fs::write(&config_path, r#"{"loadBalancingMode":"priority"}"#).unwrap();
 
         let config = Config::load(&config_path).unwrap();
-        let manager =
-            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, None, false)
-                .unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
 
         manager
             .set_load_balancing_mode("round_robin".to_string())
@@ -2738,7 +2797,8 @@ mod tests {
         good_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
         let manager =
-            MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, None, false).unwrap();
+            MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, None, false)
+                .unwrap();
 
         let ctx = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.id, 2);

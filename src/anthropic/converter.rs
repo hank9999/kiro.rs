@@ -179,27 +179,28 @@ Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
-/// 严格对照版本号
+///
+/// 显式版本优先；客户端传入不带 Kiro 小版本的通用模型名时，按当前
+/// 兼容默认值回退，避免 `claude-sonnet-4` / `claude-opus-4` 等常见别名
+/// 被误判为不支持。
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
     if model_lower.contains("sonnet") {
         if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-sonnet-4.5".to_string())
         } else {
-            None
+            // 默认兼容 `claude-sonnet-4`、`claude-3-5-sonnet-*` 等别名。
+            Some("claude-sonnet-4.5".to_string())
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-opus-4.6".to_string())
-        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
+        if model_lower.contains("4-7") || model_lower.contains("4.7") {
             Some("claude-opus-4.7".to_string())
+        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
+            Some("claude-opus-4.5".to_string())
         } else {
-            None
+            // 默认兼容 `claude-opus-4` 等别名；README 中约定 opus 其他版本走 4.6。
+            Some("claude-opus-4.6".to_string())
         }
     } else if model_lower.contains("haiku") {
         Some("claude-haiku-4.5".to_string())
@@ -215,7 +216,13 @@ pub fn map_model(model: &str) -> Option<String> {
 /// 4.7 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
-        Some(mapped) if mapped == "claude-sonnet-4.6" || mapped == "claude-opus-4.6" || mapped == "claude-opus-4.7" => 1_000_000,
+        Some(mapped)
+            if mapped == "claude-sonnet-4.6"
+                || mapped == "claude-opus-4.6"
+                || mapped == "claude-opus-4.7" =>
+        {
+            1_000_000
+        }
         _ => 200_000,
     }
 }
@@ -2096,7 +2103,10 @@ mod tests {
             .filter_map(|msg| match msg {
                 Message::User(user_msg) => {
                     let content = &user_msg.user_input_message.content;
-                    let tool_results = &user_msg.user_input_message.user_input_message_context.tool_results;
+                    let tool_results = &user_msg
+                        .user_input_message
+                        .user_input_message_context
+                        .tool_results;
                     if !content.is_empty() && !tool_results.is_empty() {
                         Some((content.clone(), tool_results.len()))
                     } else {
@@ -2180,7 +2190,11 @@ mod tests {
         let result = convert_request(&req).expect("转换应成功");
         let state = result.conversation_state;
 
-        assert_eq!(state.history.len(), 2, "末尾 tool_result 不应残留在 history");
+        assert_eq!(
+            state.history.len(),
+            2,
+            "末尾 tool_result 不应残留在 history"
+        );
 
         let current_tool_results = &state
             .current_message
@@ -2237,12 +2251,12 @@ mod tests {
 
         assert_eq!(state.history.len(), 2, "末尾 user 当前轮不应被拆进 history");
         assert_eq!(
-            state.current_message.user_input_message.content,
-            "please summarize",
+            state.current_message.user_input_message.content, "please summarize",
             "当前消息应保留末尾文本"
         );
         assert_eq!(
-            state.current_message
+            state
+                .current_message
                 .user_input_message
                 .user_input_message_context
                 .tool_results

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, WalletCards } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -16,7 +16,7 @@ import { ActivityMonitor } from '@/components/activity-monitor'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { ApiKeyManagement } from '@/components/api-key-management'
 import { ProxySettings } from '@/components/proxy-settings'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
+import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useQueryAllBalancesAndEnable } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
@@ -59,6 +59,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
+  const queryAllBalancesAndEnable = useQueryAllBalancesAndEnable()
 
   // 计算分页
   const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
@@ -407,6 +408,40 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
   }
 
+  // 一键查询所有凭据额度，并自动启用仍有剩余额度的账号
+  const handleQueryAllBalancesAndEnable = () => {
+    if (!data?.credentials || data.credentials.length === 0) {
+      toast.error('当前没有可查询的凭据')
+      return
+    }
+
+    queryAllBalancesAndEnable.mutate(undefined, {
+      onSuccess: (response) => {
+        const nextBalanceMap = new Map<number, BalanceResponse>()
+        response.results.forEach((item) => {
+          if (item.balance) {
+            nextBalanceMap.set(item.id, item.balance)
+          }
+        })
+        setBalanceMap(nextBalanceMap)
+        queryClient.invalidateQueries({ queryKey: ['credentials'] })
+
+        if (response.failed === 0) {
+          toast.success(
+            `查询完成：${response.success}/${response.total} 个成功，${response.withRemaining} 个有余额，已启用 ${response.enabled} 个账号`
+          )
+        } else {
+          toast.warning(
+            `查询完成：成功 ${response.success} 个，失败 ${response.failed} 个，${response.withRemaining} 个有余额，已启用 ${response.enabled} 个账号`
+          )
+        }
+      },
+      onError: (error) => {
+        toast.error(`一键查询失败: ${extractErrorMessage(error)}`)
+      },
+    })
+  }
+
   // 批量验活
   const handleBatchVerify = async () => {
     if (selectedIds.size === 0) {
@@ -686,13 +721,25 @@ export function Dashboard({ onLogout }: DashboardProps) {
               )}
               {data?.credentials && data.credentials.length > 0 && (
                 <Button
+                  onClick={handleQueryAllBalancesAndEnable}
+                  size="sm"
+                  variant="default"
+                  disabled={queryAllBalancesAndEnable.isPending}
+                  title="查询全部凭据额度，并自动启用仍有剩余额度的账号"
+                >
+                  <WalletCards className={`h-4 w-4 mr-2 ${queryAllBalancesAndEnable.isPending ? 'animate-pulse' : ''}`} />
+                  {queryAllBalancesAndEnable.isPending ? '全量查询中...' : '一键查询额度并启用'}
+                </Button>
+              )}
+              {data?.credentials && data.credentials.length > 0 && (
+                <Button
                   onClick={handleQueryCurrentPageInfo}
                   size="sm"
                   variant="outline"
-                  disabled={queryingInfo}
+                  disabled={queryingInfo || queryAllBalancesAndEnable.isPending}
                 >
                   <RefreshCw className={`h-4 w-4 mr-2 ${queryingInfo ? 'animate-spin' : ''}`} />
-                  {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询信息'}
+                  {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询当前页'}
                 </Button>
               )}
               {data?.credentials && data.credentials.length > 0 && (

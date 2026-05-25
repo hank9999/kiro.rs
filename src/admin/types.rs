@@ -178,6 +178,44 @@ pub struct BalanceResponse {
     pub next_reset_at: Option<f64>,
 }
 
+// ============ 批量余额查询 ============
+
+/// 单个凭据的批量余额查询与启用结果
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchCredentialBalanceItem {
+    /// 凭据 ID
+    pub id: u64,
+    /// 查询是否成功
+    pub success: bool,
+    /// 是否在本次操作中被启用
+    pub enabled: bool,
+    /// 查询成功时的余额数据
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<BalanceResponse>,
+    /// 查询失败或启用失败时的错误信息
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// 批量查询所有凭据余额并自动启用有余额账号响应
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchCredentialBalanceResponse {
+    /// 处理的凭据总数
+    pub total: usize,
+    /// 余额查询成功数
+    pub success: usize,
+    /// 余额查询失败数
+    pub failed: usize,
+    /// 查询后确认有剩余额度的凭据数
+    pub with_remaining: usize,
+    /// 本次自动启用的凭据数
+    pub enabled: usize,
+    /// 逐凭据结果
+    pub results: Vec<BatchCredentialBalanceItem>,
+}
+
 // ============ 负载均衡配置 ============
 
 /// 负载均衡模式响应

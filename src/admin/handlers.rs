@@ -109,6 +109,34 @@ pub async fn get_credential_balance(
     }
 }
 
+/// POST /api/admin/credentials/query-balances-enable
+/// 查询所有凭据余额，并自动启用有剩余额度的账号
+pub async fn query_all_credential_balances_and_enable(
+    State(state): State<AdminState>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .query_all_balances_and_enable_remaining()
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/enable-all
+/// 启用所有可恢复凭据
+pub async fn enable_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.enable_all_credentials() {
+        Ok(count) => Json(SuccessResponse::new(format!(
+            "已启用 {} 个凭据（配置无效的凭据会保留禁用）",
+            count
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials
 /// 添加新凭据
 pub async fn add_credential(
@@ -295,11 +323,7 @@ pub async fn update_credential_proxy(
     Json(payload): Json<UpdateCredentialProxyRequest>,
 ) -> impl IntoResponse {
     match state.service.update_credential_proxy(id, payload).await {
-        Ok(_) => Json(SuccessResponse::new(format!(
-            "凭据 #{} 代理已更新",
-            id
-        )))
-        .into_response(),
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 代理已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

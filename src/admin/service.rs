@@ -20,16 +20,14 @@ use crate::shared_state::ModelsCacheHandle;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddApiKeyRequest, AddCredentialRequest, AddCredentialResponse, ApiKeyInfo,
-    ApiKeysListResponse, BalanceResponse, CredentialStatusItem, CredentialsStatusResponse,
-    GenerateApiKeyRequest, GenerateApiKeyResponse, LoadBalancingModeResponse, LogsResponse,
-    ProxyPoolDto, ProxyPoolStatusResponse, ProxyPoolTemplateDto, ProxyTestItem,
-    ProxyTestResponse, SetLoadBalancingModeRequest, TestProxyPoolRequest,
-    UpdateApiKeyRequest, UpdateCredentialProxyRequest,
+    AddApiKeyRequest, AddCredentialRequest, AddCredentialResponse, ApiKeyInfo, ApiKeysListResponse,
+    BalanceResponse, BatchCredentialBalanceItem, BatchCredentialBalanceResponse,
+    CredentialStatusItem, CredentialsStatusResponse, GenerateApiKeyRequest, GenerateApiKeyResponse,
+    LoadBalancingModeResponse, LogsResponse, ProxyPoolDto, ProxyPoolStatusResponse,
+    ProxyPoolTemplateDto, ProxyTestItem, ProxyTestResponse, SetLoadBalancingModeRequest,
+    TestProxyPoolRequest, UpdateApiKeyRequest, UpdateCredentialProxyRequest,
 };
-use crate::model::config::{
-    ApiKeyConfig, Config, ProxyPoolConfig, ProxyPoolTemplate,
-};
+use crate::model::config::{ApiKeyConfig, Config, ProxyPoolConfig, ProxyPoolTemplate};
 use std::time::{Duration, Instant};
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -163,6 +161,13 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id))
     }
 
+    /// 启用全部可恢复凭据
+    pub fn enable_all_credentials(&self) -> Result<usize, AdminServiceError> {
+        self.token_manager
+            .enable_all_recoverable()
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+    }
+
     /// 获取凭据余额（带缓存）
     pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
         // 先查缓存
@@ -181,17 +186,7 @@ impl AdminService {
         let balance = self.fetch_balance(id).await?;
 
         // 更新缓存
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.insert(
-                id,
-                CachedBalance {
-                    cached_at: Utc::now().timestamp() as f64,
-                    data: balance.clone(),
-                },
-            );
-        }
-        self.save_balance_cache();
+        self.update_balance_cache(id, &balance);
 
         Ok(balance)
     }
@@ -222,6 +217,111 @@ impl AdminService {
             usage_percentage,
             next_reset_at: usage.next_date_reset,
         })
+    }
+
+    /// 查询所有凭据余额，并自动启用仍有剩余额度的账号
+    pub async fn query_all_balances_and_enable_remaining(
+        &self,
+    ) -> Result<BatchCredentialBalanceResponse, AdminServiceError> {
+        let snapshot = self.token_manager.snapshot();
+        let mut results = Vec::with_capacity(snapshot.entries.len());
+        let mut success = 0usize;
+        let mut failed = 0usize;
+        let mut with_remaining = 0usize;
+        let mut enabled = 0usize;
+
+        for entry in snapshot.entries {
+            let id = entry.id;
+
+            match self.fetch_balance(id).await {
+                Ok(balance) => {
+                    if balance.remaining > 0.0 {
+                        with_remaining += 1;
+
+                        match self.token_manager.reset_and_enable(id) {
+                            Ok(()) => {
+                                success += 1;
+                                if entry.disabled {
+                                    enabled += 1;
+                                }
+                                self.update_balance_cache(id, &balance);
+                                results.push(BatchCredentialBalanceItem {
+                                    id,
+                                    success: true,
+                                    enabled: entry.disabled,
+                                    balance: Some(balance),
+                                    error: None,
+                                });
+                            }
+                            Err(error) => {
+                                failed += 1;
+                                results.push(BatchCredentialBalanceItem {
+                                    id,
+                                    success: false,
+                                    enabled: false,
+                                    balance: Some(balance),
+                                    error: Some(error.to_string()),
+                                });
+                            }
+                        }
+                    } else {
+                        success += 1;
+                        self.update_balance_cache(id, &balance);
+                        results.push(BatchCredentialBalanceItem {
+                            id,
+                            success: true,
+                            enabled: false,
+                            balance: Some(balance),
+                            error: None,
+                        });
+                    }
+                }
+                Err(error) => {
+                    failed += 1;
+                    results.push(BatchCredentialBalanceItem {
+                        id,
+                        success: false,
+                        enabled: false,
+                        balance: None,
+                        error: Some(error.to_string()),
+                    });
+                }
+            }
+        }
+
+        if enabled > 0 {
+            tracing::info!(
+                total = results.len(),
+                success,
+                failed,
+                with_remaining,
+                enabled,
+                "已完成批量额度查询并自动启用有余额凭据"
+            );
+        }
+
+        Ok(BatchCredentialBalanceResponse {
+            total: results.len(),
+            success,
+            failed,
+            with_remaining,
+            enabled,
+            results,
+        })
+    }
+
+    fn update_balance_cache(&self, id: u64, balance: &BalanceResponse) {
+        {
+            let mut cache = self.balance_cache.lock();
+            cache.insert(
+                id,
+                CachedBalance {
+                    cached_at: Utc::now().timestamp() as f64,
+                    data: balance.clone(),
+                },
+            );
+        }
+        self.save_balance_cache();
     }
 
     /// 添加新凭据
@@ -356,10 +456,7 @@ impl AdminService {
             return Err(AdminServiceError::UpstreamError(msg));
         }
 
-        let default_id = response
-            .default_model
-            .as_ref()
-            .map(|m| m.model_id.clone());
+        let default_id = response.default_model.as_ref().map(|m| m.model_id.clone());
 
         let count = models.len();
         let filtered_out = total_upstream.saturating_sub(count);
@@ -683,13 +780,12 @@ impl AdminService {
     }
 
     /// 添加新的 API Key
-    pub fn add_api_key(
-        &self,
-        req: AddApiKeyRequest,
-    ) -> Result<ApiKeyInfo, AdminServiceError> {
+    pub fn add_api_key(&self, req: AddApiKeyRequest) -> Result<ApiKeyInfo, AdminServiceError> {
         let key = req.key.trim();
         if key.is_empty() {
-            return Err(AdminServiceError::InvalidRequest("Key 不能为空".to_string()));
+            return Err(AdminServiceError::InvalidRequest(
+                "Key 不能为空".to_string(),
+            ));
         }
 
         let mut config = Config::load(&self.config_path)
@@ -737,8 +833,8 @@ impl AdminService {
         &self,
         req: GenerateApiKeyRequest,
     ) -> Result<GenerateApiKeyResponse, AdminServiceError> {
-        use rand::{thread_rng, Rng};
         use rand::distributions::Alphanumeric;
+        use rand::{Rng, thread_rng};
 
         let length = req.length.clamp(16, 64);
         let key: String = thread_rng()
@@ -913,10 +1009,7 @@ impl AdminService {
 
         // 如果 password 字段为 "***"（占位符），保留原密码；其他情况按传入值覆盖
         if matches!(dto.password.as_deref(), Some("***")) {
-            dto.password = config
-                .proxy_pool
-                .as_ref()
-                .and_then(|p| p.password.clone());
+            dto.password = config.proxy_pool.as_ref().and_then(|p| p.password.clone());
         }
 
         let pool_cfg = dto_to_pool_config(&dto);
@@ -1053,8 +1146,16 @@ impl AdminService {
         // 检查是否至少保留一个启用的Key
         let key_to_delete = &config.api_keys[index];
         if key_to_delete.enabled {
-            let enabled_count = config.api_keys.iter().filter(|k| k.enabled && k.id != id).count();
-            let has_primary = config.api_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false);
+            let enabled_count = config
+                .api_keys
+                .iter()
+                .filter(|k| k.enabled && k.id != id)
+                .count();
+            let has_primary = config
+                .api_key
+                .as_ref()
+                .map(|k| !k.trim().is_empty())
+                .unwrap_or(false);
 
             if enabled_count == 0 && !has_primary {
                 return Err(AdminServiceError::InvalidRequest(

@@ -7,12 +7,13 @@ use axum::{
 
 use super::{
     handlers::{
-        add_api_key, add_credential, delete_api_key, delete_credential, force_refresh_token,
-        generate_api_key, get_all_credentials, get_api_keys, get_available_models,
-        get_credential_balance, get_load_balancing_mode, get_proxy_pool, get_recent_logs,
-        get_request_activity, reset_failure_count, set_credential_disabled,
-        set_credential_priority, set_load_balancing_mode, test_proxy_pool, update_api_key,
-        update_credential_proxy, update_proxy_pool,
+        add_api_key, add_credential, delete_api_key, delete_credential, enable_all_credentials,
+        force_refresh_token, generate_api_key, get_all_credentials, get_api_keys,
+        get_available_models, get_credential_balance, get_load_balancing_mode, get_proxy_pool,
+        get_recent_logs, get_request_activity, query_all_credential_balances_and_enable,
+        reset_failure_count, set_credential_disabled, set_credential_priority,
+        set_load_balancing_mode, test_proxy_pool, update_api_key, update_credential_proxy,
+        update_proxy_pool,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -28,6 +29,8 @@ use super::{
 /// - `POST /credentials/:id/reset` - 重置失败计数
 /// - `POST /credentials/:id/refresh` - 强制刷新 Token
 /// - `GET /credentials/:id/balance` - 获取凭据余额
+/// - `POST /credentials/query-balances-enable` - 查询所有凭据余额并启用有余额账号
+/// - `POST /credentials/enable-all` - 启用所有可恢复凭据
 /// - `GET /config/load-balancing` - 获取负载均衡模式
 /// - `PUT /config/load-balancing` - 设置负载均衡模式
 /// - `GET /api-keys` - 获取所有 API Keys
@@ -53,6 +56,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/models", get(get_available_models))
         .route("/activity", get(get_request_activity))
         .route("/logs", get(get_recent_logs))
+        .route(
+            "/credentials/query-balances-enable",
+            post(query_all_credential_balances_and_enable),
+        )
+        .route("/credentials/enable-all", post(enable_all_credentials))
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
@@ -66,10 +74,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/api-keys", get(get_api_keys).post(add_api_key))
         .route("/api-keys/generate", post(generate_api_key))
         .route("/api-keys/{id}", put(update_api_key).delete(delete_api_key))
-        .route(
-            "/proxy-pool",
-            get(get_proxy_pool).put(update_proxy_pool),
-        )
+        .route("/proxy-pool", get(get_proxy_pool).put(update_proxy_pool))
         .route("/proxy-pool/test", post(test_proxy_pool))
         .route("/credentials/{id}/proxy", put(update_credential_proxy))
         .layer(middleware::from_fn_with_state(

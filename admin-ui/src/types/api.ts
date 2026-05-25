@@ -40,6 +40,24 @@ export interface BalanceResponse {
   nextResetAt: number | null;
 }
 
+// 批量余额查询结果
+export interface BatchCredentialBalanceItem {
+  id: number;
+  success: boolean;
+  enabled: boolean;
+  balance?: BalanceResponse;
+  error?: string;
+}
+
+export interface BatchCredentialBalanceResponse {
+  total: number;
+  success: number;
+  failed: number;
+  withRemaining: number;
+  enabled: number;
+  results: BatchCredentialBalanceItem[];
+}
+
 // 成功响应
 export interface SuccessResponse {
   success: boolean;

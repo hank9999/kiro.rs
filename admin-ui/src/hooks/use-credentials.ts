@@ -6,6 +6,8 @@ import {
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
+  queryAllCredentialBalancesAndEnable,
+  enableAllCredentials,
   addCredential,
   deleteCredential,
   getLoadBalancingMode,
@@ -75,6 +77,28 @@ export function useForceRefreshToken() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (id: number) => forceRefreshToken(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["credentials"] });
+    },
+  });
+}
+
+// 查询所有凭据余额，并自动启用仍有剩余额度的账号
+export function useQueryAllBalancesAndEnable() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: queryAllCredentialBalancesAndEnable,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["credentials"] });
+    },
+  });
+}
+
+// 启用所有可恢复凭据
+export function useEnableAllCredentials() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: enableAllCredentials,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["credentials"] });
     },

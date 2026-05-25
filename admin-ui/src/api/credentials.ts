@@ -3,6 +3,7 @@ import { storage } from "@/lib/storage";
 import type {
   CredentialsStatusResponse,
   BalanceResponse,
+  BatchCredentialBalanceResponse,
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
@@ -81,6 +82,20 @@ export async function getCredentialBalance(
   id: number,
 ): Promise<BalanceResponse> {
   const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`);
+  return data;
+}
+
+// 查询所有凭据余额，并自动启用仍有剩余额度的账号
+export async function queryAllCredentialBalancesAndEnable(): Promise<BatchCredentialBalanceResponse> {
+  const { data } = await api.post<BatchCredentialBalanceResponse>(
+    "/credentials/query-balances-enable",
+  );
+  return data;
+}
+
+// 启用所有可恢复凭据
+export async function enableAllCredentials(): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>("/credentials/enable-all");
   return data;
 }
 
