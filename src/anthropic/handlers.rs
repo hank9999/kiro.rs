@@ -225,6 +225,28 @@ fn map_provider_error(err: Error) -> Response {
         )
             .into_response();
     }
+
+    // Bedrock client-side validation errors (tool_use <-> tool_result mismatch, invalid message sequence, etc.)
+    // The root cause is the client's own messages array, not an upstream failure, so it must not map to 5xx
+    // otherwise it triggers an upstream cooldown that amplifies one client error into a 30+ burst of 503s
+    if err_str.contains("TOOL_USE_RESULT_MISMATCH")
+        || err_str.contains("ValidationException")
+        || err_str.contains("Expected toolResult blocks")
+    {
+        tracing::warn!(
+            error = %err,
+            "client messages array violates the protocol (Bedrock validation; mapped to 400 to avoid a false cooldown)"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                format!("Invalid message sequence rejected by upstream: {}", err),
+            )),
+        )
+            .into_response();
+    }
+
     tracing::error!("Kiro API 调用失败: {}", err);
     (
         StatusCode::BAD_GATEWAY,
