@@ -111,6 +111,17 @@ pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
     })
 }
 
+/// Checks whether the request is a "mixed-tools set that contains web_search" case
+///
+/// Mutually exclusive with [`has_web_search_tool`]: that one is the pure single-tool fast path, while this one detects
+/// the case where web_search coexists with other tools (exec, etc.) - such a request falls onto the normal chat path,
+/// where the upstream may return a tool_use with name=web_search, requiring the internal agentic loop.
+pub(crate) fn has_web_search_among_tools(req: &MessagesRequest) -> bool {
+    req.tools.as_ref().is_some_and(|tools| {
+        tools.len() > 1 && tools.iter().any(|t| t.name == "web_search")
+    })
+}
+
 /// 从消息中提取搜索查询
 ///
 /// 读取 messages 的第一条消息的第一个内容块
@@ -445,7 +456,7 @@ fn generate_websearch_events(
 }
 
 /// 生成搜索结果摘要
-fn generate_search_summary(query: &str, results: &Option<WebSearchResults>) -> String {
+pub(crate) fn generate_search_summary(query: &str, results: &Option<WebSearchResults>) -> String {
     let mut summary = format!("Here are the search results for \"{}\":\n\n", query);
 
     if let Some(results) = results {
@@ -520,7 +531,7 @@ pub async fn handle_websearch_request(
 }
 
 /// 调用 Kiro MCP API
-async fn call_mcp_api(
+pub(crate) async fn call_mcp_api(
     provider: &crate::kiro::provider::KiroProvider,
     request: &McpRequest,
 ) -> anyhow::Result<McpResponse> {

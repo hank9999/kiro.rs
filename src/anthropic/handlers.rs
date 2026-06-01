@@ -197,7 +197,7 @@ fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
-fn map_provider_error(err: Error) -> Response {
+pub(super) fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
@@ -460,6 +460,15 @@ pub async fn post_messages(
         let status = if resp.status().is_success() { "success" } else { "error" };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
+    }
+
+    let payload_stream = payload.stream;
+    // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
+    // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
+    if websearch::has_web_search_among_tools(&payload) {
+        tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
+        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream)
+            .await;
     }
 
     // 转换请求
@@ -1105,6 +1114,15 @@ pub async fn post_messages_cc(
         let status = if resp.status().is_success() { "success" } else { "error" };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
+    }
+
+    let payload_stream = payload.stream;
+    // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
+    // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
+    if websearch::has_web_search_among_tools(&payload) {
+        tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
+        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream)
+            .await;
     }
 
     // 转换请求
