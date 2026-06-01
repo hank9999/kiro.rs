@@ -15,7 +15,9 @@ use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
 
-use super::types::{ContentBlock, MessagesRequest};
+use super::types::{ContentBlock, ImageSource, MessagesRequest};
+
+use crate::image_resize::{ResizeConfig, maybe_shrink_image};
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 /// 规范化 JSON Schema，修复工具定义中常见的类型问题
@@ -413,6 +415,16 @@ fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
 fn process_message_content(
     content: &serde_json::Value,
 ) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
+    process_message_content_dedup(content, None)
+}
+
+/// Same as `process_message_content`, but when `dedup` is `Some` it deduplicates images by SHA256:
+/// the same image (identical base64) recurring across history is kept only on first sight and later replaced with placeholder text,
+/// avoiding the same screenshot being re-sent as base64 over multiple turns and burning tokens.
+fn process_message_content_dedup(
+    content: &serde_json::Value,
+    mut dedup: Option<&mut std::collections::HashSet<String>>,
+) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
     let mut tool_results = Vec::new();
@@ -431,15 +443,17 @@ fn process_message_content(
                             }
                         }
                         "image" => {
-                            if let Some(source) = block.source {
-                                if let Some(format) = get_image_format(&source.media_type) {
-                                    images.push(KiroImage::from_base64(format, source.data));
-                                }
+                            if let Some(source) = block.source
+                                && let Some(placeholder) =
+                                    extract_kiro_image(&source, &mut dedup, &mut images)
+                            {
+                                text_parts.push(placeholder);
                             }
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
-                                let result_content = extract_tool_result_content(&block.content);
+                                let result_content =
+                                    extract_tool_result_content(&block.content, &mut dedup, &mut images);
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
@@ -478,18 +492,65 @@ fn get_image_format(media_type: &str) -> Option<String> {
     }
 }
 
+/// Converts an image block's source into a `KiroImage` and pushes it onto the top-level `images`.
+///
+/// Reuses the same conversion chain as top-level images (format validation + SHA256 dedup + resize + `from_base64`),
+/// so an image inside a tool_result is lifted into the top-level images field the same way.
+/// Returns `Some(placeholder)` when history dedup hit and the image was omitted; `None` when it was lifted or the format is unsupported.
+fn extract_kiro_image(
+    source: &ImageSource,
+    dedup: &mut Option<&mut std::collections::HashSet<String>>,
+    images: &mut Vec<KiroImage>,
+) -> Option<String> {
+    let format = get_image_format(&source.media_type)?;
+    // History dedup: an already-seen image omits its base64 and returns placeholder text
+    if let Some(seen) = dedup.as_deref_mut() {
+        let mut hasher = Sha256::new();
+        hasher.update(source.data.as_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+        if !seen.insert(digest) {
+            return Some("[image omitted: identical to an earlier screenshot]".to_string());
+        }
+    }
+    let cfg = ResizeConfig::from_env();
+    let processed = maybe_shrink_image(cfg, &format, &source.data);
+    images.push(KiroImage::from_base64(processed.format, processed.data_base64));
+    None
+}
+
 /// 提取工具结果内容
-fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
+///
+/// Text elements remain as tool_result placeholder text; blocks with `type=="image"` are extracted into a `KiroImage`
+/// and lifted to the top-level `images` (Amazon Q's `ToolResult` has no image field, so images can only go through the top-level channel).
+/// If a tool_result has only images and no text, the placeholder text "[image attached]" is used.
+fn extract_tool_result_content(
+    content: &Option<serde_json::Value>,
+    dedup: &mut Option<&mut std::collections::HashSet<String>>,
+    images: &mut Vec<KiroImage>,
+) -> String {
     match content {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(arr)) => {
             let mut parts = Vec::new();
+            let mut had_image = false;
             for item in arr {
                 if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                     parts.push(text.to_string());
+                } else if item.get("type").and_then(|v| v.as_str()) == Some("image")
+                    && let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone())
+                    && let Some(source) = block.source
+                {
+                    had_image = true;
+                    if let Some(placeholder) = extract_kiro_image(&source, dedup, images) {
+                        parts.push(placeholder);
+                    }
                 }
             }
-            parts.join("\n")
+            if parts.is_empty() && had_image {
+                "[image attached]".to_string()
+            } else {
+                parts.join("\n")
+            }
         }
         Some(v) => v.to_string(),
         None => String::new(),
@@ -779,6 +840,8 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     // 收集并配对消息
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
     let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
+    // SHA256 dedup set for images spanning the whole history; a repeated image is kept only on first sight
+    let mut image_dedup: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for i in 0..history_end_index {
         let msg = &messages[i];
@@ -794,7 +857,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
         } else if msg.role == "assistant" {
             // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
-                let merged_user = merge_user_messages(&user_buffer, model_id)?;
+                let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup)?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
             }
@@ -811,7 +874,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 
     // 处理结尾的孤立 user 消息
     if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id)?;
+        let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup)?;
         history.push(Message::User(merged_user));
 
         // 自动配对一个 "OK" 的 assistant 响应
@@ -826,13 +889,15 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 fn merge_user_messages(
     messages: &[&super::types::Message],
     model_id: &str,
+    dedup: &mut std::collections::HashSet<String>,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut all_images = Vec::new();
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
-        let (text, images, tool_results) = process_message_content(&msg.content)?;
+        let (text, images, tool_results) =
+            process_message_content_dedup(&msg.content, Some(dedup))?;
         if !text.is_empty() {
             content_parts.push(text);
         }
@@ -1892,5 +1957,112 @@ mod tests {
             }
         }
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
+    }
+
+    // base64 of a 1x1 PNG (valid PNG header, so resize just passes it through)
+    const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+
+    #[test]
+    fn test_tool_result_image_lifts_to_top_level() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // user question -> assistant tool_use -> user tool_result (with image + text)
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("take a screenshot"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tool-1", "name": "screenshot", "input": {}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": [
+                            {"type": "text", "text": "here is the screen"},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": TINY_PNG_B64}}
+                        ]}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+
+        // image is lifted to the top-level images
+        assert_eq!(msg.images.len(), 1, "image in tool_result should be lifted to top-level images");
+        assert_eq!(msg.images[0].format, "png");
+        assert_eq!(msg.images[0].source.bytes, TINY_PNG_B64);
+
+        // tool_result itself keeps only the text placeholder (image stripped out)
+        let tr = &msg.user_input_message_context.tool_results;
+        assert_eq!(tr.len(), 1);
+        assert_eq!(
+            tr[0].content[0].get("text").and_then(|v| v.as_str()),
+            Some("here is the screen"),
+            "tool_result content should keep the text and contain no base64"
+        );
+    }
+
+    #[test]
+    fn test_tool_result_text_only_unchanged() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // text-only tool_result: regression unchanged, should produce no top-level image
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("read the file"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tool-1", "name": "read", "input": {"path": "/a.txt"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "file content"}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+
+        assert!(msg.images.is_empty(), "text-only tool_result should produce no top-level image");
+        let tr = &msg.user_input_message_context.tool_results;
+        assert_eq!(tr.len(), 1);
+        assert_eq!(
+            tr[0].content[0].get("text").and_then(|v| v.as_str()),
+            Some("file content"),
+            "text-only tool_result content should be preserved as-is"
+        );
     }
 }

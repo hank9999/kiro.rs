@@ -197,6 +197,55 @@ fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
+///
+/// Also persists the upstream raw body to `logs/errors/{ts}-{request_id}-{kind}.json`,
+/// so it can be reproduced later with the `replay/` tool - this way issues like Anthropic 400 /
+/// Bedrock protocol mismatches can be diagnosed without relying on the client to resend.
+/// Image-budget warning threshold (in raw base64 chars, not decoded bytes).
+/// Emits a warning when the total base64 char count of all image content in one request exceeds this threshold.
+/// The threshold does not reject the request (the upstream makes the final call); it only gives operators more precise diagnostics.
+const IMAGE_BUDGET_WARN_BYTES: usize = 800 * 1024;
+
+/// Budget statistics for the image content in one inbound request.
+struct ImageBudget {
+    count: usize,
+    total_b64_bytes: usize,
+    largest_b64_bytes: usize,
+}
+
+/// Counts the total number of images in the payload and their base64 byte size.
+/// Looks only at inline base64 (image source.type == "base64"), skipping url-mode images (which do not
+/// go directly into a Bedrock single message body). This is a lightweight O(N) scan that does not decode base64.
+fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
+    let mut count = 0usize;
+    let mut total = 0usize;
+    let mut largest = 0usize;
+    for msg in &payload.messages {
+        if let serde_json::Value::Array(arr) = &msg.content {
+            for item in arr {
+                if item.get("type").and_then(|v| v.as_str()) != Some("image") {
+                    continue;
+                }
+                let Some(src) = item.get("source") else { continue };
+                if src.get("type").and_then(|v| v.as_str()) != Some("base64") {
+                    continue;
+                }
+                let n = src.get("data").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
+                count += 1;
+                total += n;
+                if n > largest {
+                    largest = n;
+                }
+            }
+        }
+    }
+    ImageBudget {
+        count,
+        total_b64_bytes: total,
+        largest_b64_bytes: largest,
+    }
+}
+
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
 
@@ -415,13 +464,25 @@ pub async fn post_messages(
     Extension(key_ctx): Extension<KeyContext>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    // Count the image budget on inbound to provide precise diagnostics for later context-window-full errors
+    let img_stats = count_image_budget(&payload);
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
         message_count = %payload.messages.len(),
+        image_count = %img_stats.count,
+        image_total_b64_kb = %(img_stats.total_b64_bytes / 1024),
+        image_largest_b64_kb = %(img_stats.largest_b64_bytes / 1024),
         "Received POST /v1/messages request"
     );
+    if img_stats.total_b64_bytes > IMAGE_BUDGET_WARN_BYTES {
+        tracing::warn!(
+            image_count = %img_stats.count,
+            image_total_b64_kb = %(img_stats.total_b64_bytes / 1024),
+            "incoming image payload is large; if upstream rejects with CONTENT_LENGTH_EXCEEDS_THRESHOLD, reduce image count or use lower-resolution screenshots"
+        );
+    }
     let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -1392,6 +1453,56 @@ mod tests {
 
         assert!(ids.contains(&"claude-opus-4-7"));
         assert!(ids.contains(&"claude-opus-4-7-thinking"));
+    }
+
+    #[test]
+    fn count_image_budget_handles_empty() {
+        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
+            "model": "claude-opus-4-7",
+            "max_tokens": 100,
+            "messages": []
+        }"#).unwrap();
+        let stats = count_image_budget(&req);
+        assert_eq!(stats.count, 0);
+        assert_eq!(stats.total_b64_bytes, 0);
+        assert_eq!(stats.largest_b64_bytes, 0);
+    }
+
+    #[test]
+    fn count_image_budget_counts_inline_base64() {
+        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
+            "model": "claude-opus-4-7",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA1111"}},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "BBBBBBBBBB"}},
+                    {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}}
+                ]
+            }]
+        }"#).unwrap();
+        let stats = count_image_budget(&req);
+        assert_eq!(stats.count, 2);
+        assert_eq!(stats.total_b64_bytes, 18);
+        assert_eq!(stats.largest_b64_bytes, 10);
+    }
+
+    #[test]
+    fn count_image_budget_skips_url_only_images() {
+        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
+            "model": "claude-opus-4-7",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}}
+                ]
+            }]
+        }"#).unwrap();
+        let stats = count_image_budget(&req);
+        assert_eq!(stats.count, 0);
     }
 
     #[test]
