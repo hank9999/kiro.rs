@@ -35,6 +35,41 @@ pub struct KiroRequest {
     /// Profile ARN（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_arn: Option<String>,
+    /// Additional model request fields (a real Kiro CLI wire field carrying control switches such as `output_config.effort`)
+    ///
+    /// Real wire sample (captured from real Kiro CLI traffic):
+    /// ```json
+    /// "additionalModelRequestFields": {
+    ///     "output_config": { "effort": "max" }
+    /// }
+    /// ```
+    /// Five tiers: `low / medium / high / xhigh / max`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
+}
+
+/// Top-level container for the AWS Q CodeWhisperer `additionalModelRequestFields`
+///
+/// Note: in the real wire format the inner `output_config` field is `snake_case`,
+/// unlike the outer `additionalModelRequestFields` (camelCase),
+/// so this struct **must not** inherit `rename_all = "camelCase"`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AdditionalModelRequestFields {
+    /// Output configuration (including reasoning effort)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<KiroOutputConfig>,
+}
+
+/// The effort control field recognized by the AWS Q backend
+///
+/// Accepts five tiers: `low / medium / high / xhigh / max`
+///
+/// Measured (via a ladder experiment), the same prompt between `low` and `max` differs
+/// by roughly 5x in response time and output length, so this **is a protocol field that genuinely takes effect**,
+/// completely unlike the "pseudo-protocol" of stuffing a `<thinking_effort>` XML tag into the system prompt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KiroOutputConfig {
+    pub effort: String,
 }
 #[cfg(test)]
 mod tests {

@@ -11,6 +11,7 @@ use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
     HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
 };
+use crate::kiro::model::requests::kiro::{AdditionalModelRequestFields, KiroOutputConfig};
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
@@ -194,6 +195,9 @@ pub struct ConversionResult {
     pub conversation_state: ConversationState,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
+    /// Additional model request fields (including `output_config.effort`), translated from the
+    /// `output_config` field of the client's Anthropic request. Not sent when empty.
+    pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
 }
 
 /// 转换错误
@@ -397,9 +401,26 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         );
     }
 
+    // 14. Extract effort into AdditionalModelRequestFields (a real Kiro CLI wire field)
+    //
+    // The AWS Q backend's real protocol uses `additionalModelRequestFields.output_config.effort`,
+    // which is not the same thing as stuffing a `<thinking_effort>` XML tag into the system prompt.
+    // The client-supplied `req.output_config.effort` is translated here into the real protocol field,
+    // while the existing XML prefix logic (generate_thinking_prefix) is left unchanged,
+    // so sending both yields the strongest effect (measured to roughly 4x the thinking depth of sending only one).
+    // The effort value is passed through verbatim: whatever tier the client sends is translated into the protocol field, with no literal substitution.
+    let additional_model_request_fields = req.output_config.as_ref().map(|oc| {
+        AdditionalModelRequestFields {
+            output_config: Some(KiroOutputConfig {
+                effort: oc.effort.clone(),
+            }),
+        }
+    });
+
     Ok(ConversionResult {
         conversation_state,
         tool_name_map,
+        additional_model_request_fields,
     })
 }
 

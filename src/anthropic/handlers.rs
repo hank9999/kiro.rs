@@ -484,10 +484,13 @@ pub async fn post_messages(
         }
     };
 
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
+    // Build the Kiro request (profile_arn is injected by the provider layer from the actual credentials;
+    // additional_model_request_fields comes from the client's output_config and is the real protocol field
+    // by which the AWS Q backend recognizes effort; sending it alongside the XML prefix yields the strongest effect)
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -1126,10 +1129,13 @@ pub async fn post_messages_cc(
         }
     };
 
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
+    // Build the Kiro request (profile_arn is injected by the provider layer from the actual credentials;
+    // additional_model_request_fields comes from the client's output_config and is the real protocol field
+    // by which the AWS Q backend recognizes effort; sending it alongside the XML prefix yields the strongest effect)
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
