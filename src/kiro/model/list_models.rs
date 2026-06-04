@@ -166,7 +166,10 @@ mod tests {
         assert_eq!(first.model_name.as_deref(), Some("Claude Sonnet 4.5"));
         assert_eq!(first.rate_multiplier, Some(1.3));
         assert_eq!(
-            first.token_limits.as_ref().and_then(|t| t.max_output_tokens),
+            first
+                .token_limits
+                .as_ref()
+                .and_then(|t| t.max_output_tokens),
             Some(64000)
         );
         assert_eq!(

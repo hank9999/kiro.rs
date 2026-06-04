@@ -62,7 +62,9 @@ impl AdminServiceError {
     pub fn into_response(self) -> AdminErrorResponse {
         match &self {
             AdminServiceError::NotFound { .. } => AdminErrorResponse::not_found(self.to_string()),
-            AdminServiceError::NotFoundGeneric(_) => AdminErrorResponse::not_found(self.to_string()),
+            AdminServiceError::NotFoundGeneric(_) => {
+                AdminErrorResponse::not_found(self.to_string())
+            }
             AdminServiceError::UpstreamError(_) => AdminErrorResponse::api_error(self.to_string()),
             AdminServiceError::InternalError(_) => {
                 AdminErrorResponse::internal_error(self.to_string())

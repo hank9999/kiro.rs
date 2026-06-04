@@ -586,8 +586,13 @@ pub struct MultiTokenManager {
     entries: Mutex<Vec<CredentialEntry>>,
     /// 当前活动凭据 ID
     current_id: Mutex<u64>,
-    /// Token 刷新锁，确保同一时间只有一个刷新操作
-    refresh_lock: TokioMutex<()>,
+    /// Token 刷新锁表，确保同一凭据同一时间只有一个刷新操作。
+    ///
+    /// 旧实现使用全局刷新锁，批量额度查询时 1000 个凭据会被串行刷新拖慢；这里改为
+    /// 按凭据 ID 加锁，不同凭据可在 Admin 批量任务的并发限制内并行刷新。
+    refresh_locks: Mutex<HashMap<u64, Arc<TokioMutex<()>>>>,
+    /// 凭据文件持久化锁，避免多凭据并行刷新时并发写入 `credentials.json`。
+    persist_lock: Mutex<()>,
     /// 凭据文件路径（用于回写）
     credentials_path: Option<PathBuf>,
     /// 是否为多凭据格式（数组格式才回写）
@@ -726,7 +731,8 @@ impl MultiTokenManager {
             proxy_pool: Mutex::new(proxy_pool),
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
-            refresh_lock: TokioMutex::new(()),
+            refresh_locks: Mutex::new(HashMap::new()),
+            persist_lock: Mutex::new(()),
             credentials_path,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
@@ -768,6 +774,18 @@ impl MultiTokenManager {
     /// 获取全局单代理的引用（可选）
     pub fn global_proxy(&self) -> Option<&ProxyConfig> {
         self.proxy.as_ref()
+    }
+
+    /// 获取指定凭据的刷新锁。
+    ///
+    /// 锁对象放在独立表中，避免持有 `entries` 锁等待网络刷新；同一 ID 会复用同一把锁，
+    /// 不同 ID 可并行刷新。
+    fn refresh_lock_for(&self, id: u64) -> Arc<TokioMutex<()>> {
+        let mut locks = self.refresh_locks.lock();
+        locks
+            .entry(id)
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone()
     }
 
     /// 计算凭据 Token 刷新/余额查询使用的有效代理
@@ -1043,8 +1061,9 @@ impl MultiTokenManager {
         let needs_refresh = is_token_expired(credentials) || is_token_expiring_soon(credentials);
 
         let creds = if needs_refresh {
-            // 获取刷新锁，确保同一时间只有一个刷新操作
-            let _guard = self.refresh_lock.lock().await;
+            // 获取凭据级刷新锁：同一凭据串行刷新，不同凭据允许并行刷新。
+            let refresh_lock = self.refresh_lock_for(id);
+            let _guard = refresh_lock.lock().await;
 
             // 第二次检查：获取锁后重新读取凭据，因为其他请求可能已经完成刷新
             let current_creds = {
@@ -1130,6 +1149,9 @@ impl MultiTokenManager {
             Some(p) => p,
             None => return Ok(false),
         };
+
+        // 多个凭据可以并行刷新，但磁盘回写必须串行，避免 credentials.json 互相覆盖。
+        let _persist_guard = self.persist_lock.lock();
 
         // 收集所有凭据
         let credentials: Vec<KiroCredentials> = {
@@ -1751,6 +1773,75 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 批量重置凭据失败计数并重新启用（Admin API）
+    ///
+    /// 返回值按凭据 ID 汇总：
+    /// - `Ok(true)`：本次操作前该凭据处于禁用状态，已重新启用
+    /// - `Ok(false)`：本次操作前该凭据已启用，仅清空失败计数
+    /// - `Err(String)`：凭据不存在、配置无效或持久化失败
+    ///
+    /// 与逐个调用 [`Self::reset_and_enable`] 相比，本方法只持久化一次，避免批量额度
+    /// 查询命中大量有余额账号时反复写入 `credentials.json` 导致管理接口卡顿。
+    pub fn reset_and_enable_many(&self, ids: &[u64]) -> HashMap<u64, Result<bool, String>> {
+        let mut results = HashMap::with_capacity(ids.len());
+        if ids.is_empty() {
+            return results;
+        }
+
+        let mut changed_any = false;
+        {
+            let mut entries = self.entries.lock();
+            for id in ids.iter().copied() {
+                // 当前调用方不会传重复 ID；这里仍做去重，避免重复处理和重复计数。
+                if results.contains_key(&id) {
+                    continue;
+                }
+
+                let entry = match entries.iter_mut().find(|e| e.id == id) {
+                    Some(entry) => entry,
+                    None => {
+                        results.insert(id, Err(format!("凭据不存在: {}", id)));
+                        continue;
+                    }
+                };
+
+                if entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
+                    results.insert(
+                        id,
+                        Err(format!(
+                            "凭据 #{} 因配置无效被禁用，请修正配置后重启服务",
+                            id
+                        )),
+                    );
+                    continue;
+                }
+
+                let was_disabled = entry.disabled;
+                entry.failure_count = 0;
+                entry.refresh_failure_count = 0;
+                entry.disabled = false;
+                entry.disabled_reason = None;
+                changed_any = true;
+                results.insert(id, Ok(was_disabled));
+            }
+        }
+
+        if changed_any {
+            if let Err(error) = self.persist_credentials() {
+                let message = error.to_string();
+                for result in results.values_mut() {
+                    if result.is_ok() {
+                        *result = Err(message.clone());
+                    }
+                }
+            } else {
+                self.select_highest_priority();
+            }
+        }
+
+        results
+    }
+
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
         let credentials = {
@@ -1774,7 +1865,8 @@ impl MultiTokenManager {
                 is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
 
             if needs_refresh {
-                let _guard = self.refresh_lock.lock().await;
+                let refresh_lock = self.refresh_lock_for(id);
+                let _guard = refresh_lock.lock().await;
                 let current_creds = {
                     let entries = self.entries.lock();
                     entries
@@ -1901,7 +1993,8 @@ impl MultiTokenManager {
             let needs_refresh =
                 is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
             if needs_refresh {
-                let _guard = self.refresh_lock.lock().await;
+                let refresh_lock = self.refresh_lock_for(cred_id);
+                let _guard = refresh_lock.lock().await;
                 let current_creds = {
                     let entries = self.entries.lock();
                     entries
@@ -2148,6 +2241,8 @@ impl MultiTokenManager {
         // 立即回写统计数据，清除已删除凭据的残留条目
         self.save_stats();
 
+        self.refresh_locks.lock().remove(&id);
+
         tracing::info!("已删除凭据 #{}", id);
         Ok(())
     }
@@ -2166,8 +2261,9 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
-        // 获取刷新锁防止并发刷新
-        let _guard = self.refresh_lock.lock().await;
+        // 获取凭据级刷新锁防止同一凭据并发刷新，不阻塞其他凭据刷新。
+        let refresh_lock = self.refresh_lock_for(id);
+        let _guard = refresh_lock.lock().await;
 
         // 无条件调用 refresh_token
         let effective_proxy = self.effective_proxy_for(&credentials);

@@ -456,7 +456,9 @@ impl Config {
                     continue;
                 }
                 let mut cfg = ProxyConfig::new(trimmed);
-                if let (Some(u), Some(p)) = (pool_cfg.username.as_deref(), pool_cfg.password.as_deref()) {
+                if let (Some(u), Some(p)) =
+                    (pool_cfg.username.as_deref(), pool_cfg.password.as_deref())
+                {
                     if !trimmed.contains('@') {
                         cfg = cfg.with_auth(u, p);
                     }

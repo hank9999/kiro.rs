@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
+use futures::{StreamExt, stream};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +33,12 @@ use std::time::{Duration, Instant};
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+/// 批量额度查询最大并发数。
+///
+/// 1000 个账号串行查询会被单个慢代理/慢 Token 刷新拖死；这里按需求固定为 20 路并发。
+const BATCH_BALANCE_CONCURRENCY: usize = 20;
+/// 单个凭据在批量额度查询中的总超时时间（包含必要的 Token 刷新 + 额度查询）。
+const BATCH_BALANCE_ITEM_TIMEOUT_SECS: u64 = 90;
 
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,31 +231,89 @@ impl AdminService {
         &self,
     ) -> Result<BatchCredentialBalanceResponse, AdminServiceError> {
         let snapshot = self.token_manager.snapshot();
-        let mut results = Vec::with_capacity(snapshot.entries.len());
+        let total = snapshot.entries.len();
+
+        tracing::info!(
+            total,
+            concurrency = BATCH_BALANCE_CONCURRENCY,
+            item_timeout_secs = BATCH_BALANCE_ITEM_TIMEOUT_SECS,
+            "开始批量额度查询并自动启用有余额凭据"
+        );
+
+        struct BalanceFetchOutcome {
+            index: usize,
+            id: u64,
+            result: Result<BalanceResponse, String>,
+        }
+
+        let mut fetch_outcomes = stream::iter(snapshot.entries.into_iter().enumerate().map(
+            |(index, entry)| async move {
+                let id = entry.id;
+                let result = match tokio::time::timeout(
+                    Duration::from_secs(BATCH_BALANCE_ITEM_TIMEOUT_SECS),
+                    self.fetch_balance(id),
+                )
+                .await
+                {
+                    Ok(Ok(balance)) => Ok(balance),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(_) => Err(format!(
+                        "额度查询超时（超过 {} 秒）",
+                        BATCH_BALANCE_ITEM_TIMEOUT_SECS
+                    )),
+                };
+
+                BalanceFetchOutcome { index, id, result }
+            },
+        ))
+        .buffer_unordered(BATCH_BALANCE_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+        // buffer_unordered 按完成顺序返回；恢复为原快照顺序，避免前端列表跳动。
+        fetch_outcomes.sort_by_key(|outcome| outcome.index);
+
+        let reset_ids: Vec<u64> = fetch_outcomes
+            .iter()
+            .filter_map(|outcome| match &outcome.result {
+                Ok(balance) if balance.remaining > 0.0 => Some(outcome.id),
+                _ => None,
+            })
+            .collect();
+
+        // 查询完成后批量重置并持久化一次，避免 1000 个账号逐个回写 credentials.json。
+        let mut reset_results = self.token_manager.reset_and_enable_many(&reset_ids);
+
+        let mut results = Vec::with_capacity(total);
+        let mut cache_updates = Vec::new();
         let mut success = 0usize;
         let mut failed = 0usize;
         let mut with_remaining = 0usize;
         let mut enabled = 0usize;
 
-        for entry in snapshot.entries {
-            let id = entry.id;
+        for outcome in fetch_outcomes {
+            let id = outcome.id;
 
-            match self.fetch_balance(id).await {
+            match outcome.result {
                 Ok(balance) => {
+                    cache_updates.push((id, balance.clone()));
+
                     if balance.remaining > 0.0 {
                         with_remaining += 1;
 
-                        match self.token_manager.reset_and_enable(id) {
-                            Ok(()) => {
+                        match reset_results
+                            .remove(&id)
+                            .unwrap_or_else(|| Err("内部错误: 批量重置结果缺失".to_string()))
+                        {
+                            Ok(was_disabled) => {
                                 success += 1;
-                                if entry.disabled {
+                                if was_disabled {
                                     enabled += 1;
                                 }
-                                self.update_balance_cache(id, &balance);
                                 results.push(BatchCredentialBalanceItem {
                                     id,
                                     success: true,
-                                    enabled: entry.disabled,
+                                    enabled: was_disabled,
                                     balance: Some(balance),
                                     error: None,
                                 });
@@ -266,7 +331,6 @@ impl AdminService {
                         }
                     } else {
                         success += 1;
-                        self.update_balance_cache(id, &balance);
                         results.push(BatchCredentialBalanceItem {
                             id,
                             success: true,
@@ -289,16 +353,16 @@ impl AdminService {
             }
         }
 
-        if enabled > 0 {
-            tracing::info!(
-                total = results.len(),
-                success,
-                failed,
-                with_remaining,
-                enabled,
-                "已完成批量额度查询并自动启用有余额凭据"
-            );
-        }
+        self.update_balance_cache_many(&cache_updates);
+
+        tracing::info!(
+            total = results.len(),
+            success,
+            failed,
+            with_remaining,
+            enabled,
+            "已完成批量额度查询并自动启用有余额凭据"
+        );
 
         Ok(BatchCredentialBalanceResponse {
             total: results.len(),
@@ -308,6 +372,27 @@ impl AdminService {
             enabled,
             results,
         })
+    }
+
+    fn update_balance_cache_many(&self, balances: &[(u64, BalanceResponse)]) {
+        if balances.is_empty() {
+            return;
+        }
+
+        {
+            let mut cache = self.balance_cache.lock();
+            let cached_at = Utc::now().timestamp() as f64;
+            for (id, balance) in balances {
+                cache.insert(
+                    *id,
+                    CachedBalance {
+                        cached_at,
+                        data: balance.clone(),
+                    },
+                );
+            }
+        }
+        self.save_balance_cache();
     }
 
     fn update_balance_cache(&self, id: u64, balance: &BalanceResponse) {

@@ -224,7 +224,9 @@ impl ProxyPool {
         }
 
         let pick_from = |slot: usize| -> Option<ProxyConfig> {
-            available.get(slot).and_then(|&i| self.entries.get(i).cloned())
+            available
+                .get(slot)
+                .and_then(|&i| self.entries.get(i).cloned())
         };
 
         match self.strategy {
