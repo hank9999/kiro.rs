@@ -46,6 +46,31 @@ pub struct KiroProvider {
 }
 
 impl KiroProvider {
+    /// 判断 403 响应是否表示 Kiro 用户账号被临时封禁。
+    ///
+    /// 这类错误不是 token 过期或短暂权限问题，继续刷新/重试只会浪费次数；
+    /// 直接删除对应凭据并切换到下一张凭据。
+    fn is_account_suspended_response(status: reqwest::StatusCode, body: &str) -> bool {
+        if status.as_u16() != 403 {
+            return false;
+        }
+
+        let message = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("message")
+                    .and_then(|message| message.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| body.to_string());
+        let message = message.to_ascii_lowercase();
+
+        message.contains("temporarily is suspended")
+            || message.contains("temporarily suspended")
+            || (message.contains("locked your account") && message.contains("support"))
+    }
+
     fn log_bad_request_details(
         api_type: &str,
         attempt: usize,
@@ -387,6 +412,42 @@ impl KiroProvider {
 
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
+                // 账号被 Kiro 临时封禁：该凭据不可恢复，直接删除并切换。
+                if Self::is_account_suspended_response(status, &body) {
+                    tracing::error!(
+                        "凭据 #{} 所属 Kiro 账号被临时封禁，直接删除凭据并切换",
+                        ctx.id
+                    );
+                    match self.token_manager.delete_suspended_credential(ctx.id) {
+                        Ok(true) => {
+                            last_error = Some(anyhow::anyhow!(
+                                "MCP 请求失败（账号被临时封禁，已删除凭据 #{}）: {} {}",
+                                ctx.id,
+                                status,
+                                body
+                            ));
+                            continue;
+                        }
+                        Ok(false) => {
+                            anyhow::bail!(
+                                "MCP 请求失败（账号被临时封禁，凭据 #{} 已删除，已无可用凭据）: {} {}",
+                                ctx.id,
+                                status,
+                                body
+                            );
+                        }
+                        Err(e) => {
+                            anyhow::bail!(
+                                "MCP 请求失败（账号被临时封禁，删除凭据 #{} 失败: {}）: {} {}",
+                                ctx.id,
+                                e,
+                                status,
+                                body
+                            );
+                        }
+                    }
+                }
+
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
@@ -603,6 +664,45 @@ impl KiroProvider {
                     body
                 );
 
+                // 账号被 Kiro 临时封禁：该凭据不可恢复，直接删除并切换。
+                if Self::is_account_suspended_response(status, &body) {
+                    tracing::error!(
+                        "凭据 #{} 所属 Kiro 账号被临时封禁，直接删除凭据并切换",
+                        ctx.id
+                    );
+                    match self.token_manager.delete_suspended_credential(ctx.id) {
+                        Ok(true) => {
+                            last_error = Some(anyhow::anyhow!(
+                                "{} API 请求失败（账号被临时封禁，已删除凭据 #{}）: {} {}",
+                                api_type,
+                                ctx.id,
+                                status,
+                                body
+                            ));
+                            continue;
+                        }
+                        Ok(false) => {
+                            anyhow::bail!(
+                                "{} API 请求失败（账号被临时封禁，凭据 #{} 已删除，已无可用凭据）: {} {}",
+                                api_type,
+                                ctx.id,
+                                status,
+                                body
+                            );
+                        }
+                        Err(e) => {
+                            anyhow::bail!(
+                                "{} API 请求失败（账号被临时封禁，删除凭据 #{} 失败: {}）: {} {}",
+                                api_type,
+                                ctx.id,
+                                e,
+                                status,
+                                body
+                            );
+                        }
+                    }
+                }
+
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
@@ -764,6 +864,28 @@ fn mask_proxy_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_account_suspended_response_detects_kiro_message() {
+        let body = r#"{"message":"Your User ID (8488f468-6091-7026-b62a-7fa2c4749a49) temporarily is suspended. We've locked your account as a security precaution. To restore access, please contact our support team to verify your identity: https://app.kiro.dev/account/usage?support_form","reason":null}"#;
+
+        assert!(KiroProvider::is_account_suspended_response(
+            reqwest::StatusCode::FORBIDDEN,
+            body
+        ));
+    }
+
+    #[test]
+    fn test_account_suspended_response_ignores_generic_forbidden() {
+        assert!(!KiroProvider::is_account_suspended_response(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"message":"The bearer token included in the request is invalid"}"#
+        ));
+        assert!(!KiroProvider::is_account_suspended_response(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"message":"temporarily is suspended"}"#
+        ));
+    }
 
     #[test]
     fn test_mask_proxy_url_with_auth() {
