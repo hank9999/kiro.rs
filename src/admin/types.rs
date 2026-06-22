@@ -196,6 +196,30 @@ pub struct SetLoadBalancingModeRequest {
     pub mode: String,
 }
 
+// ============ 缓存模拟配置 ============
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheSimulationResponse {
+    pub enabled: bool,
+    pub hit_probability: u8,
+    pub min_cache_ratio: u8,
+    pub max_cache_ratio: u8,
+    pub minimum_input_tokens: u32,
+    pub minimum_uncached_tokens: u32,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCacheSimulationRequest {
+    pub enabled: bool,
+    pub hit_probability: u8,
+    pub min_cache_ratio: u8,
+    pub max_cache_ratio: u8,
+    pub minimum_input_tokens: u32,
+    pub minimum_uncached_tokens: u32,
+}
+
 // ============ 通用响应 ============
 
 /// 操作成功响应

@@ -10,11 +10,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::model::config::CacheSimulationConfig;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CacheSimulationResponse,
+    CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
+    SetCacheSimulationRequest, SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -299,6 +301,52 @@ impl AdminService {
         Ok(LoadBalancingModeResponse { mode: req.mode })
     }
 
+    pub fn get_cache_simulation(&self) -> CacheSimulationResponse {
+        let value = self.token_manager.get_cache_simulation();
+        CacheSimulationResponse {
+            enabled: value.enabled,
+            hit_probability: value.hit_probability,
+            min_cache_ratio: value.min_cache_ratio,
+            max_cache_ratio: value.max_cache_ratio,
+            minimum_input_tokens: value.minimum_input_tokens,
+            minimum_uncached_tokens: value.minimum_uncached_tokens,
+        }
+    }
+
+    pub fn set_cache_simulation(
+        &self,
+        req: SetCacheSimulationRequest,
+    ) -> Result<CacheSimulationResponse, AdminServiceError> {
+        if req.hit_probability > 100 {
+            return Err(AdminServiceError::InvalidCredential(
+                "hitProbability 必须在 0 到 100 之间".to_string(),
+            ));
+        }
+        if req.min_cache_ratio > 100 || req.max_cache_ratio > 100 {
+            return Err(AdminServiceError::InvalidCredential(
+                "缓存比例必须在 0 到 100 之间".to_string(),
+            ));
+        }
+        if req.min_cache_ratio > req.max_cache_ratio {
+            return Err(AdminServiceError::InvalidCredential(
+                "最低缓存比例不能高于最高缓存比例".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_cache_simulation(CacheSimulationConfig {
+                enabled: req.enabled,
+                hit_probability: req.hit_probability,
+                min_cache_ratio: req.min_cache_ratio,
+                max_cache_ratio: req.max_cache_ratio,
+                minimum_input_tokens: req.minimum_input_tokens,
+                minimum_uncached_tokens: req.minimum_uncached_tokens,
+            })
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(self.get_cache_simulation())
+    }
+
     /// 强制刷新指定凭据的 Token
     pub async fn force_refresh_token(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
@@ -448,7 +496,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)

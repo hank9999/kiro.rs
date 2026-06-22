@@ -23,7 +23,7 @@ use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::model::config::Config;
+use crate::model::config::{CacheSimulationConfig, Config};
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -352,10 +352,7 @@ pub(crate) async fn get_usage_limits(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
         os_name, node_version, kiro_version, machine_id
     );
-    let amz_user_agent = format!(
-        "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
-        kiro_version, machine_id
-    );
+    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
@@ -522,6 +519,8 @@ pub struct MultiTokenManager {
     is_multiple_format: bool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// Anthropic usage 缓存命中模拟配置（运行时可修改）
+    cache_simulation: Mutex<CacheSimulationConfig>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -644,6 +643,7 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
+        let cache_simulation = config.cache_simulation;
         let manager = Self {
             config,
             proxy,
@@ -653,6 +653,7 @@ impl MultiTokenManager {
             credentials_path,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            cache_simulation: Mutex::new(cache_simulation),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -832,14 +833,13 @@ impl MultiTokenManager {
                 }
                 Err(e) => {
                     // refreshToken 永久失效 → 立即禁用，不累计重试
-                    let has_available =
-                        if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
-                            tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
-                            self.report_refresh_token_invalid(id)
-                        } else {
-                            tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
-                            self.report_refresh_failure(id)
-                        };
+                    let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                        tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
+                        self.report_refresh_token_invalid(id)
+                    } else {
+                        tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
+                        self.report_refresh_failure(id)
+                    };
                     attempt_count += 1;
                     if !has_available {
                         anyhow::bail!("所有凭据均已禁用（0/{}）", total);
@@ -1411,7 +1411,8 @@ impl MultiTokenManager {
                         Some("api_key".to_string())
                     } else {
                         e.credentials.auth_method.as_deref().map(|m| {
-                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
+                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam")
+                            {
                                 "idc".to_string()
                             } else {
                                 m.to_string()
@@ -1445,14 +1446,17 @@ impl MultiTokenManager {
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
-                    disabled_reason: e.disabled_reason.map(|r| match r {
-                        DisabledReason::Manual => "Manual",
-                        DisabledReason::TooManyFailures => "TooManyFailures",
-                        DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
-                        DisabledReason::QuotaExceeded => "QuotaExceeded",
-                        DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
-                        DisabledReason::InvalidConfig => "InvalidConfig",
-                    }.to_string()),
+                    disabled_reason: e.disabled_reason.map(|r| {
+                        match r {
+                            DisabledReason::Manual => "Manual",
+                            DisabledReason::TooManyFailures => "TooManyFailures",
+                            DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
+                            DisabledReason::QuotaExceeded => "QuotaExceeded",
+                            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
+                            DisabledReason::InvalidConfig => "InvalidConfig",
+                        }
+                        .to_string()
+                    }),
                     endpoint: e.credentials.endpoint.clone(),
                 })
                 .collect(),
@@ -1514,10 +1518,7 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             if entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
-                anyhow::bail!(
-                    "凭据 #{} 因配置无效被禁用，请修正配置后重启服务",
-                    id
-                );
+                anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
             }
             entry.failure_count = 0;
             entry.refresh_failure_count = 0;
@@ -1602,7 +1603,8 @@ impl MultiTokenManager {
         };
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let usage_limits =
+            get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -1611,8 +1613,7 @@ impl MultiTokenManager {
                 if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                     let old_title = entry.credentials.subscription_title.clone();
                     if old_title.as_deref() != Some(subscription_title) {
-                        entry.credentials.subscription_title =
-                            Some(subscription_title.to_string());
+                        entry.credentials.subscription_title = Some(subscription_title.to_string());
                         tracing::info!(
                             "凭据 #{} 订阅等级已更新: {:?} -> {}",
                             id,
@@ -1852,8 +1853,7 @@ impl MultiTokenManager {
 
         // 无条件调用 refresh_token
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let new_creds =
-            refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
+        let new_creds = refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
 
         // 更新 entries 中对应凭据
         {
@@ -1919,6 +1919,63 @@ impl MultiTokenManager {
         }
 
         tracing::info!("负载均衡模式已设置为: {}", mode);
+        Ok(())
+    }
+
+    pub fn get_cache_simulation(&self) -> CacheSimulationConfig {
+        *self.cache_simulation.lock()
+    }
+
+    fn persist_cache_simulation(&self, value: CacheSimulationConfig) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，缓存模拟设置仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.cache_simulation = value;
+        config
+            .save()
+            .with_context(|| format!("持久化缓存模拟设置失败: {}", config_path.display()))
+    }
+
+    pub fn set_cache_simulation(&self, value: CacheSimulationConfig) -> anyhow::Result<()> {
+        if value.hit_probability > 100 {
+            anyhow::bail!("hitProbability 必须在 0 到 100 之间");
+        }
+        if value.min_cache_ratio > 100 || value.max_cache_ratio > 100 {
+            anyhow::bail!("缓存比例必须在 0 到 100 之间");
+        }
+        if value.min_cache_ratio > value.max_cache_ratio {
+            anyhow::bail!("最低缓存比例不能高于最高缓存比例");
+        }
+
+        let previous = self.get_cache_simulation();
+        if previous == value {
+            return Ok(());
+        }
+
+        *self.cache_simulation.lock() = value;
+        if let Err(err) = self.persist_cache_simulation(value) {
+            *self.cache_simulation.lock() = previous;
+            return Err(err);
+        }
+
+        tracing::info!(
+            enabled = value.enabled,
+            hit_probability = value.hit_probability,
+            min_cache_ratio = value.min_cache_ratio,
+            max_cache_ratio = value.max_cache_ratio,
+            minimum_input_tokens = value.minimum_input_tokens,
+            minimum_uncached_tokens = value.minimum_uncached_tokens,
+            "缓存模拟设置已更新"
+        );
         Ok(())
     }
 }
@@ -2072,11 +2129,13 @@ mod tests {
 
         let result = manager.add_credential(duplicate).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("kiroApiKey 重复"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("kiroApiKey 重复")
+        );
     }
 
     #[tokio::test]
@@ -2090,11 +2149,13 @@ mod tests {
 
         let result = manager.add_credential(cred).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("kiroApiKey 为空"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("kiroApiKey 为空")
+        );
     }
 
     #[tokio::test]
@@ -2108,11 +2169,13 @@ mod tests {
 
         let result = manager.add_credential(cred).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("缺少 kiroApiKey"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("缺少 kiroApiKey")
+        );
     }
 
     #[tokio::test]
@@ -2277,21 +2340,14 @@ mod tests {
 
     #[test]
     fn test_set_load_balancing_mode_persists_to_config_file() {
-        let config_path = std::env::temp_dir().join(format!(
-            "kiro-load-balancing-{}.json",
-            uuid::Uuid::new_v4()
-        ));
+        let config_path =
+            std::env::temp_dir().join(format!("kiro-load-balancing-{}.json", uuid::Uuid::new_v4()));
         std::fs::write(&config_path, r#"{"loadBalancingMode":"priority"}"#).unwrap();
 
         let config = Config::load(&config_path).unwrap();
-        let manager = MultiTokenManager::new(
-            config,
-            vec![KiroCredentials::default()],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
 
         manager
             .set_load_balancing_mode("balanced".to_string())
@@ -2300,6 +2356,36 @@ mod tests {
         let persisted = Config::load(&config_path).unwrap();
         assert_eq!(persisted.load_balancing_mode, "balanced");
         assert_eq!(manager.get_load_balancing_mode(), "balanced");
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[test]
+    fn test_set_cache_simulation_persists_to_config_file() {
+        let config_path = std::env::temp_dir().join(format!(
+            "kiro-cache-simulation-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&config_path, "{}").unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+        let expected = CacheSimulationConfig {
+            enabled: true,
+            hit_probability: 75,
+            min_cache_ratio: 80,
+            max_cache_ratio: 90,
+            minimum_input_tokens: 1024,
+            minimum_uncached_tokens: 64,
+        };
+
+        manager.set_cache_simulation(expected.clone()).unwrap();
+
+        let persisted = Config::load(&config_path).unwrap();
+        assert_eq!(persisted.cache_simulation, expected);
+        assert_eq!(manager.get_cache_simulation(), expected);
 
         std::fs::remove_file(&config_path).unwrap();
     }
@@ -2334,7 +2420,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled() {
+    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled()
+     {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
 
@@ -2395,7 +2482,12 @@ mod tests {
         }
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager
+            .acquire_context(None)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -2435,7 +2527,12 @@ mod tests {
         manager.report_quota_exhausted(2);
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager
+            .acquire_context(None)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",

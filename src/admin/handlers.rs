@@ -9,8 +9,8 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, SetCacheSimulationRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
     },
 };
 
@@ -136,6 +136,22 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/cache-simulation
+pub async fn get_cache_simulation(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_cache_simulation())
+}
+
+/// PUT /api/admin/config/cache-simulation
+pub async fn set_cache_simulation(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetCacheSimulationRequest>,
+) -> impl IntoResponse {
+    match state.service.set_cache_simulation(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

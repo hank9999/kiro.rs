@@ -1,0 +1,57 @@
+services:
+  kiro-rs:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    command:
+      - cargo
+      - watch
+      - --poll
+      - --why
+      - --watch
+      - src
+      - --watch
+      - Cargo.toml
+      - --watch
+      - Cargo.lock
+      - -x
+      - run --no-default-features -- -c /app/config/config.json --credentials /app/config/credentials.json
+    environment:
+      RUST_LOG: ${RUST_LOG:-kiro_rs=debug,tower_http=debug}
+    volumes:
+      - ./src/:/app/src/
+      - ./Cargo.toml:/app/Cargo.toml:ro
+      - ./Cargo.lock:/app/Cargo.lock:ro
+      - ./config/:/app/config/
+      - kiro-rs-target:/app/target/
+    restart: "no"
+
+  admin-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      target: frontend-dev
+    container_name: kiro-rs-admin-ui
+    working_dir: /app/admin-ui
+    command:
+      - pnpm
+      - dev
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5173"
+    depends_on:
+      - kiro-rs
+    environment:
+      VITE_PROXY_TARGET: http://kiro-rs:8990
+      CHOKIDAR_USEPOLLING: "true"
+    ports:
+      - "18991:5173"
+    volumes:
+      - ./admin-ui/:/app/admin-ui/
+      - kiro-rs-admin-node-modules-v2:/app/admin-ui/node_modules/
+    restart: "no"
+
+volumes:
+  kiro-rs-target:
+  kiro-rs-admin-node-modules-v2:

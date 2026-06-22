@@ -8,8 +8,9 @@ use axum::{
 use super::{
     handlers::{
         add_credential, delete_credential, force_refresh_token, get_all_credentials,
-        get_credential_balance, get_load_balancing_mode, reset_failure_count,
-        set_credential_disabled, set_credential_priority, set_load_balancing_mode,
+        get_cache_simulation, get_credential_balance, get_load_balancing_mode, reset_failure_count,
+        set_cache_simulation, set_credential_disabled, set_credential_priority,
+        set_load_balancing_mode,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -47,6 +48,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
+        )
+        .route(
+            "/config/cache-simulation",
+            get(get_cache_simulation).put(set_cache_simulation),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),

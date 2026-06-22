@@ -12,6 +12,7 @@ use axum::{
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
+use crate::kiro::token_manager::MultiTokenManager;
 
 use super::types::ErrorResponse;
 
@@ -23,6 +24,7 @@ pub struct AppState {
     /// Kiro Provider（可选，用于实际 API 调用）
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
     pub kiro_provider: Option<Arc<KiroProvider>>,
+    pub token_manager: Option<Arc<MultiTokenManager>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
 }
@@ -33,6 +35,7 @@ impl AppState {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
+            token_manager: None,
             extract_thinking,
         }
     }
@@ -40,6 +43,11 @@ impl AppState {
     /// 设置 KiroProvider
     pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
         self.kiro_provider = Some(Arc::new(provider));
+        self
+    }
+
+    pub fn with_token_manager(mut self, token_manager: Arc<MultiTokenManager>) -> Self {
+        self.token_manager = Some(token_manager);
         self
     }
 }

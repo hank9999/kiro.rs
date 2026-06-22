@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, MessagesRequest};
+use super::usage::CacheSimulationDecision;
 
 /// MCP 请求
 #[derive(Debug, Serialize)]
@@ -220,9 +221,16 @@ pub fn create_websearch_sse_stream(
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    cache_simulation: CacheSimulationDecision,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let events =
-        generate_websearch_events(&model, &query, &tool_use_id, search_results, input_tokens);
+    let events = generate_websearch_events(
+        &model,
+        &query,
+        &tool_use_id,
+        search_results,
+        input_tokens,
+        cache_simulation,
+    );
 
     stream::iter(
         events
@@ -238,12 +246,15 @@ fn generate_websearch_events(
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    cache_simulation: CacheSimulationDecision,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let message_id = format!(
         "msg_{}",
         Uuid::new_v4().to_string().replace('-', "")[..24].to_string()
     );
+
+    let initial_usage = cache_simulation.apply(input_tokens, 0);
 
     // 1. message_start
     events.push(SseEvent::new(
@@ -257,12 +268,7 @@ fn generate_websearch_events(
                 "model": model,
                 "content": [],
                 "stop_reason": null,
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
-                }
+                "usage": initial_usage
             }
         }),
     ));
@@ -417,6 +423,7 @@ fn generate_websearch_events(
     // 10. message_delta
     // 官方 API 的 message_delta.delta 中没有 stop_sequence 字段
     let output_tokens = (summary.len() as i32 + 3) / 4; // 简单估算
+    let final_usage = cache_simulation.apply(input_tokens, output_tokens);
     events.push(SseEvent::new(
         "message_delta",
         json!({
@@ -425,7 +432,10 @@ fn generate_websearch_events(
                 "stop_reason": "end_turn"
             },
             "usage": {
-                "output_tokens": output_tokens,
+                "input_tokens": final_usage.input_tokens,
+                "output_tokens": final_usage.output_tokens,
+                "cache_creation_input_tokens": final_usage.cache_creation_input_tokens,
+                "cache_read_input_tokens": final_usage.cache_read_input_tokens,
                 "server_tool_use": {
                     "web_search_requests": 1
                 }
@@ -475,6 +485,7 @@ pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
+    cache_simulation: CacheSimulationDecision,
 ) -> Response {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
@@ -507,8 +518,14 @@ pub async fn handle_websearch_request(
 
     // 4. 生成 SSE 响应
     let model = payload.model.clone();
-    let stream =
-        create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+    let stream = create_websearch_sse_stream(
+        model,
+        query,
+        tool_use_id,
+        search_results,
+        input_tokens,
+        cache_simulation,
+    );
 
     Response::builder()
         .status(StatusCode::OK)

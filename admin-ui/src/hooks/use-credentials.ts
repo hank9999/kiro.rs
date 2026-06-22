@@ -10,8 +10,10 @@ import {
   deleteCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getCacheSimulation,
+  setCacheSimulation,
 } from '@/api/credentials'
-import type { AddCredentialRequest } from '@/types/api'
+import type { AddCredentialRequest, CacheSimulationConfig } from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -115,6 +117,23 @@ export function useSetLoadBalancingMode() {
     mutationFn: setLoadBalancingMode,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+    },
+  })
+}
+
+export function useCacheSimulation() {
+  return useQuery({
+    queryKey: ['cacheSimulation'],
+    queryFn: getCacheSimulation,
+  })
+}
+
+export function useSetCacheSimulation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (config: CacheSimulationConfig) => setCacheSimulation(config),
+    onSuccess: (data) => {
+      queryClient.setQueryData(['cacheSimulation'], data)
     },
   })
 }

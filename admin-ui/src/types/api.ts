@@ -87,3 +87,12 @@ export interface AddCredentialResponse {
   credentialId: number
   email?: string
 }
+
+export interface CacheSimulationConfig {
+  enabled: boolean
+  hitProbability: number
+  minCacheRatio: number
+  maxCacheRatio: number
+  minimumInputTokens: number
+  minimumUncachedTokens: number
+}
