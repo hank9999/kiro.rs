@@ -12,6 +12,10 @@ import type {
   LogsResponse,
   RequestActivityResponse,
   AvailableModelsResponse,
+  LoadBalancingMode,
+  LoadBalancingModeResponse,
+  SetLoadBalancingModeRequest,
+  SetTokenPoolSizeRequest,
 } from "@/types/api";
 
 // 创建 axios 实例
@@ -113,14 +117,9 @@ export async function deleteCredential(id: number): Promise<SuccessResponse> {
   return data;
 }
 
-// 负载均衡模式联合类型
-export type LoadBalancingMode = "priority" | "balanced" | "round_robin";
-
 // 获取负载均衡模式
-export async function getLoadBalancingMode(): Promise<{
-  mode: LoadBalancingMode;
-}> {
-  const { data } = await api.get<{ mode: LoadBalancingMode }>(
+export async function getLoadBalancingMode(): Promise<LoadBalancingModeResponse> {
+  const { data } = await api.get<LoadBalancingModeResponse>(
     "/config/load-balancing",
   );
   return data;
@@ -129,10 +128,21 @@ export async function getLoadBalancingMode(): Promise<{
 // 设置负载均衡模式
 export async function setLoadBalancingMode(
   mode: LoadBalancingMode,
-): Promise<{ mode: LoadBalancingMode }> {
-  const { data } = await api.put<{ mode: LoadBalancingMode }>(
+): Promise<LoadBalancingModeResponse> {
+  const { data } = await api.put<LoadBalancingModeResponse>(
     "/config/load-balancing",
-    { mode },
+    { mode } as SetLoadBalancingModeRequest,
+  );
+  return data;
+}
+
+// 设置轮询模式热凭据池大小
+export async function setTokenPoolSize(
+  tokenPoolSize: number,
+): Promise<LoadBalancingModeResponse> {
+  const { data } = await api.put<LoadBalancingModeResponse>(
+    "/config/token-pool",
+    { tokenPoolSize } as SetTokenPoolSizeRequest,
   );
   return data;
 }

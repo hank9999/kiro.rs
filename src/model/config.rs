@@ -211,9 +211,16 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
-    /// 负载均衡模式（"priority" 或 "balanced"）
+    /// 负载均衡模式（"priority" / "balanced" / "round_robin" / "token_pool"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
+
+    /// token_pool 模式下维护的热凭据池大小
+    ///
+    /// 当 `loadBalancingMode = "token_pool"` 时，请求会优先在已有有效
+    /// accessToken 的凭据池中轮询；热池未达到该数量时，才逐步激活新的冷凭据。
+    #[serde(default = "default_token_pool_size")]
+    pub token_pool_size: usize,
 
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
@@ -324,6 +331,10 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_token_pool_size() -> usize {
+    32
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -356,6 +367,7 @@ impl Default for Config {
             proxy_pool: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            token_pool_size: default_token_pool_size(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),

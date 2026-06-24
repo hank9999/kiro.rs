@@ -50,6 +50,21 @@ pub(crate) fn is_token_expiring_soon(credentials: &KiroCredentials) -> bool {
     is_token_expiring_within(credentials, 10).unwrap_or(false)
 }
 
+/// 检查凭据是否已经持有可直接用于请求的 Token。
+///
+/// API Key 凭据天然不需要刷新；OAuth / IdC 凭据必须同时满足：
+/// - 存在 accessToken
+/// - 未过期，且不在提前刷新窗口内
+fn has_ready_access_token(credentials: &KiroCredentials) -> bool {
+    if credentials.is_api_key_credential() {
+        return credentials.kiro_api_key.is_some();
+    }
+
+    credentials.access_token.is_some()
+        && !is_token_expired(credentials)
+        && !is_token_expiring_soon(credentials)
+}
+
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
@@ -605,12 +620,18 @@ pub struct MultiTokenManager {
     stats_dirty: AtomicBool,
     /// 轮询模式游标：记录上次返回的凭据 id（0 表示尚未轮询过，下一次从第一个开始）
     round_robin_cursor: Mutex<u64>,
+    /// Token 热池模式下维护的热凭据池大小。
+    ///
+    /// 该值可通过 Admin API 实时修改并持久化；请求选择路径实时读取。
+    token_pool_size: Mutex<usize>,
 }
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+/// 热凭据池大小的最大保护值，防止误填极大值导致每轮扫描意外放大。
+const MAX_TOKEN_POOL_SIZE: usize = 100_000;
 
 /// API 调用上下文
 ///
@@ -725,6 +746,7 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
+        let token_pool_size = config.token_pool_size.max(1);
         let manager = Self {
             config,
             proxy,
@@ -739,6 +761,7 @@ impl MultiTokenManager {
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             round_robin_cursor: Mutex::new(0),
+            token_pool_size: Mutex::new(token_pool_size),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -826,7 +849,8 @@ impl MultiTokenManager {
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
     /// - balanced 模式：均衡选择可用凭据（Least-Used）
-    /// - round_robin 模式：按 (priority, id) 升序轮询所有可用凭据
+    /// - round_robin 模式：按 (priority, id) 升序严格轮询所有可用凭据
+    /// - token_pool 模式：维护固定大小的有效 Token 热池，并在热池内轮询
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
@@ -873,13 +897,65 @@ impl MultiTokenManager {
                 Some((entry.id, entry.credentials.clone()))
             }
             "round_robin" => {
-                // 轮询模式：按 (priority, id) 升序轮换
-                // 找到游标 last_id 在排序后列表中的位置，取下一个；
-                // 若 last_id 不存在（被禁用/删除）或已在末尾，则回到列表头
+                // 严格轮询模式：按 (priority, id) 升序轮换所有可用凭据。
+                // 该模式会真实触达所有可用凭据；如果凭据很多且 Token 过期，
+                // 可能产生大量刷新请求。需要省刷新流量时请使用 token_pool 模式。
                 let last_id = *self.round_robin_cursor.lock();
                 let chosen = match available.iter().position(|e| e.id == last_id) {
                     Some(idx) if idx + 1 < available.len() => available[idx + 1],
                     _ => available[0],
+                };
+
+                *self.round_robin_cursor.lock() = chosen.id;
+                Some((chosen.id, chosen.credentials.clone()))
+            }
+            "token_pool" => {
+                // Token 热池模式：
+                // - 热池未达到 token_pool_size：优先选择没有可用 accessToken 的冷凭据，
+                //   让后续 try_ensure_token() 逐步激活新凭据；
+                // - 热池达到目标数量：只在热池内轮询，避免几千冷凭据被每请求刷新；
+                // - 如果历史文件中已有超过目标数量的有效 Token，仅取排序靠前的前 N 个
+                //   作为当前热池，保证“池子数量”是真正上限。
+                let last_id = *self.round_robin_cursor.lock();
+
+                let token_pool_size = (*self.token_pool_size.lock()).max(1);
+                let active_ready_ids: std::collections::HashSet<u64> = available
+                    .iter()
+                    .filter(|e| has_ready_access_token(&e.credentials))
+                    .take(token_pool_size)
+                    .map(|e| e.id)
+                    .collect();
+
+                let choose_matching_after =
+                    |predicate: &dyn Fn(&CredentialEntry) -> bool| -> Option<&CredentialEntry> {
+                        let len = available.len();
+                        let start = available
+                            .iter()
+                            .position(|e| e.id == last_id)
+                            .map(|idx| idx + 1)
+                            .unwrap_or(0);
+
+                        for offset in 0..len {
+                            let idx = (start + offset) % len;
+                            let entry = available[idx];
+                            if predicate(entry) {
+                                return Some(entry);
+                            }
+                        }
+
+                        None
+                    };
+
+                let chosen = if active_ready_ids.len() < token_pool_size {
+                    // 热池未满：优先拉起一个冷凭据。若所有可用凭据都已经有 Token，
+                    // 则回退到当前热池轮询。
+                    choose_matching_after(&|e| !has_ready_access_token(&e.credentials))
+                        .or_else(|| choose_matching_after(&|e| active_ready_ids.contains(&e.id)))
+                        .unwrap_or(available[0])
+                } else {
+                    // 热池已满：只在热池内轮询。
+                    choose_matching_after(&|e| active_ready_ids.contains(&e.id))
+                        .unwrap_or(available[0])
                 };
 
                 *self.round_robin_cursor.lock() = chosen.id;
@@ -923,9 +999,11 @@ impl MultiTokenManager {
                 // 非粘性模式：每次请求都重新选择凭据，不复用 current_id
                 // - balanced：基于 success_count 重新均衡
                 // - round_robin：按顺序前进游标
+                // - token_pool：热池未满时激活冷凭据，热池满后在热池内轮询
                 // priority 模式（默认）：优先使用 current_id 指向的凭据
-                let is_per_request_select =
-                    mode.as_str() == "balanced" || mode.as_str() == "round_robin";
+                let is_per_request_select = mode.as_str() == "balanced"
+                    || mode.as_str() == "round_robin"
+                    || mode.as_str() == "token_pool";
 
                 let current_hit = if is_per_request_select {
                     None
@@ -2339,6 +2417,11 @@ impl MultiTokenManager {
         self.load_balancing_mode.lock().clone()
     }
 
+    /// 获取轮询模式热凭据池大小（Admin API）
+    pub fn get_token_pool_size(&self) -> usize {
+        *self.token_pool_size.lock()
+    }
+
     fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
         use anyhow::Context;
 
@@ -2360,10 +2443,32 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    fn persist_token_pool_size(&self, size: usize) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，Token 热池大小仅在当前进程生效: {}", size);
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.token_pool_size = size;
+        config
+            .save()
+            .with_context(|| format!("持久化 Token 热池大小失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
+
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         // 验证模式值
-        if mode != "priority" && mode != "balanced" && mode != "round_robin" {
+        if mode != "priority" && mode != "balanced" && mode != "round_robin" && mode != "token_pool"
+        {
             anyhow::bail!("无效的负载均衡模式: {}", mode);
         }
 
@@ -2380,11 +2485,43 @@ impl MultiTokenManager {
         }
 
         // 持久化成功后再重置游标，确保失败回滚不会影响轮询状态
-        if mode == "round_robin" {
+        if mode == "round_robin" || mode == "token_pool" {
             *self.round_robin_cursor.lock() = 0;
         }
 
         tracing::info!("负载均衡模式已设置为: {}", mode);
+        Ok(())
+    }
+
+    /// 设置轮询模式热凭据池大小（Admin API）
+    pub fn set_token_pool_size(&self, size: usize) -> anyhow::Result<()> {
+        if size == 0 {
+            anyhow::bail!("Token 热池大小必须大于 0");
+        }
+        if size > MAX_TOKEN_POOL_SIZE {
+            anyhow::bail!(
+                "Token 热池大小过大: {}，最大允许 {}",
+                size,
+                MAX_TOKEN_POOL_SIZE
+            );
+        }
+
+        let previous_size = self.get_token_pool_size();
+        if previous_size == size {
+            return Ok(());
+        }
+
+        *self.token_pool_size.lock() = size;
+
+        if let Err(err) = self.persist_token_pool_size(size) {
+            *self.token_pool_size.lock() = previous_size;
+            return Err(err);
+        }
+
+        // 缩小热池时重置游标，下一次选择会按新热池上限从头稳定轮询。
+        *self.round_robin_cursor.lock() = 0;
+
+        tracing::info!("Token 热池大小已设置为: {}", size);
         Ok(())
     }
 }
@@ -2817,6 +2954,20 @@ mod tests {
             .collect()
     }
 
+    /// 辅助函数：构造带过期 Token 的凭据，模拟大量冷账号。
+    fn build_expired_round_robin_test_creds(count: u32) -> Vec<KiroCredentials> {
+        (0..count)
+            .map(|i| {
+                let mut c = KiroCredentials::default();
+                c.priority = i;
+                c.access_token = Some(format!("expired-token-{}", i));
+                c.refresh_token = Some("a".repeat(150));
+                c.expires_at = Some((Utc::now() - Duration::hours(1)).to_rfc3339());
+                c
+            })
+            .collect()
+    }
+
     /// 测试 round_robin 切换到 round_robin 模式后，按 (priority, id) 顺序循环选择
     #[test]
     fn test_round_robin_select_cycles_through_available_credentials() {
@@ -2885,6 +3036,92 @@ mod tests {
         assert_eq!(fourth, 1);
     }
 
+    /// 测试 token_pool 在热池未满时会继续选择冷凭据，避免退化成 priority。
+    #[test]
+    fn test_token_pool_activates_cold_credentials_until_pool_full() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "token_pool".to_string();
+        config.token_pool_size = 2;
+        let mut creds = build_expired_round_robin_test_creds(4);
+
+        // 只有 #1 已经是热账号；热池目标为 2，下一次应选择 #2 这种冷账号用于激活。
+        creds[0].access_token = Some("ready-0".to_string());
+        creds[0].expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, creds, None, None, None, false).unwrap();
+
+        let (id, _) = manager.select_next_credential(None).unwrap();
+        assert_eq!(id, 2);
+    }
+
+    /// 测试 token_pool 在热池满后只在热池内轮询，不继续碰冷账号。
+    #[test]
+    fn test_token_pool_uses_ready_token_pool_when_full() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "token_pool".to_string();
+        config.token_pool_size = 2;
+        let mut creds = build_expired_round_robin_test_creds(5);
+
+        // #1 / #2 是热账号，#3..#5 是冷账号。池满后应只返回 1/2。
+        for cred in creds.iter_mut().take(2) {
+            cred.access_token = Some("ready".to_string());
+            cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        }
+
+        let manager = MultiTokenManager::new(config, creds, None, None, None, false).unwrap();
+
+        let mut order = Vec::new();
+        for _ in 0..6 {
+            let (id, _) = manager.select_next_credential(None).unwrap();
+            order.push(id);
+        }
+
+        assert_eq!(order, vec![1, 2, 1, 2, 1, 2]);
+    }
+
+    /// 测试运行时修改热池大小会立即影响 token_pool 选择。
+    #[test]
+    fn test_set_token_pool_size_changes_token_pool_selection_runtime() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "token_pool".to_string();
+        config.token_pool_size = 1;
+        let mut creds = build_expired_round_robin_test_creds(3);
+
+        creds[0].access_token = Some("ready-0".to_string());
+        creds[0].expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, creds, None, None, None, false).unwrap();
+
+        // 池大小为 1 时，只在 #1 内轮询。
+        let (first, _) = manager.select_next_credential(None).unwrap();
+        assert_eq!(first, 1);
+
+        manager.set_token_pool_size(2).unwrap();
+
+        // 扩大到 2 后，热池未满，应选择 #2 冷账号去激活。
+        let (second, _) = manager.select_next_credential(None).unwrap();
+        assert_eq!(second, 2);
+    }
+
+    /// 测试严格 round_robin 不受 tokenPoolSize 限制，仍然会遍历所有可用凭据。
+    #[test]
+    fn test_round_robin_remains_strict_and_ignores_token_pool_size() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "round_robin".to_string();
+        config.token_pool_size = 1;
+        let creds = build_expired_round_robin_test_creds(3);
+
+        let manager = MultiTokenManager::new(config, creds, None, None, None, false).unwrap();
+
+        let mut order = Vec::new();
+        for _ in 0..5 {
+            let (id, _) = manager.select_next_credential(None).unwrap();
+            order.push(id);
+        }
+
+        assert_eq!(order, vec![1, 2, 3, 1, 2]);
+    }
+
     /// 测试 set_load_balancing_mode 接受 round_robin 字符串并持久化
     #[test]
     fn test_set_load_balancing_mode_accepts_round_robin() {
@@ -2912,6 +3149,13 @@ mod tests {
         let persisted = Config::load(&config_path).unwrap();
         assert_eq!(persisted.load_balancing_mode, "round_robin");
         assert_eq!(manager.get_load_balancing_mode(), "round_robin");
+
+        manager
+            .set_load_balancing_mode("token_pool".to_string())
+            .expect("token_pool 应该是合法值");
+        let persisted = Config::load(&config_path).unwrap();
+        assert_eq!(persisted.load_balancing_mode, "token_pool");
+        assert_eq!(manager.get_load_balancing_mode(), "token_pool");
 
         // 非法字符串仍然被拒绝
         let bad = manager.set_load_balancing_mode("unknown".to_string());

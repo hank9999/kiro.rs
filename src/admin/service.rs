@@ -26,7 +26,8 @@ use super::types::{
     CredentialStatusItem, CredentialsStatusResponse, GenerateApiKeyRequest, GenerateApiKeyResponse,
     LoadBalancingModeResponse, LogsResponse, ProxyPoolDto, ProxyPoolStatusResponse,
     ProxyPoolTemplateDto, ProxyTestItem, ProxyTestResponse, SetLoadBalancingModeRequest,
-    TestProxyPoolRequest, UpdateApiKeyRequest, UpdateCredentialProxyRequest,
+    SetTokenPoolSizeRequest, TestProxyPoolRequest, UpdateApiKeyRequest,
+    UpdateCredentialProxyRequest,
 };
 use crate::model::config::{ApiKeyConfig, Config, ProxyPoolConfig, ProxyPoolTemplate};
 use std::time::{Duration, Instant};
@@ -493,6 +494,7 @@ impl AdminService {
     pub fn get_load_balancing_mode(&self) -> LoadBalancingModeResponse {
         LoadBalancingModeResponse {
             mode: self.token_manager.get_load_balancing_mode(),
+            token_pool_size: self.token_manager.get_token_pool_size(),
         }
     }
 
@@ -591,9 +593,14 @@ impl AdminService {
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
         // 验证模式值
-        if req.mode != "priority" && req.mode != "balanced" && req.mode != "round_robin" {
+        if req.mode != "priority"
+            && req.mode != "balanced"
+            && req.mode != "round_robin"
+            && req.mode != "token_pool"
+        {
             return Err(AdminServiceError::InvalidCredential(
-                "mode 必须是 'priority' / 'balanced' / 'round_robin' 之一".to_string(),
+                "mode 必须是 'priority' / 'balanced' / 'round_robin' / 'token_pool' 之一"
+                    .to_string(),
             ));
         }
 
@@ -601,7 +608,31 @@ impl AdminService {
             .set_load_balancing_mode(req.mode.clone())
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
-        Ok(LoadBalancingModeResponse { mode: req.mode })
+        Ok(LoadBalancingModeResponse {
+            mode: req.mode,
+            token_pool_size: self.token_manager.get_token_pool_size(),
+        })
+    }
+
+    /// 设置轮询模式热凭据池大小
+    pub fn set_token_pool_size(
+        &self,
+        req: SetTokenPoolSizeRequest,
+    ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
+        if req.token_pool_size == 0 {
+            return Err(AdminServiceError::InvalidRequest(
+                "tokenPoolSize 必须大于 0".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_token_pool_size(req.token_pool_size)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(LoadBalancingModeResponse {
+            mode: self.token_manager.get_load_balancing_mode(),
+            token_pool_size: self.token_manager.get_token_pool_size(),
+        })
     }
 
     /// 强制刷新指定凭据的 Token

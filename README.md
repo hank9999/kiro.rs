@@ -221,7 +221,8 @@ docker-compose up
 | `proxyUsername` | string | - | 代理用户名 |
 | `proxyPassword` | string | - | 代理密码 |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
-| `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
+| `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）、`balanced`（均衡分配）、`round_robin`（严格轮询所有可用凭据）或 `token_pool`（热池轮询） |
+| `tokenPoolSize` | number | `32` | `token_pool` 模式下维护的热凭据池大小。热池未满时逐步激活冷凭据，热池满后只在有效 Token 凭据内轮询 |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 
@@ -248,6 +249,7 @@ docker-compose up
    "proxyPassword": "pass",
    "adminApiKey": "sk-admin-your-secret-key",
    "loadBalancingMode": "priority",
+   "tokenPoolSize": 32,
    "extractThinking": true
 }
 ```

@@ -12,8 +12,8 @@ use super::{
         get_available_models, get_credential_balance, get_load_balancing_mode, get_proxy_pool,
         get_recent_logs, get_request_activity, query_all_credential_balances_and_enable,
         reset_failure_count, set_credential_disabled, set_credential_priority,
-        set_load_balancing_mode, test_proxy_pool, update_api_key, update_credential_proxy,
-        update_proxy_pool,
+        set_load_balancing_mode, set_token_pool_size, test_proxy_pool, update_api_key,
+        update_credential_proxy, update_proxy_pool,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -33,6 +33,7 @@ use super::{
 /// - `POST /credentials/enable-all` - 启用所有可恢复凭据
 /// - `GET /config/load-balancing` - 获取负载均衡模式
 /// - `PUT /config/load-balancing` - 设置负载均衡模式
+/// - `PUT /config/token-pool` - 设置轮询模式热凭据池大小
 /// - `GET /api-keys` - 获取所有 API Keys
 /// - `POST /api-keys` - 添加新 API Key
 /// - `POST /api-keys/generate` - 生成随机 API Key
@@ -71,6 +72,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
         )
+        .route("/config/token-pool", put(set_token_pool_size))
         .route("/api-keys", get(get_api_keys).post(add_api_key))
         .route("/api-keys/generate", post(generate_api_key))
         .route("/api-keys/{id}", put(update_api_key).delete(delete_api_key))

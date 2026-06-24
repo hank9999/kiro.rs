@@ -15,6 +15,7 @@ import {
   getRequestActivity,
   getAvailableModels,
   setLoadBalancingMode,
+  setTokenPoolSize,
 } from "@/api/credentials";
 import type { AddCredentialRequest } from "@/types/api";
 
@@ -142,6 +143,18 @@ export function useSetLoadBalancingMode() {
     mutationFn: setLoadBalancingMode,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["loadBalancingMode"] });
+    },
+  });
+}
+
+// 设置轮询模式热凭据池大小
+export function useSetTokenPoolSize() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: setTokenPoolSize,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["loadBalancingMode"] });
+      queryClient.invalidateQueries({ queryKey: ["credentials"] });
     },
   });
 }

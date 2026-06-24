@@ -222,16 +222,26 @@ pub struct BatchCredentialBalanceResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoadBalancingModeResponse {
-    /// 当前模式（"priority" 或 "balanced"）
+    /// 当前模式（"priority" / "balanced" / "round_robin" / "token_pool"）
     pub mode: String,
+    /// token_pool 模式下维护的热凭据池大小
+    pub token_pool_size: usize,
 }
 
 /// 设置负载均衡模式请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetLoadBalancingModeRequest {
-    /// 模式（"priority" 或 "balanced"）
+    /// 模式（"priority" / "balanced" / "round_robin" / "token_pool"）
     pub mode: String,
+}
+
+/// 设置 Token 热池大小请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetTokenPoolSizeRequest {
+    /// token_pool 模式下维护的热凭据池大小，必须大于 0
+    pub token_pool_size: usize,
 }
 
 // ============ 查询参数 / 日志 ============

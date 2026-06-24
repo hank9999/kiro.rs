@@ -61,6 +61,7 @@ export function CredentialCard({
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [deleteConfirmStep, setDeleteConfirmStep] = useState<1 | 2>(1)
   const [showProxyDialog, setShowProxyDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
@@ -136,6 +137,7 @@ export function CredentialCard({
       onSuccess: (res) => {
         toast.success(res.message)
         setShowDeleteDialog(false)
+        setDeleteConfirmStep(1)
       },
       onError: (err) => {
         toast.error('删除失败: ' + (err as Error).message)
@@ -379,7 +381,10 @@ export function CredentialCard({
             <Button
               size="sm"
               variant="destructive"
-              onClick={() => setShowDeleteDialog(true)}
+              onClick={() => {
+                setDeleteConfirmStep(1)
+                setShowDeleteDialog(true)
+              }}
               disabled={!credential.disabled}
               title={!credential.disabled ? '需要先禁用凭据才能删除' : undefined}
             >
@@ -391,12 +396,24 @@ export function CredentialCard({
       </Card>
 
       {/* 删除确认对话框 */}
-      <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
+      <Dialog
+        open={showDeleteDialog}
+        onOpenChange={(open) => {
+          setShowDeleteDialog(open)
+          if (!open) {
+            setDeleteConfirmStep(1)
+          }
+        }}
+      >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>确认删除凭据</DialogTitle>
+            <DialogTitle>
+              {deleteConfirmStep === 1 ? '确认删除凭据' : '二次确认删除'}
+            </DialogTitle>
             <DialogDescription>
-              您确定要删除凭据 #{credential.id} 吗？此操作无法撤销。
+              {deleteConfirmStep === 1
+                ? `您确定要删除凭据 #${credential.id} 吗？此操作无法撤销。`
+                : `请再次确认：即将永久删除凭据 #${credential.id}，删除后无法恢复。`}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -409,10 +426,17 @@ export function CredentialCard({
             </Button>
             <Button
               variant="destructive"
-              onClick={handleDelete}
+              onClick={() => {
+                if (deleteConfirmStep === 1) {
+                  setDeleteConfirmStep(2)
+                  return
+                }
+
+                handleDelete()
+              }}
               disabled={deleteCredential.isPending || !credential.disabled}
             >
-              确认删除
+              {deleteConfirmStep === 1 ? '继续确认' : '确认永久删除'}
             </Button>
           </DialogFooter>
         </DialogContent>

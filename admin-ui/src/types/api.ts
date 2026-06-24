@@ -81,6 +81,21 @@ export interface SetPriorityRequest {
   priority: number;
 }
 
+export type LoadBalancingMode = "priority" | "balanced" | "round_robin" | "token_pool";
+
+export interface LoadBalancingModeResponse {
+  mode: LoadBalancingMode;
+  tokenPoolSize: number;
+}
+
+export interface SetLoadBalancingModeRequest {
+  mode: LoadBalancingMode;
+}
+
+export interface SetTokenPoolSizeRequest {
+  tokenPoolSize: number;
+}
+
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken?: string;

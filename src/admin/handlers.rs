@@ -11,7 +11,8 @@ use super::{
     types::{
         ActivityQuery, AddApiKeyRequest, AddCredentialRequest, GenerateApiKeyRequest, LogsQuery,
         ProxyPoolDto, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse, TestProxyPoolRequest, UpdateApiKeyRequest, UpdateCredentialProxyRequest,
+        SetTokenPoolSizeRequest, SuccessResponse, TestProxyPoolRequest, UpdateApiKeyRequest,
+        UpdateCredentialProxyRequest,
     },
 };
 
@@ -191,6 +192,18 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/config/token-pool
+/// 设置轮询模式热凭据池大小
+pub async fn set_token_pool_size(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetTokenPoolSizeRequest>,
+) -> impl IntoResponse {
+    match state.service.set_token_pool_size(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
