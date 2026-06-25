@@ -486,18 +486,18 @@ export function ProxySettings() {
                   </div>
                 ) : (
                   <div className="space-y-1 mt-3">
-                    <Label>代理 URL 列表（每行一个）</Label>
+                    <Label>代理列表（每行一个）</Label>
                     <textarea
                       rows={6}
                       className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono"
-                      placeholder={"socks5h://user:pass@host:10001\nsocks5h://user:pass@host:10002"}
+                      placeholder={"31.59.20.176:6754:用户名:密码\n31.56.127.193:7684:用户名:密码\nhttp://user:pass@host:10001"}
                       value={form.urlsText}
                       onChange={(e) =>
                         setForm((f) => ({ ...f, urlsText: e.target.value }))
                       }
                     />
                     <p className="text-xs text-muted-foreground">
-                      URL 中若已带认证信息，下方全局认证将被忽略
+                      支持完整 URL，也支持 ip:port:用户名:密码；四段格式默认按 HTTP 代理处理。URL 中若已带认证信息或每行已带用户名密码，下方全局认证将被忽略
                     </p>
                   </div>
                 )}

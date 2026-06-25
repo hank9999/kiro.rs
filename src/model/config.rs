@@ -467,11 +467,11 @@ impl Config {
                 if trimmed.is_empty() {
                     continue;
                 }
-                let mut cfg = ProxyConfig::new(trimmed);
+                let mut cfg = ProxyConfig::from_user_input(trimmed, "http");
                 if let (Some(u), Some(p)) =
                     (pool_cfg.username.as_deref(), pool_cfg.password.as_deref())
                 {
-                    if !trimmed.contains('@') {
+                    if cfg.username.is_none() && !trimmed.contains('@') {
                         cfg = cfg.with_auth(u, p);
                     }
                 }
@@ -510,5 +510,81 @@ impl Config {
         }
 
         keys
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, ProxyPoolConfig};
+
+    #[test]
+    fn test_build_proxy_pool_accepts_host_port_auth_lines() {
+        let config = Config {
+            proxy_pool: Some(ProxyPoolConfig {
+                enabled: true,
+                strategy: "round-robin".to_string(),
+                urls: Some(vec![
+                    "31.59.20.176:6754:wmkmhcil:8qcdmn0rh4ku".to_string(),
+                    "31.56.127.193:7684:wmkmhcil:8qcdmn0rh4ku".to_string(),
+                ]),
+                ..ProxyPoolConfig::default()
+            }),
+            ..Config::default()
+        };
+
+        let pool = config.build_proxy_pool().expect("代理池应构建成功");
+        assert_eq!(pool.len(), 2);
+
+        let first = &pool.entries()[0];
+        assert_eq!(first.url, "http://31.59.20.176:6754");
+        assert_eq!(first.username.as_deref(), Some("wmkmhcil"));
+        assert_eq!(first.password.as_deref(), Some("8qcdmn0rh4ku"));
+
+        let second = &pool.entries()[1];
+        assert_eq!(second.url, "http://31.56.127.193:7684");
+        assert_eq!(second.username.as_deref(), Some("wmkmhcil"));
+        assert_eq!(second.password.as_deref(), Some("8qcdmn0rh4ku"));
+    }
+
+    #[test]
+    fn test_build_proxy_pool_line_auth_overrides_global_auth() {
+        let config = Config {
+            proxy_pool: Some(ProxyPoolConfig {
+                enabled: true,
+                strategy: "round-robin".to_string(),
+                urls: Some(vec!["31.59.20.176:6754:line_user:line_pass".to_string()]),
+                username: Some("global_user".to_string()),
+                password: Some("global_pass".to_string()),
+                ..ProxyPoolConfig::default()
+            }),
+            ..Config::default()
+        };
+
+        let pool = config.build_proxy_pool().expect("代理池应构建成功");
+        let first = &pool.entries()[0];
+        assert_eq!(first.url, "http://31.59.20.176:6754");
+        assert_eq!(first.username.as_deref(), Some("line_user"));
+        assert_eq!(first.password.as_deref(), Some("line_pass"));
+    }
+
+    #[test]
+    fn test_build_proxy_pool_global_auth_still_applies_to_plain_url() {
+        let config = Config {
+            proxy_pool: Some(ProxyPoolConfig {
+                enabled: true,
+                strategy: "round-robin".to_string(),
+                urls: Some(vec!["http://31.59.20.176:6754".to_string()]),
+                username: Some("global_user".to_string()),
+                password: Some("global_pass".to_string()),
+                ..ProxyPoolConfig::default()
+            }),
+            ..Config::default()
+        };
+
+        let pool = config.build_proxy_pool().expect("代理池应构建成功");
+        let first = &pool.entries()[0];
+        assert_eq!(first.url, "http://31.59.20.176:6754");
+        assert_eq!(first.username.as_deref(), Some("global_user"));
+        assert_eq!(first.password.as_deref(), Some("global_pass"));
     }
 }

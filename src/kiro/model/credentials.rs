@@ -222,11 +222,13 @@ impl KiroCredentials {
         match self.proxy_url.as_deref() {
             Some(url) if url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => None,
             Some(url) => {
-                let mut proxy = ProxyConfig::new(url);
+                let mut proxy = ProxyConfig::from_user_input(url, "http");
                 if let (Some(username), Some(password)) =
                     (&self.proxy_username, &self.proxy_password)
                 {
-                    proxy = proxy.with_auth(username, password);
+                    if proxy.username.is_none() {
+                        proxy = proxy.with_auth(username, password);
+                    }
                 }
                 Some(proxy)
             }

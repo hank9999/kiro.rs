@@ -29,12 +29,62 @@ impl ProxyConfig {
         }
     }
 
+    /// 从用户输入创建代理配置，兼容常见代理商的 `host:port:username:password` 格式。
+    ///
+    /// - 标准 URL（如 `http://host:port` / `socks5://user:pass@host:port`）保持原样
+    /// - 四段格式（如 `31.59.20.176:6754:user:pass`）自动补成 `default_protocol://host:port`
+    ///   并把第三、第四段拆为认证信息
+    pub fn from_user_input(input: impl AsRef<str>, default_protocol: &str) -> Self {
+        let trimmed = input.as_ref().trim();
+        if let Some((host, port, username, password)) = parse_host_port_auth(trimmed) {
+            let protocol = default_protocol.trim().trim_end_matches("://");
+            let protocol = if protocol.is_empty() {
+                "http"
+            } else {
+                protocol
+            };
+            return Self::new(format!("{}://{}:{}", protocol, host, port))
+                .with_auth(username, password);
+        }
+
+        Self::new(trimmed)
+    }
+
     /// 设置认证信息
     pub fn with_auth(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
         self.username = Some(username.into());
         self.password = Some(password.into());
         self
     }
+}
+
+/// 解析常见代理商四段格式：`host:port:username:password`。
+///
+/// 这里故意只匹配“无 scheme、无 @、恰好四段、port 合法”的输入，避免误伤标准 URL、
+/// IPv6 字面量、以及其它自定义格式。用户名或密码里如果还包含冒号，建议使用标准 URL
+/// 或独立的 username/password 字段。
+fn parse_host_port_auth(input: &str) -> Option<(&str, u16, &str, &str)> {
+    if input.contains("://") || input.contains('@') {
+        return None;
+    }
+
+    let mut parts = input.split(':');
+    let host = parts.next()?.trim();
+    let port_raw = parts.next()?.trim();
+    let username = parts.next()?.trim();
+    let password = parts.next()?.trim();
+
+    // 恰好四段，避免把其它冒号格式猜错
+    if parts.next().is_some() {
+        return None;
+    }
+
+    if host.is_empty() || username.is_empty() || password.is_empty() {
+        return None;
+    }
+
+    let port = port_raw.parse::<u16>().ok()?;
+    Some((host, port, username, password))
 }
 
 /// 代理池选择策略
@@ -365,6 +415,31 @@ mod tests {
         assert_eq!(config.url, "socks5://127.0.0.1:1080");
         assert_eq!(config.username, Some("user".to_string()));
         assert_eq!(config.password, Some("pass".to_string()));
+    }
+
+    #[test]
+    fn test_proxy_config_from_host_port_auth() {
+        let config =
+            ProxyConfig::from_user_input("31.59.20.176:6754:wmkmhcil:8qcdmn0rh4ku", "http");
+        assert_eq!(config.url, "http://31.59.20.176:6754");
+        assert_eq!(config.username, Some("wmkmhcil".to_string()));
+        assert_eq!(config.password, Some("8qcdmn0rh4ku".to_string()));
+    }
+
+    #[test]
+    fn test_proxy_config_from_host_port_auth_custom_protocol() {
+        let config = ProxyConfig::from_user_input("proxy.example:1080:user:pass", "socks5h");
+        assert_eq!(config.url, "socks5h://proxy.example:1080");
+        assert_eq!(config.username, Some("user".to_string()));
+        assert_eq!(config.password, Some("pass".to_string()));
+    }
+
+    #[test]
+    fn test_proxy_config_from_user_input_keeps_standard_url() {
+        let config = ProxyConfig::from_user_input("socks5://user:pass@127.0.0.1:1080", "http");
+        assert_eq!(config.url, "socks5://user:pass@127.0.0.1:1080");
+        assert!(config.username.is_none());
+        assert!(config.password.is_none());
     }
 
     #[test]

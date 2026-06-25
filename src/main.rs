@@ -219,9 +219,11 @@ async fn main() {
 
     // 构建代理配置
     let proxy_config = config.proxy_url.as_ref().map(|url| {
-        let mut proxy = http_client::ProxyConfig::new(url);
+        let mut proxy = http_client::ProxyConfig::from_user_input(url, "http");
         if let (Some(username), Some(password)) = (&config.proxy_username, &config.proxy_password) {
-            proxy = proxy.with_auth(username, password);
+            if proxy.username.is_none() {
+                proxy = proxy.with_auth(username, password);
+            }
         }
         proxy
     });
