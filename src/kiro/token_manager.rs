@@ -2066,17 +2066,11 @@ impl MultiTokenManager {
         let normalized = SystemPromptConfig {
             enabled: value.enabled,
             mode: value.mode,
-            content: value.content.trim().to_string(),
+            content: value.content,
             replacements: value
                 .replacements
                 .into_iter()
-                .map(
-                    |replacement| crate::model::config::SystemPromptReplacement {
-                        old: replacement.old.trim().to_string(),
-                        new: replacement.new,
-                    },
-                )
-                .filter(|replacement| !replacement.old.is_empty())
+                .filter(|replacement| !replacement.old.trim().is_empty())
                 .collect(),
         };
 
@@ -2559,6 +2553,37 @@ mod tests {
             replacements: vec![crate::model::config::SystemPromptReplacement {
                 old: "AI".to_string(),
                 new: "Kiro".to_string(),
+            }],
+        };
+
+        manager.set_system_prompt(expected.clone()).unwrap();
+
+        let persisted = Config::load(&config_path).unwrap();
+        assert_eq!(persisted.system_prompt, expected);
+        assert_eq!(manager.get_system_prompt(), expected);
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[test]
+    fn test_set_system_prompt_preserves_whitespace_sensitive_values() {
+        let config_path = std::env::temp_dir().join(format!(
+            "kiro-system-prompt-whitespace-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&config_path, "{}").unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+        let expected = SystemPromptConfig {
+            enabled: true,
+            mode: crate::model::config::SystemPromptMode::Append,
+            content: "\n  Admin rule  \n".to_string(),
+            replacements: vec![crate::model::config::SystemPromptReplacement {
+                old: " Assistant".to_string(),
+                new: " Kiro".to_string(),
             }],
         };
 

@@ -710,7 +710,7 @@ fn apply_system_prompt_replacements(
 ) -> String {
     let mut next = content.to_string();
     for replacement in replacements {
-        if replacement.old.is_empty() {
+        if replacement.old.trim().is_empty() {
             continue;
         }
         next = next.replace(&replacement.old, &replacement.new);
@@ -724,8 +724,7 @@ fn system_messages_to_text(system: &Option<Vec<SystemMessage>>) -> String {
         .map(|messages| {
             messages
                 .iter()
-                .map(|message| message.text.trim())
-                .filter(|text| !text.is_empty())
+                .map(|message| message.text.as_str())
                 .collect::<Vec<_>>()
                 .join("\n")
         })
@@ -741,14 +740,14 @@ pub(crate) fn compose_system_messages(
         return system.clone();
     };
 
-    let admin_content = config.content.trim();
-    if !config.enabled || admin_content.is_empty() {
+    let admin_content = config.content.as_str();
+    if !config.enabled || admin_content.trim().is_empty() {
         return system.clone();
     }
 
     let client_content = system_messages_to_text(system);
     let merged = match config.mode {
-        SystemPromptMode::Append if !client_content.is_empty() => {
+        SystemPromptMode::Append if !client_content.trim().is_empty() => {
             format!("{}\n{}", client_content, admin_content)
         }
         SystemPromptMode::Append => admin_content.to_string(),
@@ -1081,6 +1080,34 @@ mod tests {
         let result = compose_system_messages(&system, Some(&config)).unwrap();
 
         assert_eq!(result[0].text, "Client Kiro\nUse Kiro");
+    }
+
+    #[test]
+    fn test_system_prompt_append_preserves_client_whitespace() {
+        let config = SystemPromptConfig {
+            enabled: true,
+            mode: SystemPromptMode::Append,
+            content: "Admin rule".to_string(),
+            replacements: vec![],
+        };
+        let system = Some(vec![
+            SystemMessage {
+                text: "\n  Client rule  ".to_string(),
+            },
+            SystemMessage {
+                text: "  ".to_string(),
+            },
+            SystemMessage {
+                text: "\nBoundary".to_string(),
+            },
+        ]);
+
+        let result = compose_system_messages(&system, Some(&config)).unwrap();
+
+        assert_eq!(
+            result[0].text,
+            "\n  Client rule  \n  \n\nBoundary\nAdmin rule"
+        );
     }
 
     #[test]

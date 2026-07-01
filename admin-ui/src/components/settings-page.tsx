@@ -245,23 +245,23 @@ export function SettingsPage({ onBack, onLogout }: SettingsPageProps) {
   }
 
   const handleSaveSystemPrompt = () => {
-    const replacements = []
+    const replacements: Array<{ old: string; new: string }> = []
     const seenOldValues = new Set<string>()
     for (const row of replacementRows) {
-      const oldValue = row.old.trim()
-      if (!oldValue && !row.new.trim()) {
+      const oldIsBlank = row.old.trim().length === 0
+      if (oldIsBlank && !row.new.trim()) {
         continue
       }
-      if (!oldValue) {
+      if (oldIsBlank) {
         toast.error('替换规则的原文不能为空')
         return
       }
-      if (seenOldValues.has(oldValue)) {
-        toast.error(`重复的替换原文: ${oldValue}`)
+      if (seenOldValues.has(row.old)) {
+        toast.error(`重复的替换原文: ${row.old}`)
         return
       }
-      seenOldValues.add(oldValue)
-      replacements.push({ old: oldValue, new: row.new })
+      seenOldValues.add(row.old)
+      replacements.push({ old: row.old, new: row.new })
     }
 
     saveSystemPrompt(
