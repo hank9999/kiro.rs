@@ -31,4 +31,5 @@ pub mod types;
 mod usage;
 mod websearch;
 
+pub(crate) use handlers::supported_models;
 pub use router::create_router_with_provider;

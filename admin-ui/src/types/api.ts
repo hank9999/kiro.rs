@@ -96,3 +96,20 @@ export interface CacheSimulationConfig {
   minimumInputTokens: number
   minimumUncachedTokens: number
 }
+
+export interface ModelIdMappingsConfig {
+  mappings: Record<string, string>
+}
+
+export interface SupportedModelItem {
+  id: string
+  displayName: string
+  ownedBy: string
+  maxTokens: number
+  supportsThinking: boolean
+  notes: string[]
+}
+
+export interface SupportedModelsResponse {
+  models: SupportedModelItem[]
+}

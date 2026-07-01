@@ -16,7 +16,8 @@ use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CacheSimulationResponse,
     CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
-    SetCacheSimulationRequest, SetLoadBalancingModeRequest,
+    ModelIdMappingsResponse, SetCacheSimulationRequest, SetLoadBalancingModeRequest,
+    SetModelIdMappingsRequest, SupportedModelItem, SupportedModelsResponse,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -345,6 +346,53 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(self.get_cache_simulation())
+    }
+
+    pub fn get_model_id_mappings(&self) -> ModelIdMappingsResponse {
+        ModelIdMappingsResponse {
+            mappings: self.token_manager.get_model_id_mappings(),
+        }
+    }
+
+    pub fn set_model_id_mappings(
+        &self,
+        req: SetModelIdMappingsRequest,
+    ) -> Result<ModelIdMappingsResponse, AdminServiceError> {
+        self.token_manager
+            .set_model_id_mappings(req.mappings)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(self.get_model_id_mappings())
+    }
+
+    pub fn get_supported_models(&self) -> SupportedModelsResponse {
+        let models = crate::anthropic::supported_models()
+            .into_iter()
+            .map(|model| {
+                let mut notes = Vec::new();
+                let id_lower = model.id.to_lowercase();
+                if id_lower.contains("opus") {
+                    notes.push("Opus may require a paid account".to_string());
+                }
+                if model.max_tokens >= 128_000 {
+                    notes.push("Large context window".to_string());
+                }
+                if id_lower.contains("coder") {
+                    notes.push("Coding-oriented model".to_string());
+                }
+
+                SupportedModelItem {
+                    supports_thinking: id_lower.contains("thinking"),
+                    id: model.id,
+                    display_name: model.display_name,
+                    owned_by: model.owned_by,
+                    max_tokens: model.max_tokens,
+                    notes,
+                }
+            })
+            .collect();
+
+        SupportedModelsResponse { models }
     }
 
     /// 强制刷新指定凭据的 Token

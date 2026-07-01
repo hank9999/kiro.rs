@@ -9,6 +9,8 @@ import type {
   AddCredentialRequest,
   AddCredentialResponse,
   CacheSimulationConfig,
+  ModelIdMappingsConfig,
+  SupportedModelsResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -118,5 +120,25 @@ export async function setCacheSimulation(
     '/config/cache-simulation',
     config
   )
+  return data
+}
+
+export async function getModelIdMappings(): Promise<ModelIdMappingsConfig> {
+  const { data } = await api.get<ModelIdMappingsConfig>('/config/model-id-mappings')
+  return data
+}
+
+export async function setModelIdMappings(
+  config: ModelIdMappingsConfig
+): Promise<ModelIdMappingsConfig> {
+  const { data } = await api.put<ModelIdMappingsConfig>(
+    '/config/model-id-mappings',
+    config
+  )
+  return data
+}
+
+export async function getSupportedModels(): Promise<SupportedModelsResponse> {
+  const { data } = await api.get<SupportedModelsResponse>('/config/supported-models')
   return data
 }

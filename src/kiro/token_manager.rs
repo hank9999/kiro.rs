@@ -521,6 +521,7 @@ pub struct MultiTokenManager {
     load_balancing_mode: Mutex<String>,
     /// Anthropic usage 缓存命中模拟配置（运行时可修改）
     cache_simulation: Mutex<CacheSimulationConfig>,
+    model_id_mappings: Mutex<HashMap<String, String>>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -644,6 +645,7 @@ impl MultiTokenManager {
 
         let load_balancing_mode = config.load_balancing_mode.clone();
         let cache_simulation = config.cache_simulation;
+        let model_id_mappings = config.model_id_mappings.clone();
         let manager = Self {
             config,
             proxy,
@@ -654,6 +656,7 @@ impl MultiTokenManager {
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
             cache_simulation: Mutex::new(cache_simulation),
+            model_id_mappings: Mutex::new(model_id_mappings),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -1926,6 +1929,18 @@ impl MultiTokenManager {
         *self.cache_simulation.lock()
     }
 
+    pub fn get_model_id_mappings(&self) -> HashMap<String, String> {
+        self.model_id_mappings.lock().clone()
+    }
+
+    pub fn resolve_model_id(&self, model: &str) -> String {
+        self.model_id_mappings
+            .lock()
+            .get(model)
+            .cloned()
+            .unwrap_or_else(|| model.to_string())
+    }
+
     fn persist_cache_simulation(&self, value: CacheSimulationConfig) -> anyhow::Result<()> {
         use anyhow::Context;
 
@@ -1976,6 +1991,47 @@ impl MultiTokenManager {
             minimum_uncached_tokens = value.minimum_uncached_tokens,
             "缓存模拟设置已更新"
         );
+        Ok(())
+    }
+
+    fn persist_model_id_mappings(&self, value: &HashMap<String, String>) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，模型 ID 映射仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.model_id_mappings = value.clone();
+        config
+            .save()
+            .with_context(|| format!("持久化模型 ID 映射失败: {}", config_path.display()))
+    }
+
+    pub fn set_model_id_mappings(&self, value: HashMap<String, String>) -> anyhow::Result<()> {
+        let normalized: HashMap<String, String> = value
+            .into_iter()
+            .map(|(public, real)| (public.trim().to_string(), real.trim().to_string()))
+            .filter(|(public, real)| !public.is_empty() && !real.is_empty())
+            .collect();
+
+        let previous = self.get_model_id_mappings();
+        if previous == normalized {
+            return Ok(());
+        }
+
+        *self.model_id_mappings.lock() = normalized.clone();
+        if let Err(err) = self.persist_model_id_mappings(&normalized) {
+            *self.model_id_mappings.lock() = previous;
+            return Err(err);
+        }
+
+        tracing::info!(count = normalized.len(), "模型 ID 映射已更新");
         Ok(())
     }
 }
@@ -2386,6 +2442,37 @@ mod tests {
         let persisted = Config::load(&config_path).unwrap();
         assert_eq!(persisted.cache_simulation, expected);
         assert_eq!(manager.get_cache_simulation(), expected);
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[test]
+    fn test_set_model_id_mappings_persists_to_config_file() {
+        let config_path = std::env::temp_dir().join(format!(
+            "kiro-model-id-mappings-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&config_path, "{}").unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+        let expected = HashMap::from([
+            ("public-sonnet".to_string(), "claude-sonnet-4-6".to_string()),
+            ("public-fast".to_string(), "claude-sonnet-4-6".to_string()),
+        ]);
+
+        manager.set_model_id_mappings(expected.clone()).unwrap();
+
+        let persisted = Config::load(&config_path).unwrap();
+        assert_eq!(persisted.model_id_mappings, expected);
+        assert_eq!(manager.get_model_id_mappings(), expected);
+        assert_eq!(
+            manager.resolve_model_id("public-sonnet"),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(manager.resolve_model_id("unknown-model"), "unknown-model");
 
         std::fs::remove_file(&config_path).unwrap();
     }

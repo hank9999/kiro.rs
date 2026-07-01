@@ -129,6 +129,10 @@ pub struct Config {
     #[serde(default)]
     pub cache_simulation: CacheSimulationConfig,
 
+    /// Public model ID -> real upstream model ID mappings.
+    #[serde(default)]
+    pub model_id_mappings: HashMap<String, String>,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -236,6 +240,7 @@ impl Default for Config {
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             cache_simulation: CacheSimulationConfig::default(),
+            model_id_mappings: HashMap::new(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),

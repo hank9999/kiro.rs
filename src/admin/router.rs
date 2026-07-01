@@ -8,9 +8,10 @@ use axum::{
 use super::{
     handlers::{
         add_credential, delete_credential, force_refresh_token, get_all_credentials,
-        get_cache_simulation, get_credential_balance, get_load_balancing_mode, reset_failure_count,
-        set_cache_simulation, set_credential_disabled, set_credential_priority,
-        set_load_balancing_mode,
+        get_cache_simulation, get_credential_balance, get_load_balancing_mode,
+        get_model_id_mappings, get_supported_models, reset_failure_count, set_cache_simulation,
+        set_credential_disabled, set_credential_priority, set_load_balancing_mode,
+        set_model_id_mappings,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -53,6 +54,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/config/cache-simulation",
             get(get_cache_simulation).put(set_cache_simulation),
         )
+        .route(
+            "/config/model-id-mappings",
+            get(get_model_id_mappings).put(set_model_id_mappings),
+        )
+        .route("/config/supported-models", get(get_supported_models))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

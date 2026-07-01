@@ -39,6 +39,14 @@ fn sample_cache_simulation(state: &AppState) -> CacheSimulationDecision {
         .unwrap_or_default()
 }
 
+fn resolve_model_id(state: &AppState, model: &str) -> String {
+    state
+        .token_manager
+        .as_ref()
+        .map(|manager| manager.resolve_model_id(model))
+        .unwrap_or_else(|| model.to_string())
+}
+
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
@@ -79,13 +87,8 @@ fn map_provider_error(err: Error) -> Response {
         .into_response()
 }
 
-/// GET /v1/models
-///
-/// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
-    tracing::info!("Received GET /v1/models request");
-
-    let models = vec![
+pub(crate) fn supported_models() -> Vec<Model> {
+    vec![
         Model {
             id: "claude-opus-4-8".to_string(),
             object: "model".to_string(),
@@ -258,7 +261,44 @@ pub async fn get_models() -> impl IntoResponse {
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
-    ];
+    ]
+}
+
+/// GET /v1/models
+///
+/// 返回可用的模型列表
+pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
+    tracing::info!("Received GET /v1/models request");
+
+    let mut models = supported_models();
+
+    if let Some(manager) = &state.token_manager {
+        let mappings = manager.get_model_id_mappings();
+        for (public_id, real_id) in mappings {
+            if models.iter().any(|model| model.id == public_id) {
+                continue;
+            }
+
+            let mut mapped_model = models
+                .iter()
+                .find(|model| model.id == real_id)
+                .cloned()
+                .unwrap_or_else(|| Model {
+                    id: public_id.clone(),
+                    object: "model".to_string(),
+                    created: 0,
+                    owned_by: "mapped".to_string(),
+                    display_name: public_id.clone(),
+                    model_type: "chat".to_string(),
+                    max_tokens: 200_000,
+                });
+            mapped_model.id = public_id.clone();
+            if mapped_model.display_name == real_id {
+                mapped_model.display_name = public_id;
+            }
+            models.push(mapped_model);
+        }
+    }
 
     Json(ModelsResponse {
         object: "list".to_string(),
@@ -296,9 +336,12 @@ pub async fn post_messages(
         }
     };
     let cache_simulation = sample_cache_simulation(&state);
+    let response_model = payload.model.clone();
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    let upstream_model = resolve_model_id(&state, &response_model);
+    payload.model = upstream_model.clone();
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -315,6 +358,7 @@ pub async fn post_messages(
         return websearch::handle_websearch_request(
             provider,
             &payload,
+            &response_model,
             input_tokens,
             cache_simulation,
         )
@@ -387,7 +431,8 @@ pub async fn post_messages(
         handle_stream_request(
             provider,
             &request_body,
-            &payload.model,
+            &response_model,
+            &upstream_model,
             input_tokens,
             thinking_enabled,
             tool_name_map,
@@ -400,7 +445,8 @@ pub async fn post_messages(
         handle_non_stream_request(
             provider,
             &request_body,
-            &payload.model,
+            &response_model,
+            &upstream_model,
             input_tokens,
             extract_thinking,
             tool_name_map,
@@ -415,6 +461,7 @@ async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
+    context_model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
@@ -427,9 +474,14 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx =
-        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map)
-            .with_cache_simulation(cache_simulation);
+    let mut ctx = StreamContext::new_with_context_model(
+        model,
+        context_model,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+    )
+    .with_cache_simulation(cache_simulation);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -554,6 +606,7 @@ async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
+    context_model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
@@ -645,7 +698,7 @@ async fn handle_non_stream_request(
                         }
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
-                            let window_size = get_context_window_size(model);
+                            let window_size = get_context_window_size(context_model);
                             let actual_input_tokens =
                                 (context_usage.context_usage_percentage * (window_size as f64)
                                     / 100.0) as i32;
@@ -770,6 +823,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 ///
 /// 计算消息的 token 数量
 pub async fn count_tokens(
+    State(state): State<AppState>,
     JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
 ) -> impl IntoResponse {
     tracing::info!(
@@ -779,7 +833,7 @@ pub async fn count_tokens(
     );
 
     let total_tokens = token::count_all_tokens(
-        payload.model,
+        resolve_model_id(&state, &payload.model),
         payload.system,
         payload.messages,
         payload.tools,
@@ -823,9 +877,12 @@ pub async fn post_messages_cc(
         }
     };
     let cache_simulation = sample_cache_simulation(&state);
+    let response_model = payload.model.clone();
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    let upstream_model = resolve_model_id(&state, &response_model);
+    payload.model = upstream_model.clone();
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -842,6 +899,7 @@ pub async fn post_messages_cc(
         return websearch::handle_websearch_request(
             provider,
             &payload,
+            &response_model,
             input_tokens,
             cache_simulation,
         )
@@ -914,7 +972,8 @@ pub async fn post_messages_cc(
         handle_stream_request_buffered(
             provider,
             &request_body,
-            &payload.model,
+            &response_model,
+            &upstream_model,
             input_tokens,
             thinking_enabled,
             tool_name_map,
@@ -927,7 +986,8 @@ pub async fn post_messages_cc(
         handle_non_stream_request(
             provider,
             &request_body,
-            &payload.model,
+            &response_model,
+            &upstream_model,
             input_tokens,
             extract_thinking,
             tool_name_map,
@@ -945,6 +1005,7 @@ async fn handle_stream_request_buffered(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
+    context_model: &str,
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
@@ -957,8 +1018,9 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(
+    let ctx = BufferedStreamContext::new_with_context_model(
         model,
+        context_model,
         estimated_input_tokens,
         thinking_enabled,
         tool_name_map,

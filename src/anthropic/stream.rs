@@ -503,6 +503,7 @@ pub struct StreamContext {
     pub state_manager: SseStateManager,
     /// 请求的模型名称
     pub model: String,
+    pub context_model: String,
     /// 消息 ID
     pub message_id: String,
     /// 输入 tokens（估算值）
@@ -535,8 +536,26 @@ pub struct StreamContext {
 
 impl StreamContext {
     /// 创建启用thinking的StreamContext
+    #[allow(dead_code)]
     pub fn new_with_thinking(
         model: impl Into<String>,
+        input_tokens: i32,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+    ) -> Self {
+        let model = model.into();
+        Self::new_with_context_model(
+            model.clone(),
+            model,
+            input_tokens,
+            thinking_enabled,
+            tool_name_map,
+        )
+    }
+
+    pub fn new_with_context_model(
+        model: impl Into<String>,
+        context_model: impl Into<String>,
         input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
@@ -544,6 +563,7 @@ impl StreamContext {
         Self {
             state_manager: SseStateManager::new(),
             model: model.into(),
+            context_model: context_model.into(),
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_tokens,
             cache_simulation: CacheSimulationDecision::default(),
@@ -630,7 +650,7 @@ impl StreamContext {
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
-                let window_size = get_context_window_size(&self.model);
+                let window_size = get_context_window_size(&self.context_model);
                 let actual_input_tokens =
                     (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
                 self.context_input_tokens = Some(actual_input_tokens);
@@ -1144,14 +1164,33 @@ pub struct BufferedStreamContext {
 
 impl BufferedStreamContext {
     /// 创建缓冲流上下文
+    #[allow(dead_code)]
     pub fn new(
         model: impl Into<String>,
         estimated_input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
-        let inner = StreamContext::new_with_thinking(
+        let model = model.into();
+        Self::new_with_context_model(
+            model.clone(),
             model,
+            estimated_input_tokens,
+            thinking_enabled,
+            tool_name_map,
+        )
+    }
+
+    pub fn new_with_context_model(
+        model: impl Into<String>,
+        context_model: impl Into<String>,
+        estimated_input_tokens: i32,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+    ) -> Self {
+        let inner = StreamContext::new_with_context_model(
+            model,
+            context_model,
             estimated_input_tokens,
             thinking_enabled,
             tool_name_map,

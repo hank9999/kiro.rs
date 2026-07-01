@@ -1,6 +1,7 @@
 //! Admin API 类型定义
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // ============ 凭据状态 ============
 
@@ -218,6 +219,35 @@ pub struct SetCacheSimulationRequest {
     pub max_cache_ratio: u8,
     pub minimum_input_tokens: u32,
     pub minimum_uncached_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelIdMappingsResponse {
+    pub mappings: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetModelIdMappingsRequest {
+    pub mappings: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportedModelItem {
+    pub id: String,
+    pub display_name: String,
+    pub owned_by: String,
+    pub max_tokens: i32,
+    pub supports_thinking: bool,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportedModelsResponse {
+    pub models: Vec<SupportedModelItem>,
 }
 
 // ============ 通用响应 ============

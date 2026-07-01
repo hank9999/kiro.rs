@@ -12,8 +12,15 @@ import {
   setLoadBalancingMode,
   getCacheSimulation,
   setCacheSimulation,
+  getModelIdMappings,
+  setModelIdMappings,
+  getSupportedModels,
 } from '@/api/credentials'
-import type { AddCredentialRequest, CacheSimulationConfig } from '@/types/api'
+import type {
+  AddCredentialRequest,
+  CacheSimulationConfig,
+  ModelIdMappingsConfig,
+} from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -135,5 +142,29 @@ export function useSetCacheSimulation() {
     onSuccess: (data) => {
       queryClient.setQueryData(['cacheSimulation'], data)
     },
+  })
+}
+
+export function useModelIdMappings() {
+  return useQuery({
+    queryKey: ['modelIdMappings'],
+    queryFn: getModelIdMappings,
+  })
+}
+
+export function useSetModelIdMappings() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (config: ModelIdMappingsConfig) => setModelIdMappings(config),
+    onSuccess: (data) => {
+      queryClient.setQueryData(['modelIdMappings'], data)
+    },
+  })
+}
+
+export function useSupportedModels() {
+  return useQuery({
+    queryKey: ['supportedModels'],
+    queryFn: getSupportedModels,
   })
 }

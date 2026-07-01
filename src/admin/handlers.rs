@@ -10,7 +10,8 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, SetCacheSimulationRequest, SetDisabledRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
+        SetLoadBalancingModeRequest, SetModelIdMappingsRequest, SetPriorityRequest,
+        SuccessResponse,
     },
 };
 
@@ -155,4 +156,25 @@ pub async fn set_cache_simulation(
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// GET /api/admin/config/model-id-mappings
+pub async fn get_model_id_mappings(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_model_id_mappings())
+}
+
+/// PUT /api/admin/config/model-id-mappings
+pub async fn set_model_id_mappings(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetModelIdMappingsRequest>,
+) -> impl IntoResponse {
+    match state.service.set_model_id_mappings(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/supported-models
+pub async fn get_supported_models(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_supported_models())
 }

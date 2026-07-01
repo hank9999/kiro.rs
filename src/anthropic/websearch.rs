@@ -484,6 +484,7 @@ fn generate_search_summary(query: &str, results: &Option<WebSearchResults>) -> S
 pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
+    response_model: &str,
     input_tokens: i32,
     cache_simulation: CacheSimulationDecision,
 ) -> Response {
@@ -517,7 +518,7 @@ pub async fn handle_websearch_request(
     };
 
     // 4. 生成 SSE 响应
-    let model = payload.model.clone();
+    let model = response_model.to_string();
     let stream = create_websearch_sse_stream(
         model,
         query,

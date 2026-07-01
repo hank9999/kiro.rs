@@ -103,7 +103,7 @@ pub fn map_model(model: &str) -> Option<String> {
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-sonnet-4.5".to_string())
         } else {
-            None
+            Some("claude-sonnet-4.5".to_string())
         }
     } else if model_lower.contains("opus") {
         if model_lower.contains("4-5") || model_lower.contains("4.5") {
@@ -115,7 +115,7 @@ pub fn map_model(model: &str) -> Option<String> {
         } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
             Some("claude-opus-4.8".to_string())
         } else {
-            None
+            Some("claude-opus-4.5".to_string())
         }
     } else if model_lower.contains("haiku") {
         Some("claude-haiku-4.5".to_string())
