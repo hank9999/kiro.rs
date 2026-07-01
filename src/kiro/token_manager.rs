@@ -23,7 +23,7 @@ use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::model::config::{CacheSimulationConfig, Config};
+use crate::model::config::{CacheSimulationConfig, Config, SystemPromptConfig};
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -522,6 +522,8 @@ pub struct MultiTokenManager {
     /// Anthropic usage 缓存命中模拟配置（运行时可修改）
     cache_simulation: Mutex<CacheSimulationConfig>,
     model_id_mappings: Mutex<HashMap<String, String>>,
+    /// 管理员系统提示词配置（运行时可修改）
+    system_prompt: Mutex<SystemPromptConfig>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -646,6 +648,7 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let cache_simulation = config.cache_simulation;
         let model_id_mappings = config.model_id_mappings.clone();
+        let system_prompt = config.system_prompt.clone();
         let manager = Self {
             config,
             proxy,
@@ -657,6 +660,7 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             cache_simulation: Mutex::new(cache_simulation),
             model_id_mappings: Mutex::new(model_id_mappings),
+            system_prompt: Mutex::new(system_prompt),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -1933,6 +1937,10 @@ impl MultiTokenManager {
         self.model_id_mappings.lock().clone()
     }
 
+    pub fn get_system_prompt(&self) -> SystemPromptConfig {
+        self.system_prompt.lock().clone()
+    }
+
     pub fn resolve_model_id(&self, model: &str) -> String {
         self.model_id_mappings
             .lock()
@@ -2032,6 +2040,63 @@ impl MultiTokenManager {
         }
 
         tracing::info!(count = normalized.len(), "模型 ID 映射已更新");
+        Ok(())
+    }
+
+    fn persist_system_prompt(&self, value: &SystemPromptConfig) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，系统提示词设置仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.system_prompt = value.clone();
+        config
+            .save()
+            .with_context(|| format!("持久化系统提示词设置失败: {}", config_path.display()))
+    }
+
+    pub fn set_system_prompt(&self, value: SystemPromptConfig) -> anyhow::Result<()> {
+        let normalized = SystemPromptConfig {
+            enabled: value.enabled,
+            mode: value.mode,
+            content: value.content.trim().to_string(),
+            replacements: value
+                .replacements
+                .into_iter()
+                .map(
+                    |replacement| crate::model::config::SystemPromptReplacement {
+                        old: replacement.old.trim().to_string(),
+                        new: replacement.new,
+                    },
+                )
+                .filter(|replacement| !replacement.old.is_empty())
+                .collect(),
+        };
+
+        let previous = self.get_system_prompt();
+        if previous == normalized {
+            return Ok(());
+        }
+
+        *self.system_prompt.lock() = normalized.clone();
+        if let Err(err) = self.persist_system_prompt(&normalized) {
+            *self.system_prompt.lock() = previous;
+            return Err(err);
+        }
+
+        tracing::info!(
+            enabled = normalized.enabled,
+            mode = ?normalized.mode,
+            replacement_count = normalized.replacements.len(),
+            "系统提示词设置已更新"
+        );
         Ok(())
     }
 }
@@ -2473,6 +2538,35 @@ mod tests {
             "claude-sonnet-4-6"
         );
         assert_eq!(manager.resolve_model_id("unknown-model"), "unknown-model");
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[test]
+    fn test_set_system_prompt_persists_to_config_file() {
+        let config_path =
+            std::env::temp_dir().join(format!("kiro-system-prompt-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&config_path, "{}").unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+        let expected = SystemPromptConfig {
+            enabled: true,
+            mode: crate::model::config::SystemPromptMode::Overwrite,
+            content: "Admin rule".to_string(),
+            replacements: vec![crate::model::config::SystemPromptReplacement {
+                old: "AI".to_string(),
+                new: "Kiro".to_string(),
+            }],
+        };
+
+        manager.set_system_prompt(expected.clone()).unwrap();
+
+        let persisted = Config::load(&config_path).unwrap();
+        assert_eq!(persisted.system_prompt, expected);
+        assert_eq!(manager.get_system_prompt(), expected);
 
         std::fs::remove_file(&config_path).unwrap();
     }

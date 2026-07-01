@@ -10,6 +10,7 @@ import type {
   AddCredentialResponse,
   CacheSimulationConfig,
   ModelIdMappingsConfig,
+  SystemPromptConfig,
   SupportedModelsResponse,
 } from '@/types/api'
 
@@ -140,5 +141,20 @@ export async function setModelIdMappings(
 
 export async function getSupportedModels(): Promise<SupportedModelsResponse> {
   const { data } = await api.get<SupportedModelsResponse>('/config/supported-models')
+  return data
+}
+
+export async function getSystemPrompt(): Promise<SystemPromptConfig> {
+  const { data } = await api.get<SystemPromptConfig>('/config/system-prompt')
+  return data
+}
+
+export async function setSystemPrompt(
+  config: SystemPromptConfig
+): Promise<SystemPromptConfig> {
+  const { data } = await api.put<SystemPromptConfig>(
+    '/config/system-prompt',
+    config
+  )
   return data
 }

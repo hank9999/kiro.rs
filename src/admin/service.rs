@@ -10,14 +10,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
-use crate::model::config::CacheSimulationConfig;
+use crate::model::config::{CacheSimulationConfig, SystemPromptConfig};
 
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CacheSimulationResponse,
     CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
     ModelIdMappingsResponse, SetCacheSimulationRequest, SetLoadBalancingModeRequest,
-    SetModelIdMappingsRequest, SupportedModelItem, SupportedModelsResponse,
+    SetModelIdMappingsRequest, SetSystemPromptConfigRequest, SupportedModelItem,
+    SupportedModelsResponse, SystemPromptConfigResponse,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -393,6 +394,32 @@ impl AdminService {
             .collect();
 
         SupportedModelsResponse { models }
+    }
+
+    pub fn get_system_prompt(&self) -> SystemPromptConfigResponse {
+        let value = self.token_manager.get_system_prompt();
+        SystemPromptConfigResponse {
+            enabled: value.enabled,
+            mode: value.mode,
+            content: value.content,
+            replacements: value.replacements,
+        }
+    }
+
+    pub fn set_system_prompt(
+        &self,
+        req: SetSystemPromptConfigRequest,
+    ) -> Result<SystemPromptConfigResponse, AdminServiceError> {
+        self.token_manager
+            .set_system_prompt(SystemPromptConfig {
+                enabled: req.enabled,
+                mode: req.mode,
+                content: req.content,
+                replacements: req.replacements,
+            })
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(self.get_system_prompt())
     }
 
     /// 强制刷新指定凭据的 Token

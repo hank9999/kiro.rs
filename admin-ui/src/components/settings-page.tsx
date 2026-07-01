@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { ArrowLeft, LogOut, Plus, Save, Server, Trash2 } from 'lucide-react'
+import { ArrowLeft, FileText, LogOut, Plus, Save, Server, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
 import { useQueryClient } from '@tanstack/react-query'
 import { Button } from '@/components/ui/button'
@@ -11,7 +11,9 @@ import {
   useModelIdMappings,
   useSetCacheSimulation,
   useSetModelIdMappings,
+  useSetSystemPrompt,
   useSupportedModels,
+  useSystemPrompt,
 } from '@/hooks/use-credentials'
 import { storage } from '@/lib/storage'
 import { extractErrorMessage } from '@/lib/utils'
@@ -25,6 +27,13 @@ export function SettingsPage({ onBack, onLogout }: SettingsPageProps) {
   const queryClient = useQueryClient()
   const { data, isLoading, error } = useCacheSimulation()
   const { mutate: save, isPending } = useSetCacheSimulation()
+  const {
+    data: systemPromptData,
+    isLoading: isSystemPromptLoading,
+    error: systemPromptError,
+  } = useSystemPrompt()
+  const { mutate: saveSystemPrompt, isPending: isSavingSystemPrompt } =
+    useSetSystemPrompt()
   const {
     data: modelMappingsData,
     isLoading: isModelMappingsLoading,
@@ -41,6 +50,14 @@ export function SettingsPage({ onBack, onLogout }: SettingsPageProps) {
   const [minimumUncachedTokens, setMinimumUncachedTokens] = useState(64)
   const [mappingRows, setMappingRows] = useState<
     Array<{ id: string; publicId: string; realId: string }>
+  >([])
+  const [systemPromptEnabled, setSystemPromptEnabled] = useState(false)
+  const [systemPromptMode, setSystemPromptMode] = useState<'append' | 'overwrite'>(
+    'append'
+  )
+  const [systemPromptContent, setSystemPromptContent] = useState('')
+  const [replacementRows, setReplacementRows] = useState<
+    Array<{ id: string; old: string; new: string }>
   >([])
   const supportedModels = supportedModelsData?.models ?? []
 
@@ -65,6 +82,19 @@ export function SettingsPage({ onBack, onLogout }: SettingsPageProps) {
     )
     setMappingRows(rows.length > 0 ? rows : [{ id: 'new-0', publicId: '', realId: '' }])
   }, [modelMappingsData])
+
+  useEffect(() => {
+    if (!systemPromptData) return
+    setSystemPromptEnabled(systemPromptData.enabled)
+    setSystemPromptMode(systemPromptData.mode)
+    setSystemPromptContent(systemPromptData.content)
+    const rows = systemPromptData.replacements.map((replacement, index) => ({
+      id: `${replacement.old}-${index}`,
+      old: replacement.old,
+      new: replacement.new,
+    }))
+    setReplacementRows(rows.length > 0 ? rows : [{ id: 'replacement-0', old: '', new: '' }])
+  }, [systemPromptData])
 
   const handleLogout = () => {
     storage.removeApiKey()
@@ -193,6 +223,77 @@ export function SettingsPage({ onBack, onLogout }: SettingsPageProps) {
     )
   }
 
+  const addReplacementRow = () => {
+    setReplacementRows((rows) => [
+      ...rows,
+      { id: `replacement-${Date.now()}`, old: '', new: '' },
+    ])
+  }
+
+  const updateReplacementRow = (
+    id: string,
+    field: 'old' | 'new',
+    value: string
+  ) => {
+    setReplacementRows((rows) =>
+      rows.map((row) => (row.id === id ? { ...row, [field]: value } : row))
+    )
+  }
+
+  const removeReplacementRow = (id: string) => {
+    setReplacementRows((rows) => rows.filter((row) => row.id !== id))
+  }
+
+  const handleSaveSystemPrompt = () => {
+    const replacements = []
+    const seenOldValues = new Set<string>()
+    for (const row of replacementRows) {
+      const oldValue = row.old.trim()
+      if (!oldValue && !row.new.trim()) {
+        continue
+      }
+      if (!oldValue) {
+        toast.error('替换规则的原文不能为空')
+        return
+      }
+      if (seenOldValues.has(oldValue)) {
+        toast.error(`重复的替换原文: ${oldValue}`)
+        return
+      }
+      seenOldValues.add(oldValue)
+      replacements.push({ old: oldValue, new: row.new })
+    }
+
+    saveSystemPrompt(
+      {
+        enabled: systemPromptEnabled,
+        mode: systemPromptMode,
+        content: systemPromptContent,
+        replacements,
+      },
+      {
+        onSuccess: (saved) => {
+          setSystemPromptEnabled(saved.enabled)
+          setSystemPromptMode(saved.mode)
+          setSystemPromptContent(saved.content)
+          setReplacementRows(
+            saved.replacements.length > 0
+              ? saved.replacements.map((replacement, index) => ({
+                  id: `${replacement.old}-${index}`,
+                  old: replacement.old,
+                  new: replacement.new,
+                }))
+              : [{ id: 'replacement-0', old: '', new: '' }]
+          )
+          toast.success('系统提示词设置已保存')
+        },
+        onError: (saveError) => {
+          toast.error(`保存失败: ${extractErrorMessage(saveError)}`)
+        },
+      }
+    )
+  }
+
   return (
     <div className="min-h-screen bg-background">
       <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
@@ -217,6 +318,146 @@ export function SettingsPage({ onBack, onLogout }: SettingsPageProps) {
           <h1 className="text-2xl font-semibold">设置</h1>
           <p className="mt-1 text-sm text-muted-foreground">响应与计费字段控制</p>
         </div>
+
+        <Card className="mb-6">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <FileText className="h-4 w-4" />
+              系统提示词
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            {isSystemPromptLoading ? (
+              <div className="py-8 text-center text-sm text-muted-foreground">加载中...</div>
+            ) : systemPromptError ? (
+              <div className="py-8 text-center text-sm text-destructive">
+                {extractErrorMessage(systemPromptError)}
+              </div>
+            ) : (
+              <>
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <div className="font-medium">启用自定义系统提示词</div>
+                    <div className="mt-1 text-sm text-muted-foreground">
+                      开启后会在请求转发前合成最终 system prompt
+                    </div>
+                  </div>
+                  <Switch
+                    checked={systemPromptEnabled}
+                    onCheckedChange={setSystemPromptEnabled}
+                  />
+                </div>
+
+                <div className="space-y-3">
+                  <div className="text-sm font-medium">注入模式</div>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <Button
+                      type="button"
+                      variant={systemPromptMode === 'append' ? 'default' : 'outline'}
+                      onClick={() => setSystemPromptMode('append')}
+                      disabled={!systemPromptEnabled}
+                    >
+                      追加到原提示词
+                    </Button>
+                    <Button
+                      type="button"
+                      variant={systemPromptMode === 'overwrite' ? 'default' : 'outline'}
+                      onClick={() => setSystemPromptMode('overwrite')}
+                      disabled={!systemPromptEnabled}
+                    >
+                      覆盖原提示词
+                    </Button>
+                  </div>
+                </div>
+
+                <label className="block space-y-2">
+                  <span className="text-sm font-medium">提示词正文</span>
+                  <textarea
+                    className="min-h-48 w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm leading-6 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                    value={systemPromptContent}
+                    onChange={(event) => setSystemPromptContent(event.target.value)}
+                    placeholder="输入要覆盖或追加的系统提示词"
+                    disabled={!systemPromptEnabled}
+                  />
+                </label>
+
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-medium">替换规则</div>
+                      <div className="mt-1 text-xs text-muted-foreground">
+                        保存时会按顺序替换最终系统提示词中的文本
+                      </div>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={addReplacementRow}
+                      disabled={!systemPromptEnabled}
+                    >
+                      <Plus className="mr-2 h-4 w-4" />
+                      添加
+                    </Button>
+                  </div>
+
+                  <div className="space-y-3">
+                    {replacementRows.map((row) => (
+                      <div
+                        key={row.id}
+                        className="grid gap-3 rounded-md border bg-muted/20 p-3 md:grid-cols-[1fr_1fr_40px] md:items-end"
+                      >
+                        <label className="space-y-2">
+                          <span className="text-sm font-medium">原文</span>
+                          <Input
+                            value={row.old}
+                            onChange={(event) =>
+                              updateReplacementRow(row.id, 'old', event.target.value)
+                            }
+                            placeholder="需要替换的文本"
+                            disabled={!systemPromptEnabled}
+                          />
+                        </label>
+                        <label className="space-y-2">
+                          <span className="text-sm font-medium">替换为</span>
+                          <Input
+                            value={row.new}
+                            onChange={(event) =>
+                              updateReplacementRow(row.id, 'new', event.target.value)
+                            }
+                            placeholder="新的文本"
+                            disabled={!systemPromptEnabled}
+                          />
+                        </label>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="icon"
+                          className="justify-self-start md:justify-self-end"
+                          onClick={() => removeReplacementRow(row.id)}
+                          disabled={!systemPromptEnabled}
+                          title="删除替换规则"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="flex justify-end border-t pt-5">
+                  <Button
+                    onClick={handleSaveSystemPrompt}
+                    disabled={isSavingSystemPrompt}
+                  >
+                    <Save className="mr-2 h-4 w-4" />
+                    {isSavingSystemPrompt ? '保存中...' : '保存提示词'}
+                  </Button>
+                </div>
+              </>
+            )}
+          </CardContent>
+        </Card>
 
         <Card>
           <CardHeader>

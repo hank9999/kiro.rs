@@ -11,7 +11,7 @@ use super::{
     types::{
         AddCredentialRequest, SetCacheSimulationRequest, SetDisabledRequest,
         SetLoadBalancingModeRequest, SetModelIdMappingsRequest, SetPriorityRequest,
-        SuccessResponse,
+        SetSystemPromptConfigRequest, SuccessResponse,
     },
 };
 
@@ -177,4 +177,20 @@ pub async fn set_model_id_mappings(
 /// GET /api/admin/config/supported-models
 pub async fn get_supported_models(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.get_supported_models())
+}
+
+/// GET /api/admin/config/system-prompt
+pub async fn get_system_prompt(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_system_prompt())
+}
+
+/// PUT /api/admin/config/system-prompt
+pub async fn set_system_prompt(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetSystemPromptConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_system_prompt(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }

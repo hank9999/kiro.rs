@@ -52,6 +52,53 @@ impl Default for CacheSimulationConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SystemPromptMode {
+    Append,
+    Overwrite,
+}
+
+impl Default for SystemPromptMode {
+    fn default() -> Self {
+        Self::Append
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemPromptReplacement {
+    pub old: String,
+    pub new: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemPromptConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub mode: SystemPromptMode,
+
+    #[serde(default)]
+    pub content: String,
+
+    #[serde(default)]
+    pub replacements: Vec<SystemPromptReplacement>,
+}
+
+impl Default for SystemPromptConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: SystemPromptMode::Append,
+            content: String::new(),
+            replacements: Vec::new(),
+        }
+    }
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -132,6 +179,10 @@ pub struct Config {
     /// Public model ID -> real upstream model ID mappings.
     #[serde(default)]
     pub model_id_mappings: HashMap<String, String>,
+
+    /// 管理员配置的系统提示词注入规则
+    #[serde(default)]
+    pub system_prompt: SystemPromptConfig,
 
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
@@ -241,6 +292,7 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             cache_simulation: CacheSimulationConfig::default(),
             model_id_mappings: HashMap::new(),
+            system_prompt: SystemPromptConfig::default(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),

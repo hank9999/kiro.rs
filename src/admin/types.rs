@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::model::config::{SystemPromptMode, SystemPromptReplacement};
+
 // ============ 凭据状态 ============
 
 /// 所有凭据状态响应
@@ -248,6 +250,25 @@ pub struct SupportedModelItem {
 #[serde(rename_all = "camelCase")]
 pub struct SupportedModelsResponse {
     pub models: Vec<SupportedModelItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemPromptConfigResponse {
+    pub enabled: bool,
+    pub mode: SystemPromptMode,
+    pub content: String,
+    pub replacements: Vec<SystemPromptReplacement>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSystemPromptConfigRequest {
+    pub enabled: bool,
+    pub mode: SystemPromptMode,
+    pub content: String,
+    #[serde(default)]
+    pub replacements: Vec<SystemPromptReplacement>,
 }
 
 // ============ 通用响应 ============

@@ -101,6 +101,20 @@ export interface ModelIdMappingsConfig {
   mappings: Record<string, string>
 }
 
+export type SystemPromptMode = 'append' | 'overwrite'
+
+export interface SystemPromptReplacement {
+  old: string
+  new: string
+}
+
+export interface SystemPromptConfig {
+  enabled: boolean
+  mode: SystemPromptMode
+  content: string
+  replacements: SystemPromptReplacement[]
+}
+
 export interface SupportedModelItem {
   id: string
   displayName: string

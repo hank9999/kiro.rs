@@ -14,8 +14,9 @@ use crate::kiro::model::requests::conversation::{
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
+use crate::model::config::{SystemPromptConfig, SystemPromptMode};
 
-use super::types::{ContentBlock, MessagesRequest};
+use super::types::{ContentBlock, MessagesRequest, SystemMessage};
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 ///
@@ -263,6 +264,14 @@ fn create_placeholder_tool(name: &str) -> Tool {
 
 /// 将 Anthropic 请求转换为 Kiro 请求
 pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
+    convert_request_with_system_prompt_config(req, None)
+}
+
+/// 将 Anthropic 请求转换为 Kiro 请求，并应用管理员系统提示词配置
+pub fn convert_request_with_system_prompt_config(
+    req: &MessagesRequest,
+    system_prompt_config: Option<&SystemPromptConfig>,
+) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
     let model_id = map_model(&req.model)
         .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
@@ -308,7 +317,14 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let mut tools = convert_tools(&req.tools, &mut tool_name_map);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
+    let effective_system = compose_system_messages(&req.system, system_prompt_config);
+    let mut history = build_history(
+        req,
+        messages,
+        &model_id,
+        &mut tool_name_map,
+        &effective_system,
+    )?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
@@ -688,6 +704,67 @@ fn has_thinking_tags(content: &str) -> bool {
     content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
 }
 
+fn apply_system_prompt_replacements(
+    content: &str,
+    replacements: &[crate::model::config::SystemPromptReplacement],
+) -> String {
+    let mut next = content.to_string();
+    for replacement in replacements {
+        if replacement.old.is_empty() {
+            continue;
+        }
+        next = next.replace(&replacement.old, &replacement.new);
+    }
+    next
+}
+
+fn system_messages_to_text(system: &Option<Vec<SystemMessage>>) -> String {
+    system
+        .as_ref()
+        .map(|messages| {
+            messages
+                .iter()
+                .map(|message| message.text.trim())
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// 合成客户端与管理员配置的系统提示词
+pub(crate) fn compose_system_messages(
+    system: &Option<Vec<SystemMessage>>,
+    config: Option<&SystemPromptConfig>,
+) -> Option<Vec<SystemMessage>> {
+    let Some(config) = config else {
+        return system.clone();
+    };
+
+    let admin_content = config.content.trim();
+    if !config.enabled || admin_content.is_empty() {
+        return system.clone();
+    }
+
+    let client_content = system_messages_to_text(system);
+    let merged = match config.mode {
+        SystemPromptMode::Append if !client_content.is_empty() => {
+            format!("{}\n{}", client_content, admin_content)
+        }
+        SystemPromptMode::Append => admin_content.to_string(),
+        SystemPromptMode::Overwrite => admin_content.to_string(),
+    };
+    let final_content = apply_system_prompt_replacements(&merged, &config.replacements);
+
+    if final_content.trim().is_empty() {
+        None
+    } else {
+        Some(vec![SystemMessage {
+            text: final_content,
+        }])
+    }
+}
+
 /// 构建历史消息
 ///
 /// # Arguments
@@ -701,6 +778,7 @@ fn build_history(
     messages: &[super::types::Message],
     model_id: &str,
     tool_name_map: &mut HashMap<String, String>,
+    system: &Option<Vec<SystemMessage>>,
 ) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
@@ -708,7 +786,7 @@ fn build_history(
     let thinking_prefix = generate_thinking_prefix(req);
 
     // 1. 处理系统消息
-    if let Some(ref system) = req.system {
+    if let Some(system) = system {
         let system_content: String = system
             .iter()
             .map(|s| s.text.clone())
@@ -947,7 +1025,63 @@ fn merge_assistant_messages(
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::SystemMessage;
     use super::*;
+    use crate::model::config::{SystemPromptConfig, SystemPromptMode, SystemPromptReplacement};
+
+    #[test]
+    fn test_system_prompt_append_adds_admin_content() {
+        let config = SystemPromptConfig {
+            enabled: true,
+            mode: SystemPromptMode::Append,
+            content: "Admin rule".to_string(),
+            replacements: vec![],
+        };
+        let system = Some(vec![SystemMessage {
+            text: "Client rule".to_string(),
+        }]);
+
+        let result = compose_system_messages(&system, Some(&config)).unwrap();
+
+        assert_eq!(result[0].text, "Client rule\nAdmin rule");
+    }
+
+    #[test]
+    fn test_system_prompt_overwrite_replaces_client_content() {
+        let config = SystemPromptConfig {
+            enabled: true,
+            mode: SystemPromptMode::Overwrite,
+            content: "Admin rule".to_string(),
+            replacements: vec![],
+        };
+        let system = Some(vec![SystemMessage {
+            text: "Client rule".to_string(),
+        }]);
+
+        let result = compose_system_messages(&system, Some(&config)).unwrap();
+
+        assert_eq!(result[0].text, "Admin rule");
+    }
+
+    #[test]
+    fn test_system_prompt_replacements_apply_after_merge() {
+        let config = SystemPromptConfig {
+            enabled: true,
+            mode: SystemPromptMode::Append,
+            content: "Use AI".to_string(),
+            replacements: vec![SystemPromptReplacement {
+                old: "AI".to_string(),
+                new: "Kiro".to_string(),
+            }],
+        };
+        let system = Some(vec![SystemMessage {
+            text: "Client AI".to_string(),
+        }]);
+
+        let result = compose_system_messages(&system, Some(&config)).unwrap();
+
+        assert_eq!(result[0].text, "Client Kiro\nUse Kiro");
+    }
 
     #[test]
     fn test_map_model_sonnet() {

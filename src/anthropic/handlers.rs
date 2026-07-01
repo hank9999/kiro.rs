@@ -21,7 +21,9 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request};
+use super::converter::{
+    ConversionError, compose_system_messages, convert_request_with_system_prompt_config,
+};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
@@ -45,6 +47,16 @@ fn resolve_model_id(state: &AppState, model: &str) -> String {
         .as_ref()
         .map(|manager| manager.resolve_model_id(model))
         .unwrap_or_else(|| model.to_string())
+}
+
+fn apply_runtime_system_prompt(
+    state: &AppState,
+    system: &mut Option<Vec<super::types::SystemMessage>>,
+) {
+    if let Some(manager) = &state.token_manager {
+        let config = manager.get_system_prompt();
+        *system = compose_system_messages(system, Some(&config));
+    }
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -342,6 +354,7 @@ pub async fn post_messages(
     override_thinking_from_model_name(&mut payload);
     let upstream_model = resolve_model_id(&state, &response_model);
     payload.model = upstream_model.clone();
+    apply_runtime_system_prompt(&state, &mut payload.system);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -366,7 +379,7 @@ pub async fn post_messages(
     }
 
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request_with_system_prompt_config(&payload, None) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -834,7 +847,11 @@ pub async fn count_tokens(
 
     let total_tokens = token::count_all_tokens(
         resolve_model_id(&state, &payload.model),
-        payload.system,
+        {
+            let mut system = payload.system;
+            apply_runtime_system_prompt(&state, &mut system);
+            system
+        },
         payload.messages,
         payload.tools,
     ) as i32;
@@ -883,6 +900,7 @@ pub async fn post_messages_cc(
     override_thinking_from_model_name(&mut payload);
     let upstream_model = resolve_model_id(&state, &response_model);
     payload.model = upstream_model.clone();
+    apply_runtime_system_prompt(&state, &mut payload.system);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -907,7 +925,7 @@ pub async fn post_messages_cc(
     }
 
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request_with_system_prompt_config(&payload, None) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {

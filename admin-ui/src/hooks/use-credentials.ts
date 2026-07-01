@@ -15,11 +15,14 @@ import {
   getModelIdMappings,
   setModelIdMappings,
   getSupportedModels,
+  getSystemPrompt,
+  setSystemPrompt,
 } from '@/api/credentials'
 import type {
   AddCredentialRequest,
   CacheSimulationConfig,
   ModelIdMappingsConfig,
+  SystemPromptConfig,
 } from '@/types/api'
 
 // 查询凭据列表
@@ -166,5 +169,22 @@ export function useSupportedModels() {
   return useQuery({
     queryKey: ['supportedModels'],
     queryFn: getSupportedModels,
+  })
+}
+
+export function useSystemPrompt() {
+  return useQuery({
+    queryKey: ['systemPrompt'],
+    queryFn: getSystemPrompt,
+  })
+}
+
+export function useSetSystemPrompt() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (config: SystemPromptConfig) => setSystemPrompt(config),
+    onSuccess: (data) => {
+      queryClient.setQueryData(['systemPrompt'], data)
+    },
   })
 }
