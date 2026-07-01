@@ -10,11 +10,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::model::config::CacheSimulationConfig;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CacheSimulationResponse,
+    CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
+    ModelIdMappingsResponse, SetCacheSimulationRequest, SetLoadBalancingModeRequest,
+    SetModelIdMappingsRequest, SupportedModelItem, SupportedModelsResponse,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -299,6 +302,99 @@ impl AdminService {
         Ok(LoadBalancingModeResponse { mode: req.mode })
     }
 
+    pub fn get_cache_simulation(&self) -> CacheSimulationResponse {
+        let value = self.token_manager.get_cache_simulation();
+        CacheSimulationResponse {
+            enabled: value.enabled,
+            hit_probability: value.hit_probability,
+            min_cache_ratio: value.min_cache_ratio,
+            max_cache_ratio: value.max_cache_ratio,
+            minimum_input_tokens: value.minimum_input_tokens,
+            minimum_uncached_tokens: value.minimum_uncached_tokens,
+        }
+    }
+
+    pub fn set_cache_simulation(
+        &self,
+        req: SetCacheSimulationRequest,
+    ) -> Result<CacheSimulationResponse, AdminServiceError> {
+        if req.hit_probability > 100 {
+            return Err(AdminServiceError::InvalidCredential(
+                "hitProbability 必须在 0 到 100 之间".to_string(),
+            ));
+        }
+        if req.min_cache_ratio > 100 || req.max_cache_ratio > 100 {
+            return Err(AdminServiceError::InvalidCredential(
+                "缓存比例必须在 0 到 100 之间".to_string(),
+            ));
+        }
+        if req.min_cache_ratio > req.max_cache_ratio {
+            return Err(AdminServiceError::InvalidCredential(
+                "最低缓存比例不能高于最高缓存比例".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_cache_simulation(CacheSimulationConfig {
+                enabled: req.enabled,
+                hit_probability: req.hit_probability,
+                min_cache_ratio: req.min_cache_ratio,
+                max_cache_ratio: req.max_cache_ratio,
+                minimum_input_tokens: req.minimum_input_tokens,
+                minimum_uncached_tokens: req.minimum_uncached_tokens,
+            })
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(self.get_cache_simulation())
+    }
+
+    pub fn get_model_id_mappings(&self) -> ModelIdMappingsResponse {
+        ModelIdMappingsResponse {
+            mappings: self.token_manager.get_model_id_mappings(),
+        }
+    }
+
+    pub fn set_model_id_mappings(
+        &self,
+        req: SetModelIdMappingsRequest,
+    ) -> Result<ModelIdMappingsResponse, AdminServiceError> {
+        self.token_manager
+            .set_model_id_mappings(req.mappings)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(self.get_model_id_mappings())
+    }
+
+    pub fn get_supported_models(&self) -> SupportedModelsResponse {
+        let models = crate::anthropic::supported_models()
+            .into_iter()
+            .map(|model| {
+                let mut notes = Vec::new();
+                let id_lower = model.id.to_lowercase();
+                if id_lower.contains("opus") {
+                    notes.push("Opus may require a paid account".to_string());
+                }
+                if model.max_tokens >= 128_000 {
+                    notes.push("Large context window".to_string());
+                }
+                if id_lower.contains("coder") {
+                    notes.push("Coding-oriented model".to_string());
+                }
+
+                SupportedModelItem {
+                    supports_thinking: id_lower.contains("thinking"),
+                    id: model.id,
+                    display_name: model.display_name,
+                    owned_by: model.owned_by,
+                    max_tokens: model.max_tokens,
+                    notes,
+                }
+            })
+            .collect();
+
+        SupportedModelsResponse { models }
+    }
+
     /// 强制刷新指定凭据的 Token
     pub async fn force_refresh_token(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
@@ -448,7 +544,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)

@@ -10,8 +10,17 @@ import {
   deleteCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getCacheSimulation,
+  setCacheSimulation,
+  getModelIdMappings,
+  setModelIdMappings,
+  getSupportedModels,
 } from '@/api/credentials'
-import type { AddCredentialRequest } from '@/types/api'
+import type {
+  AddCredentialRequest,
+  CacheSimulationConfig,
+  ModelIdMappingsConfig,
+} from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -116,5 +125,46 @@ export function useSetLoadBalancingMode() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
     },
+  })
+}
+
+export function useCacheSimulation() {
+  return useQuery({
+    queryKey: ['cacheSimulation'],
+    queryFn: getCacheSimulation,
+  })
+}
+
+export function useSetCacheSimulation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (config: CacheSimulationConfig) => setCacheSimulation(config),
+    onSuccess: (data) => {
+      queryClient.setQueryData(['cacheSimulation'], data)
+    },
+  })
+}
+
+export function useModelIdMappings() {
+  return useQuery({
+    queryKey: ['modelIdMappings'],
+    queryFn: getModelIdMappings,
+  })
+}
+
+export function useSetModelIdMappings() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (config: ModelIdMappingsConfig) => setModelIdMappings(config),
+    onSuccess: (data) => {
+      queryClient.setQueryData(['modelIdMappings'], data)
+    },
+  })
+}
+
+export function useSupportedModels() {
+  return useQuery({
+    queryKey: ['supportedModels'],
+    queryFn: getSupportedModels,
   })
 }

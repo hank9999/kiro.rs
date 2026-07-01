@@ -1,0 +1,9 @@
+{
+  "host": "0.0.0.0",
+  "port": 8990,
+  "apiKey": "1234567890",
+  "tlsBackend": "rustls",
+  "region": "us-east-1",
+  "adminApiKey": "admin123",
+  "defaultEndpoint": "ide"
+}

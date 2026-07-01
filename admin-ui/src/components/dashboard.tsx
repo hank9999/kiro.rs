@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Settings } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -19,9 +19,10 @@ import type { BalanceResponse } from '@/types/api'
 
 interface DashboardProps {
   onLogout: () => void
+  onOpenSettings: () => void
 }
 
-export function Dashboard({ onLogout }: DashboardProps) {
+export function Dashboard({ onLogout, onOpenSettings }: DashboardProps) {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
@@ -559,6 +560,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </Button>
             <Button variant="ghost" size="icon" onClick={handleRefresh}>
               <RefreshCw className="h-5 w-5" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={onOpenSettings}
+              title="设置"
+            >
+              <Settings className="h-5 w-5" />
             </Button>
             <Button variant="ghost" size="icon" onClick={handleLogout}>
               <LogOut className="h-5 w-5" />

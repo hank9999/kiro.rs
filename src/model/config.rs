@@ -17,6 +17,41 @@ impl Default for TlsBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheSimulationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub hit_probability: u8,
+
+    #[serde(default = "default_min_cache_ratio")]
+    pub min_cache_ratio: u8,
+
+    #[serde(default = "default_max_cache_ratio")]
+    pub max_cache_ratio: u8,
+
+    #[serde(default = "default_minimum_input_tokens")]
+    pub minimum_input_tokens: u32,
+
+    #[serde(default = "default_minimum_uncached_tokens")]
+    pub minimum_uncached_tokens: u32,
+}
+
+impl Default for CacheSimulationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hit_probability: 0,
+            min_cache_ratio: default_min_cache_ratio(),
+            max_cache_ratio: default_max_cache_ratio(),
+            minimum_input_tokens: default_minimum_input_tokens(),
+            minimum_uncached_tokens: default_minimum_uncached_tokens(),
+        }
+    }
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -91,6 +126,13 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    #[serde(default)]
+    pub cache_simulation: CacheSimulationConfig,
+
+    /// Public model ID -> real upstream model ID mappings.
+    #[serde(default)]
+    pub model_id_mappings: HashMap<String, String>,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -124,6 +166,22 @@ fn default_port() -> u16 {
 
 fn default_region() -> String {
     "us-east-1".to_string()
+}
+
+fn default_min_cache_ratio() -> u8 {
+    80
+}
+
+fn default_max_cache_ratio() -> u8 {
+    90
+}
+
+fn default_minimum_input_tokens() -> u32 {
+    1024
+}
+
+fn default_minimum_uncached_tokens() -> u32 {
+    64
 }
 
 fn default_kiro_version() -> String {
@@ -181,6 +239,8 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            cache_simulation: CacheSimulationConfig::default(),
+            model_id_mappings: HashMap::new(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
@@ -236,7 +296,8 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content).with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        fs::write(path, content)
+            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
     }
 }

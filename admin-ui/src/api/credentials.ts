@@ -8,6 +8,9 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  CacheSimulationConfig,
+  ModelIdMappingsConfig,
+  SupportedModelsResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -102,5 +105,40 @@ export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'bala
 // 设置负载均衡模式
 export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
   const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
+  return data
+}
+
+export async function getCacheSimulation(): Promise<CacheSimulationConfig> {
+  const { data } = await api.get<CacheSimulationConfig>('/config/cache-simulation')
+  return data
+}
+
+export async function setCacheSimulation(
+  config: CacheSimulationConfig
+): Promise<CacheSimulationConfig> {
+  const { data } = await api.put<CacheSimulationConfig>(
+    '/config/cache-simulation',
+    config
+  )
+  return data
+}
+
+export async function getModelIdMappings(): Promise<ModelIdMappingsConfig> {
+  const { data } = await api.get<ModelIdMappingsConfig>('/config/model-id-mappings')
+  return data
+}
+
+export async function setModelIdMappings(
+  config: ModelIdMappingsConfig
+): Promise<ModelIdMappingsConfig> {
+  const { data } = await api.put<ModelIdMappingsConfig>(
+    '/config/model-id-mappings',
+    config
+  )
+  return data
+}
+
+export async function getSupportedModels(): Promise<SupportedModelsResponse> {
+  const { data } = await api.get<SupportedModelsResponse>('/config/supported-models')
   return data
 }

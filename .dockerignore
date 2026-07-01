@@ -1,6 +1,5 @@
 # Rust build artifacts
 target/
-Cargo.lock
 
 # Node.js dependencies and build artifacts
 admin-ui/node_modules/

@@ -8,6 +8,8 @@ use axum::{
 };
 
 use crate::kiro::provider::KiroProvider;
+use crate::kiro::token_manager::MultiTokenManager;
+use std::sync::Arc;
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
@@ -37,9 +39,10 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
+    token_manager: Arc<MultiTokenManager>,
     extract_thinking: bool,
 ) -> Router {
-    let mut state = AppState::new(api_key, extract_thinking);
+    let mut state = AppState::new(api_key, extract_thinking).with_token_manager(token_manager);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
