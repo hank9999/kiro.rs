@@ -1,0 +1,13 @@
+name: Test Auto Trigger
+
+on:
+  push:
+    branches:
+      - openai-compat
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Echo test
+        run: echo "Auto trigger works!"

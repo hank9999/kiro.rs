@@ -1,3 +1,5 @@
+import { useEffect } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import {
   Dialog,
   DialogContent,
@@ -16,6 +18,17 @@ interface BalanceDialogProps {
 
 export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialogProps) {
   const { data: balance, isLoading, error } = useCredentialBalance(credentialId)
+  const queryClient = useQueryClient()
+
+  useEffect(() => {
+    if (!error) return
+
+    const parsed = parseError(error)
+    const message = `${parsed.title} ${parsed.detail || ''}`
+    if (message.includes('已自动删除')) {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    }
+  }, [error, queryClient])
 
   const formatDate = (timestamp: number | null) => {
     if (!timestamp) return '未知'

@@ -1,18 +1,23 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, WalletCards } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { Input } from '@/components/ui/input'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
+import { ActivityMonitor } from '@/components/activity-monitor'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
+import { ApiKeyManagement } from '@/components/api-key-management'
+import { ProxySettings } from '@/components/proxy-settings'
+import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useSetTokenPoolSize, useQueryAllBalancesAndEnable } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
@@ -22,6 +27,7 @@ interface DashboardProps {
 }
 
 export function Dashboard({ onLogout }: DashboardProps) {
+  const [activeTab, setActiveTab] = useState<'credentials' | 'api-keys' | 'proxy'>('credentials')
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
@@ -40,6 +46,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
+  const [pageJumpInput, setPageJumpInput] = useState('1')
   const itemsPerPage = 12
   const [darkMode, setDarkMode] = useState(() => {
     if (typeof window !== 'undefined') {
@@ -47,6 +54,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
     return false
   })
+  const [tokenPoolInput, setTokenPoolInput] = useState('32')
 
   const queryClient = useQueryClient()
   const { data, isLoading, error, refetch } = useCredentials()
@@ -54,22 +62,59 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
+  const { mutate: setTokenPoolSize, isPending: isSettingTokenPoolSize } = useSetTokenPoolSize()
+  const queryAllBalancesAndEnable = useQueryAllBalancesAndEnable()
 
   // 计算分页
-  const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
+  const credentialCount = data?.credentials.length || 0
+  const totalPages = Math.ceil(credentialCount / itemsPerPage)
   const startIndex = (currentPage - 1) * itemsPerPage
   const endIndex = startIndex + itemsPerPage
   const currentCredentials = data?.credentials.slice(startIndex, endIndex) || []
+  const visiblePageItems: Array<number | 'ellipsis-left' | 'ellipsis-right'> = []
+
+  if (totalPages <= 7) {
+    for (let page = 1; page <= totalPages; page++) {
+      visiblePageItems.push(page)
+    }
+  } else {
+    const middleStart = Math.max(2, currentPage - 1)
+    const middleEnd = Math.min(totalPages - 1, currentPage + 1)
+
+    visiblePageItems.push(1)
+    if (middleStart > 2) {
+      visiblePageItems.push('ellipsis-left')
+    }
+    for (let page = middleStart; page <= middleEnd; page++) {
+      visiblePageItems.push(page)
+    }
+    if (middleEnd < totalPages - 1) {
+      visiblePageItems.push('ellipsis-right')
+    }
+    visiblePageItems.push(totalPages)
+  }
+
   const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
   const selectedDisabledCount = Array.from(selectedIds).filter(id => {
     const credential = data?.credentials.find(c => c.id === id)
     return Boolean(credential?.disabled)
   }).length
 
-  // 当凭据列表变化时重置到第一页
+  // 当凭据数量变化时保留当前页，并在越界时自动回退到最后一页
   useEffect(() => {
-    setCurrentPage(1)
-  }, [data?.credentials.length])
+    setCurrentPage(prev => Math.min(Math.max(1, prev), Math.max(1, totalPages)))
+  }, [totalPages])
+
+  useEffect(() => {
+    setPageJumpInput(String(currentPage))
+  }, [currentPage])
+
+  // 后端配置变化后同步输入框；用户正在输入时只在值真正变化后覆盖即可。
+  useEffect(() => {
+    if (loadBalancingData?.tokenPoolSize) {
+      setTokenPoolInput(String(loadBalancingData.tokenPoolSize))
+    }
+  }, [loadBalancingData?.tokenPoolSize])
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
@@ -120,6 +165,27 @@ export function Dashboard({ onLogout }: DashboardProps) {
     toast.success('已刷新凭据列表')
   }
 
+  const goToPage = (page: number) => {
+    if (totalPages < 1) {
+      return
+    }
+
+    const nextPage = Math.min(Math.max(1, page), totalPages)
+    setCurrentPage(nextPage)
+  }
+
+  const handlePageJump = () => {
+    const targetPage = Number.parseInt(pageJumpInput, 10)
+
+    if (!Number.isFinite(targetPage) || targetPage < 1 || targetPage > totalPages) {
+      toast.error(`请输入 1-${totalPages} 之间的页码`)
+      setPageJumpInput(String(currentPage))
+      return
+    }
+
+    goToPage(targetPage)
+  }
+
   const handleLogout = () => {
     storage.removeApiKey()
     queryClient.clear()
@@ -162,6 +228,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
     const skippedText = skippedCount > 0 ? `（将跳过 ${skippedCount} 个未禁用凭据）` : ''
 
     if (!confirm(`确定要删除 ${disabledIds.length} 个已禁用凭据吗？此操作无法撤销。${skippedText}`)) {
+      return
+    }
+
+    if (!confirm(`二次确认：即将永久删除 ${disabledIds.length} 个已禁用凭据，请再次确认。${skippedText}`)) {
       return
     }
 
@@ -309,6 +379,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
       return
     }
 
+    if (!confirm(`二次确认：即将永久删除所有 ${disabledCredentials.length} 个已禁用凭据，请再次确认。`)) {
+      return
+    }
+
     let successCount = 0
     let failCount = 0
 
@@ -402,6 +476,44 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
   }
 
+  // 一键查询所有凭据额度，并自动启用仍有剩余额度的账号
+  const handleQueryAllBalancesAndEnable = () => {
+    if (!data?.credentials || data.credentials.length === 0) {
+      toast.error('当前没有可查询的凭据')
+      return
+    }
+
+    queryAllBalancesAndEnable.mutate(undefined, {
+      onSuccess: (response) => {
+        const nextBalanceMap = new Map<number, BalanceResponse>()
+        response.results.forEach((item) => {
+          if (item.balance) {
+            nextBalanceMap.set(item.id, item.balance)
+          }
+        })
+        setBalanceMap(nextBalanceMap)
+        queryClient.invalidateQueries({ queryKey: ['credentials'] })
+
+        const deletedText = response.deletedInvalid > 0
+          ? `，已删除失效凭据 ${response.deletedInvalid} 个`
+          : ''
+
+        if (response.failed === 0) {
+          toast.success(
+            `查询完成：${response.success}/${response.total} 个成功，${response.withRemaining} 个有余额，已启用 ${response.enabled} 个账号${deletedText}`
+          )
+        } else {
+          toast.warning(
+            `查询完成：成功 ${response.success} 个，失败 ${response.failed} 个，${response.withRemaining} 个有余额，已启用 ${response.enabled} 个账号${deletedText}`
+          )
+        }
+      },
+      onError: (error) => {
+        toast.error(`一键查询失败: ${extractErrorMessage(error)}`)
+      },
+    })
+  }
+
   // 批量验活
   const handleBatchVerify = async () => {
     if (selectedIds.size === 0) {
@@ -491,18 +603,49 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setVerifying(false)
   }
 
-  // 切换负载均衡模式
+  // 切换负载均衡模式（四态循环：priority → balanced → round_robin → token_pool → priority）
   const handleToggleLoadBalancing = () => {
-    const currentMode = loadBalancingData?.mode || 'priority'
-    const newMode = currentMode === 'priority' ? 'balanced' : 'priority'
+    const order = ['priority', 'balanced', 'round_robin', 'token_pool'] as const
+    const currentMode = (loadBalancingData?.mode || 'priority') as typeof order[number]
+    const idx = order.indexOf(currentMode)
+    const newMode = order[(idx + 1) % order.length]
+    const labelOf = (m: string) =>
+      m === 'priority' ? '优先级模式'
+        : m === 'balanced' ? '均衡负载模式'
+          : m === 'round_robin' ? '严格轮询模式'
+            : '热池模式'
 
     setLoadBalancingMode(newMode, {
       onSuccess: () => {
-        const modeName = newMode === 'priority' ? '优先级模式' : '均衡负载模式'
-        toast.success(`已切换到${modeName}`)
+        toast.success(`已切换到${labelOf(newMode)}`)
       },
       onError: (error) => {
         toast.error(`切换失败: ${extractErrorMessage(error)}`)
+      }
+    })
+  }
+
+  // 保存热池大小：实时持久化到 config.json，并立即影响 token_pool 选择逻辑
+  const handleSaveTokenPoolSize = () => {
+    const size = Number.parseInt(tokenPoolInput, 10)
+    if (!Number.isFinite(size) || size <= 0) {
+      toast.error('池子数量必须是大于 0 的整数')
+      setTokenPoolInput(String(loadBalancingData?.tokenPoolSize || 32))
+      return
+    }
+
+    if (size === loadBalancingData?.tokenPoolSize) {
+      return
+    }
+
+    setTokenPoolSize(size, {
+      onSuccess: (response) => {
+        setTokenPoolInput(String(response.tokenPoolSize))
+        toast.success(`热池数量已设置为 ${response.tokenPoolSize}`)
+      },
+      onError: (error) => {
+        setTokenPoolInput(String(loadBalancingData?.tokenPoolSize || 32))
+        toast.error(`池子数量保存失败: ${extractErrorMessage(error)}`)
       }
     })
   }
@@ -545,6 +688,27 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <span className="font-semibold">Kiro Admin</span>
           </div>
           <div className="flex items-center gap-2">
+            <div
+              className="hidden sm:flex items-center gap-2 rounded-md border px-2 py-1"
+              title="token_pool 热池模式下维护的热凭据数量。热池未满会逐步激活新账号；热池满后只在热账号内轮询。"
+            >
+              <span className="text-xs text-muted-foreground whitespace-nowrap">池子数量</span>
+              <Input
+                className="h-7 w-20 px-2 text-sm"
+                type="number"
+                min={1}
+                step={1}
+                value={tokenPoolInput}
+                disabled={isLoadingMode || isSettingTokenPoolSize}
+                onChange={(event) => setTokenPoolInput(event.target.value)}
+                onBlur={handleSaveTokenPoolSize}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.currentTarget.blur()
+                  }
+                }}
+              />
+            </div>
             <Button
               variant="outline"
               size="sm"
@@ -552,7 +716,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
               disabled={isLoadingMode || isSettingMode}
               title="切换负载均衡模式"
             >
-              {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
+              {isLoadingMode
+                ? '加载中...'
+                : loadBalancingData?.mode === 'priority'
+                  ? '优先级模式'
+                  : loadBalancingData?.mode === 'round_robin'
+                    ? '严格轮询'
+                    : loadBalancingData?.mode === 'token_pool'
+                      ? '热池模式'
+                    : '均衡负载'}
             </Button>
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
@@ -569,68 +741,78 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
       {/* 主内容 */}
       <main className="container mx-auto px-4 md:px-8 py-6">
-        {/* 统计卡片 */}
-        <div className="grid gap-4 md:grid-cols-3 mb-6">
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                凭据总数
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{data?.total || 0}</div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                可用凭据
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold text-green-600">{data?.available || 0}</div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                当前活跃
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold flex items-center gap-2">
-                #{data?.currentId || '-'}
-                <Badge variant="success">活跃</Badge>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
+        <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as any)}>
+          <TabsList className="mb-6">
+            <TabsTrigger value="credentials">凭据管理</TabsTrigger>
+            <TabsTrigger value="api-keys">API Keys</TabsTrigger>
+            <TabsTrigger value="proxy">代理池</TabsTrigger>
+          </TabsList>
 
-        {/* 凭据列表 */}
-        <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <h2 className="text-xl font-semibold">凭据管理</h2>
-              {selectedIds.size > 0 && (
-                <div className="flex items-center gap-2">
-                  <Badge variant="secondary">已选择 {selectedIds.size} 个</Badge>
-                  <Button onClick={deselectAll} size="sm" variant="ghost">
-                    取消选择
-                  </Button>
-                </div>
-              )}
+          <TabsContent value="credentials" className="space-y-6">
+            {/* 统计卡片 */}
+            <div className="grid gap-4 md:grid-cols-3">
+              <Card>
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-sm font-medium text-muted-foreground">
+                    凭据总数
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="text-2xl font-bold">{data?.total || 0}</div>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-sm font-medium text-muted-foreground">
+                    可用凭据
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="text-2xl font-bold text-green-600">{data?.available || 0}</div>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-sm font-medium text-muted-foreground">
+                    当前活跃
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="text-2xl font-bold flex items-center gap-2">
+                    #{data?.currentId || '-'}
+                    <Badge variant="success">活跃</Badge>
+                  </div>
+                </CardContent>
+              </Card>
             </div>
-            <div className="flex gap-2">
-              {selectedIds.size > 0 && (
-                <>
-                  <Button onClick={handleBatchVerify} size="sm" variant="outline">
-                    <CheckCircle2 className="h-4 w-4 mr-2" />
-                    批量验活
-                  </Button>
-                  <Button
-                    onClick={handleBatchForceRefresh}
-                    size="sm"
-                    variant="outline"
+
+            <ActivityMonitor />
+
+            {/* 凭据列表 */}
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-4">
+                  <h2 className="text-xl font-semibold">凭据列表</h2>
+                  {selectedIds.size > 0 && (
+                    <div className="flex items-center gap-2">
+                      <Badge variant="secondary">已选择 {selectedIds.size} 个</Badge>
+                      <Button onClick={deselectAll} size="sm" variant="ghost">
+                        取消选择
+                      </Button>
+                    </div>
+                  )}
+                </div>
+                <div className="flex gap-2">
+                  {selectedIds.size > 0 && (
+                    <>
+                      <Button onClick={handleBatchVerify} size="sm" variant="outline">
+                        <CheckCircle2 className="h-4 w-4 mr-2" />
+                        批量验活
+                      </Button>
+                      <Button
+                        onClick={handleBatchForceRefresh}
+                        size="sm"
+                        variant="outline"
                     disabled={batchRefreshing}
                   >
                     <RefreshCw className={`h-4 w-4 mr-2 ${batchRefreshing ? 'animate-spin' : ''}`} />
@@ -660,13 +842,25 @@ export function Dashboard({ onLogout }: DashboardProps) {
               )}
               {data?.credentials && data.credentials.length > 0 && (
                 <Button
+                  onClick={handleQueryAllBalancesAndEnable}
+                  size="sm"
+                  variant="default"
+                  disabled={queryAllBalancesAndEnable.isPending}
+                  title="查询全部凭据额度，并自动启用仍有剩余额度的账号"
+                >
+                  <WalletCards className={`h-4 w-4 mr-2 ${queryAllBalancesAndEnable.isPending ? 'animate-pulse' : ''}`} />
+                  {queryAllBalancesAndEnable.isPending ? '全量查询中...' : '一键查询额度并启用'}
+                </Button>
+              )}
+              {data?.credentials && data.credentials.length > 0 && (
+                <Button
                   onClick={handleQueryCurrentPageInfo}
                   size="sm"
                   variant="outline"
-                  disabled={queryingInfo}
+                  disabled={queryingInfo || queryAllBalancesAndEnable.isPending}
                 >
                   <RefreshCw className={`h-4 w-4 mr-2 ${queryingInfo ? 'animate-spin' : ''}`} />
-                  {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询信息'}
+                  {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询当前页'}
                 </Button>
               )}
               {data?.credentials && data.credentials.length > 0 && (
@@ -720,31 +914,82 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
               {/* 分页控件 */}
               {totalPages > 1 && (
-                <div className="flex justify-center items-center gap-4 mt-6">
+                <div className="flex flex-wrap justify-center items-center gap-2 mt-6">
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                    onClick={() => goToPage(currentPage - 1)}
                     disabled={currentPage === 1}
                   >
                     上一页
                   </Button>
-                  <span className="text-sm text-muted-foreground">
-                    第 {currentPage} / {totalPages} 页（共 {data?.credentials.length} 个凭据）
-                  </span>
+                  <div className="flex items-center gap-1">
+                    {visiblePageItems.map((item) => (
+                      typeof item === 'number' ? (
+                        <Button
+                          key={item}
+                          variant={item === currentPage ? 'default' : 'outline'}
+                          size="sm"
+                          className="h-8 min-w-8 px-2"
+                          onClick={() => goToPage(item)}
+                          aria-current={item === currentPage ? 'page' : undefined}
+                        >
+                          {item}
+                        </Button>
+                      ) : (
+                        <span key={item} className="px-2 text-sm text-muted-foreground">
+                          …
+                        </span>
+                      )
+                    ))}
+                  </div>
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                    onClick={() => goToPage(currentPage + 1)}
                     disabled={currentPage === totalPages}
                   >
                     下一页
                   </Button>
+                  <form
+                    className="flex items-center gap-2"
+                    onSubmit={(event) => {
+                      event.preventDefault()
+                      handlePageJump()
+                    }}
+                  >
+                    <span className="text-sm text-muted-foreground whitespace-nowrap">跳至</span>
+                    <Input
+                      className="h-8 w-20 px-2 text-center"
+                      type="number"
+                      min={1}
+                      max={totalPages}
+                      value={pageJumpInput}
+                      onChange={(event) => setPageJumpInput(event.target.value)}
+                    />
+                    <span className="text-sm text-muted-foreground whitespace-nowrap">页</span>
+                    <Button type="submit" variant="outline" size="sm">
+                      跳转
+                    </Button>
+                  </form>
+                  <span className="w-full text-center text-sm text-muted-foreground sm:w-auto">
+                    第 {currentPage} / {totalPages} 页，显示 {startIndex + 1}-{Math.min(endIndex, credentialCount)} / {credentialCount} 个凭据
+                  </span>
                 </div>
               )}
             </>
           )}
         </div>
+          </TabsContent>
+
+          <TabsContent value="api-keys">
+            <ApiKeyManagement />
+          </TabsContent>
+
+          <TabsContent value="proxy">
+            <ProxySettings />
+          </TabsContent>
+        </Tabs>
       </main>
 
       {/* 余额对话框 */}

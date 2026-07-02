@@ -2,15 +2,17 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
 };
 
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        ActivityQuery, AddApiKeyRequest, AddCredentialRequest, GenerateApiKeyRequest, LogsQuery,
+        ProxyPoolDto, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
+        SetTokenPoolSizeRequest, SuccessResponse, TestProxyPoolRequest, UpdateApiKeyRequest,
+        UpdateCredentialProxyRequest,
     },
 };
 
@@ -19,6 +21,32 @@ use super::{
 pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
     let response = state.service.get_all_credentials();
     Json(response)
+}
+
+/// GET /api/admin/models
+/// 获取当前服务暴露的模型列表
+pub async fn get_available_models(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_available_models())
+}
+
+/// GET /api/admin/activity
+/// 获取最近请求活动
+pub async fn get_request_activity(
+    State(state): State<AdminState>,
+    Query(query): Query<ActivityQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    Json(state.service.get_request_activity(limit))
+}
+
+/// GET /api/admin/logs
+/// 获取最近日志
+pub async fn get_recent_logs(
+    State(state): State<AdminState>,
+    Query(query): Query<LogsQuery>,
+) -> impl IntoResponse {
+    let lines = query.lines.unwrap_or(120).clamp(1, 500);
+    Json(state.service.get_recent_logs(lines))
 }
 
 /// POST /api/admin/credentials/:id/disabled
@@ -82,6 +110,34 @@ pub async fn get_credential_balance(
     }
 }
 
+/// POST /api/admin/credentials/query-balances-enable
+/// 查询所有凭据余额，并自动启用有剩余额度的账号
+pub async fn query_all_credential_balances_and_enable(
+    State(state): State<AdminState>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .query_all_balances_and_enable_remaining()
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/enable-all
+/// 启用所有可恢复凭据
+pub async fn enable_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.enable_all_credentials() {
+        Ok(count) => Json(SuccessResponse::new(format!(
+            "已启用 {} 个凭据（配置无效的凭据会保留禁用）",
+            count
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials
 /// 添加新凭据
 pub async fn add_credential(
@@ -137,6 +193,150 @@ pub async fn set_load_balancing_mode(
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
         Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/config/token-pool
+/// 设置轮询模式热凭据池大小
+pub async fn set_token_pool_size(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetTokenPoolSizeRequest>,
+) -> impl IntoResponse {
+    match state.service.set_token_pool_size(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+// ============ API Key 管理处理器 ============
+
+/// GET /api/admin/api-keys
+/// 获取所有 API Keys
+pub async fn get_api_keys(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_api_keys() {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/api-keys
+/// 添加新的 API Key
+pub async fn add_api_key(
+    State(state): State<AdminState>,
+    Json(payload): Json<AddApiKeyRequest>,
+) -> impl IntoResponse {
+    match state.service.add_api_key(payload) {
+        Ok(key_info) => {
+            // 重新加载 AppState 的 Keys
+            if let Err(e) = state.app_state.reload_keys() {
+                tracing::error!("重新加载 API Keys 失败: {}", e);
+            }
+            Json(key_info).into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/api-keys/generate
+/// 生成随机 API Key
+pub async fn generate_api_key(
+    State(state): State<AdminState>,
+    Json(payload): Json<GenerateApiKeyRequest>,
+) -> impl IntoResponse {
+    match state.service.generate_api_key(payload) {
+        Ok(response) => {
+            // 重新加载 AppState 的 Keys
+            if let Err(e) = state.app_state.reload_keys() {
+                tracing::error!("重新加载 API Keys 失败: {}", e);
+            }
+            Json(response).into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/api-keys/:id
+/// 更新 API Key
+pub async fn update_api_key(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateApiKeyRequest>,
+) -> impl IntoResponse {
+    match state.service.update_api_key(&id, payload) {
+        Ok(_) => {
+            // 重新加载 AppState 的 Keys
+            if let Err(e) = state.app_state.reload_keys() {
+                tracing::error!("重新加载 API Keys 失败: {}", e);
+            }
+            Json(SuccessResponse::new(format!("API Key {} 已更新", id))).into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// DELETE /api/admin/api-keys/:id
+/// 删除 API Key
+pub async fn delete_api_key(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.service.delete_api_key(&id) {
+        Ok(_) => {
+            // 重新加载 AppState 的 Keys
+            if let Err(e) = state.app_state.reload_keys() {
+                tracing::error!("重新加载 API Keys 失败: {}", e);
+            }
+            Json(SuccessResponse::new(format!("API Key {} 已删除", id))).into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+// ============ 代理池管理处理器 ============
+
+/// GET /api/admin/proxy-pool
+/// 获取当前代理池配置和运行时状态
+pub async fn get_proxy_pool(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_proxy_pool() {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/proxy-pool
+/// 更新代理池配置（持久化并热更新）
+pub async fn update_proxy_pool(
+    State(state): State<AdminState>,
+    Json(payload): Json<ProxyPoolDto>,
+) -> impl IntoResponse {
+    match state.service.update_proxy_pool(payload) {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxy-pool/test
+/// 测试代理池连通性
+pub async fn test_proxy_pool(
+    State(state): State<AdminState>,
+    Json(payload): Json<TestProxyPoolRequest>,
+) -> impl IntoResponse {
+    match state.service.test_proxy_pool(payload).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/credentials/:id/proxy
+/// 更新单个凭据的代理配置
+pub async fn update_credential_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<UpdateCredentialProxyRequest>,
+) -> impl IntoResponse {
+    match state.service.update_credential_proxy(id, payload).await {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 代理已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

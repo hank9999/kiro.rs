@@ -17,6 +17,119 @@ impl Default for TlsBackend {
     }
 }
 
+/// API Key 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyConfig {
+    pub id: String,
+    pub key: String,
+    pub name: String,
+    pub enabled: bool,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
+}
+
+/// 代理池端口范围模板
+///
+/// 用于自动展开 `protocol://host:portStart`..`protocol://host:portEnd` 多个代理
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolTemplate {
+    /// 代理协议，例如 "socks5h" / "socks5" / "http" / "https"
+    #[serde(default = "default_pool_protocol")]
+    pub protocol: String,
+    /// 主机名
+    pub host: String,
+    /// 起始端口（含）
+    pub port_start: u16,
+    /// 结束端口（含）
+    pub port_end: u16,
+}
+
+fn default_pool_protocol() -> String {
+    "socks5h".to_string()
+}
+
+/// 代理池配置
+///
+/// 支持两种模式：
+/// - `urls`：直接指定 URL 列表
+/// - `template`：端口范围模板，自动展开成多个代理
+///
+/// 两种模式可同时存在，合并后去重
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolConfig {
+    /// 是否启用代理池（关闭时等价于不存在）
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// 选择策略："round-robin" / "random" / "per-credential"
+    #[serde(default = "default_pool_strategy")]
+    pub strategy: String,
+
+    /// 直接指定的代理 URL 列表（可选）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub urls: Option<Vec<String>>,
+
+    /// 端口范围模板（可选）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<ProxyPoolTemplate>,
+
+    /// 模板模式下的全局认证用户名（可选）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+
+    /// 模板模式下的全局认证密码（可选）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+
+    /// 连通性测试目标 URL（可选，默认 `https://ip.decodo.com/json`）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_url: Option<String>,
+
+    /// 代理被标记为限流后的冷却时长（秒，默认 30）
+    ///
+    /// 冷却期内 `pick()` 会跳过该代理，冷却结束后自动恢复
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_secs: Option<u64>,
+}
+
+fn default_pool_strategy() -> String {
+    "round-robin".to_string()
+}
+
+impl ProxyPoolConfig {
+    /// 默认测试地址
+    pub const DEFAULT_TEST_URL: &'static str = "https://ip.decodo.com/json";
+
+    /// 默认代理限流冷却时长（秒）
+    pub const DEFAULT_COOLDOWN_SECS: u64 = 30;
+
+    /// 获取有效测试地址
+    pub fn effective_test_url(&self) -> &str {
+        self.test_url
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(Self::DEFAULT_TEST_URL)
+    }
+
+    /// 获取有效冷却时长（秒），最小 1 秒
+    pub fn effective_cooldown_secs(&self) -> u64 {
+        self.cooldown_secs
+            .filter(|v| *v > 0)
+            .unwrap_or(Self::DEFAULT_COOLDOWN_SECS)
+    }
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,6 +161,10 @@ pub struct Config {
 
     #[serde(default)]
     pub api_key: Option<String>,
+
+    /// API Keys 列表（新增，可选）
+    #[serde(default)]
+    pub api_keys: Vec<ApiKeyConfig>,
 
     #[serde(default = "default_system_version")]
     pub system_version: String,
@@ -83,13 +200,27 @@ pub struct Config {
     #[serde(default)]
     pub proxy_password: Option<String>,
 
+    /// 代理池配置（可选，启用后用于 IP 轮询，避免限流）
+    ///
+    /// 优先级：凭据级代理 > 代理池 > 全局单代理 > 无代理
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_pool: Option<ProxyPoolConfig>,
+
     /// Admin API 密钥（可选，启用 Admin API 功能）
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
-    /// 负载均衡模式（"priority" 或 "balanced"）
+    /// 负载均衡模式（"priority" / "balanced" / "round_robin" / "token_pool"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
+
+    /// token_pool 模式下维护的热凭据池大小
+    ///
+    /// 当 `loadBalancingMode = "token_pool"` 时，请求会优先在已有有效
+    /// accessToken 的凭据池中轮询；热池未达到该数量时，才逐步激活新的冷凭据。
+    #[serde(default = "default_token_pool_size")]
+    pub token_pool_size: usize,
 
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
@@ -109,9 +240,58 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// 动态模型列表配置
+    ///
+    /// 控制后台周期性从上游 `ListAvailableModels` 拉取真实可用模型列表。
+    /// 若禁用或拉取失败，会回退到 `crate::anthropic::fallback_models()` 硬编码列表。
+    #[serde(default)]
+    pub dynamic_models: DynamicModelsConfig,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
+}
+
+/// 动态模型列表刷新配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicModelsConfig {
+    /// 是否启用动态拉取（默认 true）
+    #[serde(default = "default_dynamic_models_enabled")]
+    pub enabled: bool,
+
+    /// 周期刷新间隔（秒，默认 1800 = 30 分钟）
+    #[serde(default = "default_dynamic_models_refresh_secs")]
+    pub refresh_interval_secs: u64,
+
+    /// 启动后首次拉取前的延迟（秒，默认 5）
+    ///
+    /// 等待 token_manager / 代理池等子系统完成初始化后再发出第一次请求，
+    /// 避免与服务启动尖峰流量重叠。
+    #[serde(default = "default_dynamic_models_initial_delay_secs")]
+    pub initial_delay_secs: u64,
+}
+
+impl Default for DynamicModelsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_dynamic_models_enabled(),
+            refresh_interval_secs: default_dynamic_models_refresh_secs(),
+            initial_delay_secs: default_dynamic_models_initial_delay_secs(),
+        }
+    }
+}
+
+fn default_dynamic_models_enabled() -> bool {
+    true
+}
+
+fn default_dynamic_models_refresh_secs() -> u64 {
+    1800
+}
+
+fn default_dynamic_models_initial_delay_secs() -> u64 {
+    5
 }
 
 fn default_host() -> String {
@@ -151,6 +331,10 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_token_pool_size() -> usize {
+    32
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -170,6 +354,7 @@ impl Default for Config {
             kiro_version: default_kiro_version(),
             machine_id: None,
             api_key: None,
+            api_keys: Vec::new(),
             system_version: default_system_version(),
             node_version: default_node_version(),
             tls_backend: default_tls_backend(),
@@ -179,11 +364,14 @@ impl Default for Config {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_pool: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            token_pool_size: default_token_pool_size(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
+            dynamic_models: DynamicModelsConfig::default(),
             config_path: None,
         }
     }
@@ -236,7 +424,167 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content).with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        fs::write(path, content)
+            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+
+    /// 根据 `proxy_pool` 构建运行时的代理池
+    ///
+    /// 返回 `None` 表示未启用或解析为空
+    pub fn build_proxy_pool(&self) -> Option<crate::http_client::ProxyPool> {
+        let pool_cfg = self.proxy_pool.as_ref()?;
+        if !pool_cfg.enabled {
+            return None;
+        }
+
+        use crate::http_client::{ProxyConfig, ProxyPool, ProxyStrategy};
+
+        let strategy = ProxyStrategy::from_str_lossy(&pool_cfg.strategy);
+
+        let mut entries: Vec<ProxyConfig> = Vec::new();
+
+        // 端口范围模板展开
+        if let Some(tpl) = pool_cfg.template.as_ref() {
+            if !tpl.host.trim().is_empty() {
+                let part = ProxyPool::from_template(
+                    &tpl.protocol,
+                    &tpl.host,
+                    tpl.port_start,
+                    tpl.port_end,
+                    pool_cfg.username.as_deref(),
+                    pool_cfg.password.as_deref(),
+                    strategy,
+                );
+                entries.extend(part.entries().iter().cloned());
+            }
+        }
+
+        // 直接指定的 URL 列表
+        if let Some(urls) = pool_cfg.urls.as_ref() {
+            for url in urls {
+                let trimmed = url.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let mut cfg = ProxyConfig::from_user_input(trimmed, "http");
+                if let (Some(u), Some(p)) =
+                    (pool_cfg.username.as_deref(), pool_cfg.password.as_deref())
+                {
+                    if cfg.username.is_none() && !trimmed.contains('@') {
+                        cfg = cfg.with_auth(u, p);
+                    }
+                }
+                entries.push(cfg);
+            }
+        }
+
+        // 去重，保持原有顺序
+        let mut seen = std::collections::HashSet::new();
+        entries.retain(|cfg| seen.insert(cfg.clone()));
+
+        if entries.is_empty() {
+            return None;
+        }
+
+        let cooldown = std::time::Duration::from_secs(pool_cfg.effective_cooldown_secs());
+        Some(ProxyPool::new(entries, strategy).with_cooldown(cooldown))
+    }
+
+    /// 收集所有有效的 API Keys（主Key + 启用的新Keys）
+    pub fn collect_valid_keys(&self) -> Vec<String> {
+        let mut keys = Vec::new();
+
+        // 1. 添加主Key（如果存在且非空）
+        if let Some(key) = &self.api_key {
+            if !key.trim().is_empty() {
+                keys.push(key.clone());
+            }
+        }
+
+        // 2. 添加所有启用的新Keys
+        for api_key_config in &self.api_keys {
+            if api_key_config.enabled && !api_key_config.key.trim().is_empty() {
+                keys.push(api_key_config.key.clone());
+            }
+        }
+
+        keys
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, ProxyPoolConfig};
+
+    #[test]
+    fn test_build_proxy_pool_accepts_host_port_auth_lines() {
+        let config = Config {
+            proxy_pool: Some(ProxyPoolConfig {
+                enabled: true,
+                strategy: "round-robin".to_string(),
+                urls: Some(vec![
+                    "31.59.20.176:6754:wmkmhcil:8qcdmn0rh4ku".to_string(),
+                    "31.56.127.193:7684:wmkmhcil:8qcdmn0rh4ku".to_string(),
+                ]),
+                ..ProxyPoolConfig::default()
+            }),
+            ..Config::default()
+        };
+
+        let pool = config.build_proxy_pool().expect("代理池应构建成功");
+        assert_eq!(pool.len(), 2);
+
+        let first = &pool.entries()[0];
+        assert_eq!(first.url, "http://31.59.20.176:6754");
+        assert_eq!(first.username.as_deref(), Some("wmkmhcil"));
+        assert_eq!(first.password.as_deref(), Some("8qcdmn0rh4ku"));
+
+        let second = &pool.entries()[1];
+        assert_eq!(second.url, "http://31.56.127.193:7684");
+        assert_eq!(second.username.as_deref(), Some("wmkmhcil"));
+        assert_eq!(second.password.as_deref(), Some("8qcdmn0rh4ku"));
+    }
+
+    #[test]
+    fn test_build_proxy_pool_line_auth_overrides_global_auth() {
+        let config = Config {
+            proxy_pool: Some(ProxyPoolConfig {
+                enabled: true,
+                strategy: "round-robin".to_string(),
+                urls: Some(vec!["31.59.20.176:6754:line_user:line_pass".to_string()]),
+                username: Some("global_user".to_string()),
+                password: Some("global_pass".to_string()),
+                ..ProxyPoolConfig::default()
+            }),
+            ..Config::default()
+        };
+
+        let pool = config.build_proxy_pool().expect("代理池应构建成功");
+        let first = &pool.entries()[0];
+        assert_eq!(first.url, "http://31.59.20.176:6754");
+        assert_eq!(first.username.as_deref(), Some("line_user"));
+        assert_eq!(first.password.as_deref(), Some("line_pass"));
+    }
+
+    #[test]
+    fn test_build_proxy_pool_global_auth_still_applies_to_plain_url() {
+        let config = Config {
+            proxy_pool: Some(ProxyPoolConfig {
+                enabled: true,
+                strategy: "round-robin".to_string(),
+                urls: Some(vec!["http://31.59.20.176:6754".to_string()]),
+                username: Some("global_user".to_string()),
+                password: Some("global_pass".to_string()),
+                ..ProxyPoolConfig::default()
+            }),
+            ..Config::default()
+        };
+
+        let pool = config.build_proxy_pool().expect("代理池应构建成功");
+        let first = &pool.entries()[0];
+        assert_eq!(first.url, "http://31.59.20.176:6754");
+        assert_eq!(first.username.as_deref(), Some("global_user"));
+        assert_eq!(first.password.as_deref(), Some("global_pass"));
     }
 }

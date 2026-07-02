@@ -1,24 +1,45 @@
 //! Admin API 业务逻辑服务
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
+use futures::{StreamExt, stream};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::anthropic::types::{Model, ModelsResponse};
+use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::model::list_models::UpstreamModel;
+use crate::kiro::token_manager::{MultiTokenManager, RefreshTokenInvalidError};
+use crate::monitoring::{RequestActivitySnapshot, RequestMonitor};
+use crate::shared_state::ModelsCacheHandle;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    AddApiKeyRequest, AddCredentialRequest, AddCredentialResponse, ApiKeyInfo, ApiKeysListResponse,
+    BalanceResponse, BatchCredentialBalanceItem, BatchCredentialBalanceResponse,
+    CredentialStatusItem, CredentialsStatusResponse, GenerateApiKeyRequest, GenerateApiKeyResponse,
+    LoadBalancingModeResponse, LogsResponse, ProxyPoolDto, ProxyPoolStatusResponse,
+    ProxyPoolTemplateDto, ProxyTestItem, ProxyTestResponse, SetLoadBalancingModeRequest,
+    SetTokenPoolSizeRequest, TestProxyPoolRequest, UpdateApiKeyRequest,
+    UpdateCredentialProxyRequest,
 };
+use crate::model::config::{ApiKeyConfig, Config, ProxyPoolConfig, ProxyPoolTemplate};
+use std::time::{Duration, Instant};
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+/// 批量额度查询最大并发数。
+///
+/// 1000 个账号串行查询会被单个慢代理/慢 Token 刷新拖死；这里按需求固定为 20 路并发。
+const BATCH_BALANCE_CONCURRENCY: usize = 20;
+/// 单个凭据在批量额度查询中的总超时时间（包含必要的 Token 刷新 + 额度查询）。
+const BATCH_BALANCE_ITEM_TIMEOUT_SECS: u64 = 90;
 
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,16 +55,27 @@ struct CachedBalance {
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
+    request_monitor: RequestMonitor,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     cache_path: Option<PathBuf>,
+    log_path: PathBuf,
+    config_path: PathBuf,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+    /// 共享的动态模型列表缓存（与 anthropic AppState 共享同一份）
+    models_cache: ModelsCacheHandle,
+    /// 服务启动时间（Unix 秒），用于填充 Model.created
+    started_at_unix: i64,
 }
 
 impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
+        request_monitor: RequestMonitor,
+        log_path: PathBuf,
+        config_path: PathBuf,
         known_endpoints: impl IntoIterator<Item = String>,
+        models_cache: ModelsCacheHandle,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -53,9 +85,14 @@ impl AdminService {
 
         Self {
             token_manager,
+            request_monitor,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
+            log_path,
+            config_path,
             known_endpoints: known_endpoints.into_iter().collect(),
+            models_cache,
+            started_at_unix: Utc::now().timestamp(),
         }
     }
 
@@ -83,7 +120,7 @@ impl AdminService {
                 success_count: entry.success_count,
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
-                proxy_url: entry.proxy_url,
+                proxy_url: entry.proxy_url.as_deref().map(mask_proxy_url),
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
@@ -132,6 +169,13 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id))
     }
 
+    /// 启用全部可恢复凭据
+    pub fn enable_all_credentials(&self) -> Result<usize, AdminServiceError> {
+        self.token_manager
+            .enable_all_recoverable()
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+    }
+
     /// 获取凭据余额（带缓存）
     pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
         // 先查缓存
@@ -150,28 +194,22 @@ impl AdminService {
         let balance = self.fetch_balance(id).await?;
 
         // 更新缓存
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.insert(
-                id,
-                CachedBalance {
-                    cached_at: Utc::now().timestamp() as f64,
-                    data: balance.clone(),
-                },
-            );
-        }
-        self.save_balance_cache();
+        self.update_balance_cache(id, &balance);
 
         Ok(balance)
     }
 
     /// 从上游获取余额（无缓存）
     async fn fetch_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        let usage = self
-            .token_manager
-            .get_usage_limits_for(id)
-            .await
-            .map_err(|e| self.classify_balance_error(e, id))?;
+        let usage = match self.token_manager.get_usage_limits_for(id).await {
+            Ok(usage) => usage,
+            Err(error) if error.downcast_ref::<RefreshTokenInvalidError>().is_some() => {
+                return Err(
+                    self.auto_delete_invalid_refresh_token_credential(id, error.to_string())
+                );
+            }
+            Err(error) => return Err(self.classify_balance_error(error, id)),
+        };
 
         let current_usage = usage.current_usage();
         let usage_limit = usage.usage_limit();
@@ -191,6 +229,235 @@ impl AdminService {
             usage_percentage,
             next_reset_at: usage.next_date_reset,
         })
+    }
+
+    /// 自动删除已被上游明确判定为永久失效的 refreshToken 凭据。
+    fn auto_delete_invalid_refresh_token_credential(
+        &self,
+        id: u64,
+        source_message: String,
+    ) -> AdminServiceError {
+        match self
+            .token_manager
+            .delete_invalid_refresh_token_credential(id)
+        {
+            Ok(_) => {
+                self.remove_balance_cache(id);
+                AdminServiceError::InvalidRefreshTokenDeleted {
+                    id,
+                    message: source_message,
+                }
+            }
+            Err(delete_error) => AdminServiceError::InternalError(format!(
+                "凭据 #{} refreshToken 已失效，但自动删除失败: {}; 原始错误: {}",
+                id, delete_error, source_message
+            )),
+        }
+    }
+
+    /// 查询所有凭据余额，并自动启用仍有剩余额度的账号
+    pub async fn query_all_balances_and_enable_remaining(
+        &self,
+    ) -> Result<BatchCredentialBalanceResponse, AdminServiceError> {
+        let snapshot = self.token_manager.snapshot();
+        let total = snapshot.entries.len();
+
+        tracing::info!(
+            total,
+            concurrency = BATCH_BALANCE_CONCURRENCY,
+            item_timeout_secs = BATCH_BALANCE_ITEM_TIMEOUT_SECS,
+            "开始批量额度查询并自动启用有余额凭据"
+        );
+
+        struct BalanceFetchOutcome {
+            index: usize,
+            id: u64,
+            result: Result<BalanceResponse, String>,
+            deleted_invalid: bool,
+        }
+
+        let mut fetch_stream = stream::iter(snapshot.entries.into_iter().enumerate().map(
+            |(index, entry)| async move {
+                let id = entry.id;
+                let (result, deleted_invalid) = match tokio::time::timeout(
+                    Duration::from_secs(BATCH_BALANCE_ITEM_TIMEOUT_SECS),
+                    self.fetch_balance(id),
+                )
+                .await
+                {
+                    Ok(Ok(balance)) => (Ok(balance), false),
+                    Ok(Err(error)) => {
+                        let deleted_invalid =
+                            matches!(&error, AdminServiceError::InvalidRefreshTokenDeleted { .. });
+                        (Err(error.to_string()), deleted_invalid)
+                    }
+                    Err(_) => (
+                        Err(format!(
+                            "额度查询超时（超过 {} 秒）",
+                            BATCH_BALANCE_ITEM_TIMEOUT_SECS
+                        )),
+                        false,
+                    ),
+                };
+
+                BalanceFetchOutcome {
+                    index,
+                    id,
+                    result,
+                    deleted_invalid,
+                }
+            },
+        ))
+        .buffer_unordered(BATCH_BALANCE_CONCURRENCY);
+
+        // 按原快照顺序回填结果，避免前端列表跳动；启用动作则在单个查询完成后立即执行。
+        let mut results: Vec<Option<BatchCredentialBalanceItem>> = vec![None; total];
+        let mut cache_updates = Vec::new();
+        let mut success = 0usize;
+        let mut failed = 0usize;
+        let mut with_remaining = 0usize;
+        let mut enabled = 0usize;
+        let mut deleted_invalid = 0usize;
+
+        while let Some(outcome) = fetch_stream.next().await {
+            let id = outcome.id;
+
+            let item = match outcome.result {
+                Ok(balance) => {
+                    cache_updates.push((id, balance.clone()));
+
+                    if balance.remaining > 0.0 {
+                        with_remaining += 1;
+
+                        // 一旦确认有剩余额度，立即重置失败计数并启用该凭据，
+                        // 不再等待其它账号全部查询完成。
+                        let mut reset_results = self.token_manager.reset_and_enable_many(&[id]);
+                        match reset_results
+                            .remove(&id)
+                            .unwrap_or_else(|| Err("内部错误: 重置结果缺失".to_string()))
+                        {
+                            Ok(was_disabled) => {
+                                success += 1;
+                                if was_disabled {
+                                    enabled += 1;
+                                }
+                                BatchCredentialBalanceItem {
+                                    id,
+                                    success: true,
+                                    enabled: was_disabled,
+                                    deleted: false,
+                                    balance: Some(balance),
+                                    error: None,
+                                }
+                            }
+                            Err(error) => {
+                                failed += 1;
+                                BatchCredentialBalanceItem {
+                                    id,
+                                    success: false,
+                                    enabled: false,
+                                    deleted: false,
+                                    balance: Some(balance),
+                                    error: Some(error.to_string()),
+                                }
+                            }
+                        }
+                    } else {
+                        success += 1;
+                        BatchCredentialBalanceItem {
+                            id,
+                            success: true,
+                            enabled: false,
+                            deleted: false,
+                            balance: Some(balance),
+                            error: None,
+                        }
+                    }
+                }
+                Err(error) => {
+                    failed += 1;
+                    if outcome.deleted_invalid {
+                        deleted_invalid += 1;
+                    }
+                    BatchCredentialBalanceItem {
+                        id,
+                        success: false,
+                        enabled: false,
+                        deleted: outcome.deleted_invalid,
+                        balance: None,
+                        error: Some(error.to_string()),
+                    }
+                }
+            };
+
+            results[outcome.index] = Some(item);
+        }
+
+        self.update_balance_cache_many(&cache_updates);
+        let results: Vec<BatchCredentialBalanceItem> = results.into_iter().flatten().collect();
+
+        tracing::info!(
+            total = results.len(),
+            success,
+            failed,
+            with_remaining,
+            enabled,
+            deleted_invalid,
+            "已完成批量额度查询并自动启用有余额凭据"
+        );
+
+        Ok(BatchCredentialBalanceResponse {
+            total: results.len(),
+            success,
+            failed,
+            with_remaining,
+            enabled,
+            deleted_invalid,
+            results,
+        })
+    }
+
+    fn update_balance_cache_many(&self, balances: &[(u64, BalanceResponse)]) {
+        if balances.is_empty() {
+            return;
+        }
+
+        {
+            let mut cache = self.balance_cache.lock();
+            let cached_at = Utc::now().timestamp() as f64;
+            for (id, balance) in balances {
+                cache.insert(
+                    *id,
+                    CachedBalance {
+                        cached_at,
+                        data: balance.clone(),
+                    },
+                );
+            }
+        }
+        self.save_balance_cache();
+    }
+
+    fn update_balance_cache(&self, id: u64, balance: &BalanceResponse) {
+        {
+            let mut cache = self.balance_cache.lock();
+            cache.insert(
+                id,
+                CachedBalance {
+                    cached_at: Utc::now().timestamp() as f64,
+                    data: balance.clone(),
+                },
+            );
+        }
+        self.save_balance_cache();
+    }
+
+    fn remove_balance_cache(&self, id: u64) {
+        {
+            let mut cache = self.balance_cache.lock();
+            cache.remove(&id);
+        }
+        self.save_balance_cache();
     }
 
     /// 添加新凭据
@@ -264,11 +531,7 @@ impl AdminService {
             .map_err(|e| self.classify_delete_error(e, id))?;
 
         // 清理已删除凭据的余额缓存
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.remove(&id);
-        }
-        self.save_balance_cache();
+        self.remove_balance_cache(id);
 
         Ok(())
     }
@@ -277,6 +540,96 @@ impl AdminService {
     pub fn get_load_balancing_mode(&self) -> LoadBalancingModeResponse {
         LoadBalancingModeResponse {
             mode: self.token_manager.get_load_balancing_mode(),
+            token_pool_size: self.token_manager.get_token_pool_size(),
+        }
+    }
+
+    /// 获取当前服务暴露的模型列表
+    ///
+    /// 直接从共享的 [`ModelsCacheHandle`] 读取。该缓存由后台周期任务通过
+    /// [`Self::refresh_models`] 写入；首次启动尚未刷新成功时返回 fallback。
+    pub fn get_available_models(&self) -> ModelsResponse {
+        ModelsResponse {
+            object: "list".to_string(),
+            data: self.models_cache.snapshot_models(),
+        }
+    }
+
+    /// 拉取上游 ListAvailableModels 并写入共享缓存
+    ///
+    /// 由后台周期任务（在 `main.rs` 中通过 `tokio::spawn` 启动）调用。
+    /// 失败时不清除现有缓存，仅记录 `last_error`，让现有列表（可能是 fallback 或上一次成功的结果）继续生效。
+    ///
+    /// 处理上游响应时有两道保护：
+    /// 1. **过滤非 claude 模型**：handlers::map_model 当前只支持 claude 系列，
+    ///    暴露 deepseek/minimax/glm/qwen 等模型只会让 admin UI 出现实际无法调用的条目。
+    ///    后续若 handlers 支持更多模型，再放宽此过滤。
+    /// 2. **空数组保护**：上游临时故障 / 过滤后无 claude 模型时，保留现有缓存而非清空。
+    pub async fn refresh_models(&self) -> Result<(), AdminServiceError> {
+        let response = self
+            .token_manager
+            .list_available_models_via_active()
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                self.models_cache.mark_error(msg.clone());
+                AdminServiceError::UpstreamError(msg)
+            })?;
+
+        let (models, total_upstream) =
+            convert_and_filter_upstream_models(&response, self.started_at_unix);
+
+        if models.is_empty() {
+            let msg = format!(
+                "上游返回 {} 个模型，过滤后无 claude-* 可用，保留现有缓存",
+                total_upstream
+            );
+            tracing::warn!("{}", msg);
+            self.models_cache.mark_error(msg.clone());
+            return Err(AdminServiceError::UpstreamError(msg));
+        }
+
+        let default_id = response.default_model.as_ref().map(|m| m.model_id.clone());
+
+        let count = models.len();
+        let filtered_out = total_upstream.saturating_sub(count);
+        self.models_cache.replace(models, default_id.clone());
+        tracing::info!(
+            model_count = count,
+            filtered_out = filtered_out,
+            default_id = ?default_id,
+            "模型列表已通过上游 ListAvailableModels 更新"
+        );
+
+        Ok(())
+    }
+
+    /// 获取最近请求活动
+    pub fn get_request_activity(&self, limit: usize) -> RequestActivitySnapshot {
+        self.request_monitor.snapshot(limit)
+    }
+
+    /// 获取最近日志
+    pub fn get_recent_logs(&self, lines: usize) -> LogsResponse {
+        let lines = lines.clamp(1, 500);
+
+        match read_tail_lines(&self.log_path, lines) {
+            Ok((lines, truncated)) => LogsResponse {
+                path: self.log_path.display().to_string(),
+                available: true,
+                fetched_at: Utc::now().to_rfc3339(),
+                truncated,
+                lines,
+                error: None,
+            },
+            Err(error) => LogsResponse {
+                path: self.log_path.display().to_string(),
+                available: false,
+                fetched_at: Utc::now().to_rfc3339(),
+                truncated: false,
+                lines: Vec::new(),
+                error: Some(error),
+            },
         }
     }
 
@@ -286,9 +639,14 @@ impl AdminService {
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
         // 验证模式值
-        if req.mode != "priority" && req.mode != "balanced" {
+        if req.mode != "priority"
+            && req.mode != "balanced"
+            && req.mode != "round_robin"
+            && req.mode != "token_pool"
+        {
             return Err(AdminServiceError::InvalidCredential(
-                "mode 必须是 'priority' 或 'balanced'".to_string(),
+                "mode 必须是 'priority' / 'balanced' / 'round_robin' / 'token_pool' 之一"
+                    .to_string(),
             ));
         }
 
@@ -296,15 +654,42 @@ impl AdminService {
             .set_load_balancing_mode(req.mode.clone())
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
-        Ok(LoadBalancingModeResponse { mode: req.mode })
+        Ok(LoadBalancingModeResponse {
+            mode: req.mode,
+            token_pool_size: self.token_manager.get_token_pool_size(),
+        })
+    }
+
+    /// 设置轮询模式热凭据池大小
+    pub fn set_token_pool_size(
+        &self,
+        req: SetTokenPoolSizeRequest,
+    ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
+        if req.token_pool_size == 0 {
+            return Err(AdminServiceError::InvalidRequest(
+                "tokenPoolSize 必须大于 0".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_token_pool_size(req.token_pool_size)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(LoadBalancingModeResponse {
+            mode: self.token_manager.get_load_balancing_mode(),
+            token_pool_size: self.token_manager.get_token_pool_size(),
+        })
     }
 
     /// 强制刷新指定凭据的 Token
     pub async fn force_refresh_token(&self, id: u64) -> Result<(), AdminServiceError> {
-        self.token_manager
-            .force_refresh_token_for(id)
-            .await
-            .map_err(|e| self.classify_balance_error(e, id))
+        match self.token_manager.force_refresh_token_for(id).await {
+            Ok(_) => Ok(()),
+            Err(error) if error.downcast_ref::<RefreshTokenInvalidError>().is_some() => {
+                Err(self.auto_delete_invalid_refresh_token_credential(id, error.to_string()))
+            }
+            Err(error) => Err(self.classify_balance_error(error, id)),
+        }
     }
 
     // ============ 余额缓存持久化 ============
@@ -448,10 +833,953 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
         }
+    }
+}
+
+const LOG_TAIL_BYTES: u64 = 128 * 1024;
+
+fn read_tail_lines(path: &Path, max_lines: usize) -> Result<(Vec<String>, bool), String> {
+    let mut file = File::open(path).map_err(|e| format!("打开日志文件失败: {}", e))?;
+    let file_size = file
+        .metadata()
+        .map_err(|e| format!("读取日志文件信息失败: {}", e))?
+        .len();
+
+    let start_offset = file_size.saturating_sub(LOG_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start_offset))
+        .map_err(|e| format!("定位日志文件失败: {}", e))?;
+
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)
+        .map_err(|e| format!("读取日志文件失败: {}", e))?;
+
+    // 从任意字节偏移读取尾部时，截断点可能落在 UTF-8 多字节字符中间。
+    // 这里使用 lossy 解码，并在 start_offset > 0 时丢弃首个残缺行，避免整段读取失败。
+    let buffer = String::from_utf8_lossy(&buffer);
+    let mut lines: Vec<String> = buffer.lines().map(strip_ansi_codes).collect();
+
+    if start_offset > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+
+    let truncated = lines.len() > max_lines;
+    if truncated {
+        lines = lines[lines.len() - max_lines..].to_vec();
+    }
+
+    Ok((lines, truncated))
+}
+
+fn strip_ansi_codes(line: &str) -> String {
+    let mut result = String::with_capacity(line.len());
+    let mut in_escape = false;
+
+    for ch in line.chars() {
+        if in_escape {
+            if matches!(ch, 'm' | 'K') {
+                in_escape = false;
+            }
+            continue;
+        }
+
+        if ch == '\u{1b}' {
+            in_escape = true;
+            continue;
+        }
+
+        result.push(ch);
+    }
+
+    result
+}
+
+impl AdminService {
+    // ============ API Key 管理方法 ============
+
+    /// 获取所有 API Keys
+    pub fn get_api_keys(&self) -> Result<ApiKeysListResponse, AdminServiceError> {
+        let config = Config::load(&self.config_path)
+            .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+
+        let api_keys: Vec<ApiKeyInfo> = config
+            .api_keys
+            .iter()
+            .map(|k| ApiKeyInfo {
+                id: k.id.clone(),
+                key: k.key.clone(),
+                name: k.name.clone(),
+                enabled: k.enabled,
+                created_at: k.created_at.clone(),
+                last_used_at: k.last_used_at.clone(),
+                is_primary: false,
+            })
+            .collect();
+
+        // 处理主Key（来自旧配置）
+        let primary_key = config.api_key.as_ref().and_then(|key| {
+            if key.trim().is_empty() {
+                None
+            } else {
+                Some(ApiKeyInfo {
+                    id: "primary".to_string(),
+                    key: key.clone(),
+                    name: "主Key（来自配置）".to_string(),
+                    enabled: true,
+                    created_at: "N/A".to_string(),
+                    last_used_at: None,
+                    is_primary: true,
+                })
+            }
+        });
+
+        Ok(ApiKeysListResponse {
+            api_keys,
+            primary_key,
+        })
+    }
+
+    /// 添加新的 API Key
+    pub fn add_api_key(&self, req: AddApiKeyRequest) -> Result<ApiKeyInfo, AdminServiceError> {
+        let key = req.key.trim();
+        if key.is_empty() {
+            return Err(AdminServiceError::InvalidRequest(
+                "Key 不能为空".to_string(),
+            ));
+        }
+
+        let mut config = Config::load(&self.config_path)
+            .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+
+        // 检查Key是否重复
+        if config.api_key.as_ref().map(|k| k == key).unwrap_or(false) {
+            return Err(AdminServiceError::InvalidRequest(
+                "Key 与主Key重复".to_string(),
+            ));
+        }
+        if config.api_keys.iter().any(|k| k.key == key) {
+            return Err(AdminServiceError::InvalidRequest("Key 已存在".to_string()));
+        }
+
+        let new_key = ApiKeyConfig {
+            id: uuid::Uuid::new_v4().to_string(),
+            key: key.to_string(),
+            name: req.name.trim().to_string(),
+            enabled: true,
+            created_at: Utc::now().to_rfc3339(),
+            last_used_at: None,
+        };
+
+        let key_info = ApiKeyInfo {
+            id: new_key.id.clone(),
+            key: new_key.key.clone(),
+            name: new_key.name.clone(),
+            enabled: new_key.enabled,
+            created_at: new_key.created_at.clone(),
+            last_used_at: None,
+            is_primary: false,
+        };
+
+        config.api_keys.push(new_key);
+        config
+            .save()
+            .map_err(|e| AdminServiceError::InternalError(format!("保存配置失败: {}", e)))?;
+
+        Ok(key_info)
+    }
+
+    /// 生成随机 API Key
+    pub fn generate_api_key(
+        &self,
+        req: GenerateApiKeyRequest,
+    ) -> Result<GenerateApiKeyResponse, AdminServiceError> {
+        use rand::distributions::Alphanumeric;
+        use rand::{Rng, thread_rng};
+
+        let length = req.length.clamp(16, 64);
+        let key: String = thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(length)
+            .map(char::from)
+            .collect();
+
+        let mut config = Config::load(&self.config_path)
+            .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+
+        let new_key = ApiKeyConfig {
+            id: uuid::Uuid::new_v4().to_string(),
+            key: key.clone(),
+            name: req.name.trim().to_string(),
+            enabled: true,
+            created_at: Utc::now().to_rfc3339(),
+            last_used_at: None,
+        };
+
+        let id = new_key.id.clone();
+        config.api_keys.push(new_key);
+        config
+            .save()
+            .map_err(|e| AdminServiceError::InternalError(format!("保存配置失败: {}", e)))?;
+
+        Ok(GenerateApiKeyResponse { key, id })
+    }
+
+    /// 更新 API Key
+    pub fn update_api_key(
+        &self,
+        id: &str,
+        req: UpdateApiKeyRequest,
+    ) -> Result<(), AdminServiceError> {
+        let mut config = Config::load(&self.config_path)
+            .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+
+        // 先找到Key的索引
+        let key_index = config
+            .api_keys
+            .iter()
+            .position(|k| k.id == id)
+            .ok_or_else(|| AdminServiceError::NotFoundGeneric(format!("Key {} 不存在", id)))?;
+
+        // 如果要禁用，检查是否至少保留一个启用的Key
+        if let Some(false) = req.enabled {
+            if config.api_keys[key_index].enabled {
+                let enabled_count = config
+                    .api_keys
+                    .iter()
+                    .filter(|k| k.enabled && k.id != id)
+                    .count();
+                let has_primary = config
+                    .api_key
+                    .as_ref()
+                    .map(|k| !k.trim().is_empty())
+                    .unwrap_or(false);
+
+                if enabled_count == 0 && !has_primary {
+                    return Err(AdminServiceError::InvalidRequest(
+                        "至少需要保留一个启用的 Key".to_string(),
+                    ));
+                }
+            }
+        }
+
+        // 更新Key
+        let key = &mut config.api_keys[key_index];
+        if let Some(name) = req.name {
+            key.name = name.trim().to_string();
+        }
+        if let Some(enabled) = req.enabled {
+            key.enabled = enabled;
+        }
+
+        config
+            .save()
+            .map_err(|e| AdminServiceError::InternalError(format!("保存配置失败: {}", e)))?;
+
+        Ok(())
+    }
+
+    // ============ 代理池管理 ============
+
+    /// 读取当前代理池配置（从 config.json）
+    ///
+    /// 注意：返回值会 mask password，避免通过 GET 接口泄露密码
+    pub fn get_proxy_pool(&self) -> Result<ProxyPoolStatusResponse, AdminServiceError> {
+        let config = Config::load(&self.config_path)
+            .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+
+        let mut dto = match &config.proxy_pool {
+            Some(pool) => pool_config_to_dto(pool),
+            None => ProxyPoolDto::default(),
+        };
+        // 屏蔽 password，GET 返回给前端时不暴露明文
+        if dto.password.is_some() {
+            dto.password = Some("***".to_string());
+        }
+
+        let snapshot = self.token_manager.proxy_pool_snapshot();
+        let (proxies, resolved_urls, size, default_cooldown_secs) = match snapshot.as_ref() {
+            Some(pool) => {
+                let entries = pool.entries();
+                let cooldowns = pool.cooldown_snapshot();
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+
+                let mut urls = Vec::with_capacity(entries.len());
+                let mut items = Vec::with_capacity(entries.len());
+                for (i, entry) in entries.iter().enumerate() {
+                    let masked = mask_proxy_url(&entry.url);
+                    urls.push(masked.clone());
+                    let until = cooldowns.get(i).copied().unwrap_or(0);
+                    let remaining = if until > now_ms {
+                        (until - now_ms).div_ceil(1000)
+                    } else {
+                        0
+                    };
+                    items.push(crate::admin::types::ProxyPoolItemStatus {
+                        url: masked,
+                        cooldown_until_ms: until,
+                        cooldown_remaining_secs: remaining,
+                    });
+                }
+                (items, urls, pool.len(), pool.default_cooldown().as_secs())
+            }
+            None => (
+                Vec::new(),
+                Vec::new(),
+                0,
+                crate::model::config::ProxyPoolConfig::DEFAULT_COOLDOWN_SECS,
+            ),
+        };
+
+        let active = snapshot.is_some();
+        let server_time_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        Ok(ProxyPoolStatusResponse {
+            config: dto,
+            proxies,
+            resolved_urls,
+            size,
+            active,
+            server_time_ms,
+            default_cooldown_secs,
+        })
+    }
+
+    /// 更新代理池配置（持久化 + 热更新运行时池）
+    pub fn update_proxy_pool(
+        &self,
+        mut dto: ProxyPoolDto,
+    ) -> Result<ProxyPoolStatusResponse, AdminServiceError> {
+        let strategy = dto.strategy.trim();
+        let valid_strategies = ["round-robin", "random", "per-credential"];
+        if !valid_strategies.contains(&strategy) {
+            return Err(AdminServiceError::InvalidRequest(
+                "strategy 必须是 round-robin / random / per-credential 之一".to_string(),
+            ));
+        }
+
+        // 加载现有配置
+        let mut config = Config::load(&self.config_path)
+            .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+
+        // 如果 password 字段为 "***"（占位符），保留原密码；其他情况按传入值覆盖
+        if matches!(dto.password.as_deref(), Some("***")) {
+            dto.password = config.proxy_pool.as_ref().and_then(|p| p.password.clone());
+        }
+
+        let pool_cfg = dto_to_pool_config(&dto);
+
+        config.proxy_pool = Some(pool_cfg.clone());
+        config
+            .save()
+            .map_err(|e| AdminServiceError::InternalError(format!("保存配置失败: {}", e)))?;
+
+        // 重建运行时代理池
+        let new_pool = config.build_proxy_pool().map(std::sync::Arc::new);
+        self.token_manager.replace_proxy_pool(new_pool.clone());
+
+        if let Some(pool) = new_pool.as_ref() {
+            tracing::info!(
+                "代理池已更新：共 {} 个代理，策略 {}",
+                pool.len(),
+                pool.strategy().as_str()
+            );
+        } else {
+            tracing::info!("代理池已关闭");
+        }
+
+        self.get_proxy_pool()
+    }
+
+    /// 测试代理池连通性
+    pub async fn test_proxy_pool(
+        &self,
+        req: TestProxyPoolRequest,
+    ) -> Result<ProxyTestResponse, AdminServiceError> {
+        let config = Config::load(&self.config_path)
+            .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+
+        let test_url_override = req
+            .test_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let test_url = test_url_override.unwrap_or_else(|| {
+            config
+                .proxy_pool
+                .as_ref()
+                .map(|p| p.effective_test_url().to_string())
+                .unwrap_or_else(|| ProxyPoolConfig::DEFAULT_TEST_URL.to_string())
+        });
+
+        let timeout = Duration::from_secs(req.timeout_secs.unwrap_or(10).clamp(3, 60));
+
+        let pool = self.token_manager.proxy_pool_snapshot();
+        let entries: Vec<ProxyConfig> = pool
+            .as_ref()
+            .map(|p| p.entries().to_vec())
+            .unwrap_or_default();
+
+        if entries.is_empty() {
+            return Ok(ProxyTestResponse {
+                total: 0,
+                success: 0,
+                failed: 0,
+                test_url,
+                results: Vec::new(),
+            });
+        }
+
+        let tls_backend = config.tls_backend;
+        let mut handles = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let url_owned = test_url.clone();
+            let entry_clone = entry.clone();
+            let handle = tokio::spawn(async move {
+                test_single_proxy(&entry_clone, &url_owned, timeout, tls_backend).await
+            });
+            handles.push(handle);
+        }
+
+        let mut results = Vec::with_capacity(handles.len());
+        let mut ok = 0usize;
+        for handle in handles {
+            match handle.await {
+                Ok(item) => {
+                    if item.success {
+                        ok += 1;
+                    }
+                    results.push(item);
+                }
+                Err(e) => {
+                    results.push(ProxyTestItem {
+                        url: "<unknown>".to_string(),
+                        success: false,
+                        duration_ms: 0,
+                        response_ip: None,
+                        error: Some(format!("任务失败: {}", e)),
+                    });
+                }
+            }
+        }
+
+        let total = results.len();
+        let failed = total - ok;
+
+        Ok(ProxyTestResponse {
+            total,
+            success: ok,
+            failed,
+            test_url,
+            results,
+        })
+    }
+
+    /// 更新凭据级代理配置
+    pub async fn update_credential_proxy(
+        &self,
+        id: u64,
+        req: UpdateCredentialProxyRequest,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .update_credential_proxy(id, req.proxy_url, req.proxy_username, req.proxy_password)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 删除 API Key
+    pub fn delete_api_key(&self, id: &str) -> Result<(), AdminServiceError> {
+        let mut config = Config::load(&self.config_path)
+            .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+
+        let index = config
+            .api_keys
+            .iter()
+            .position(|k| k.id == id)
+            .ok_or_else(|| AdminServiceError::NotFoundGeneric(format!("Key {} 不存在", id)))?;
+
+        // 检查是否至少保留一个启用的Key
+        let key_to_delete = &config.api_keys[index];
+        if key_to_delete.enabled {
+            let enabled_count = config
+                .api_keys
+                .iter()
+                .filter(|k| k.enabled && k.id != id)
+                .count();
+            let has_primary = config
+                .api_key
+                .as_ref()
+                .map(|k| !k.trim().is_empty())
+                .unwrap_or(false);
+
+            if enabled_count == 0 && !has_primary {
+                return Err(AdminServiceError::InvalidRequest(
+                    "至少需要保留一个启用的 Key".to_string(),
+                ));
+            }
+        }
+
+        config.api_keys.remove(index);
+        config
+            .save()
+            .map_err(|e| AdminServiceError::InternalError(format!("保存配置失败: {}", e)))?;
+
+        Ok(())
+    }
+}
+
+// ============ 代理池辅助函数 ============
+
+/// DTO -> Config
+fn dto_to_pool_config(dto: &ProxyPoolDto) -> ProxyPoolConfig {
+    let cleaned: Vec<String> = dto
+        .urls
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let urls = if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    };
+
+    let template = dto.template.as_ref().and_then(|t| {
+        let host = t.host.trim();
+        if host.is_empty() {
+            return None;
+        }
+        Some(ProxyPoolTemplate {
+            protocol: t.protocol.trim().to_string(),
+            host: host.to_string(),
+            port_start: t.port_start,
+            port_end: t.port_end,
+        })
+    });
+
+    let username = dto
+        .username
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let password = dto
+        .password
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let test_url = dto
+        .test_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    ProxyPoolConfig {
+        enabled: dto.enabled,
+        strategy: dto.strategy.trim().to_string(),
+        urls,
+        template,
+        username,
+        password,
+        test_url,
+        cooldown_secs: dto.cooldown_secs,
+    }
+}
+
+/// Config -> DTO
+fn pool_config_to_dto(cfg: &ProxyPoolConfig) -> ProxyPoolDto {
+    ProxyPoolDto {
+        enabled: cfg.enabled,
+        strategy: cfg.strategy.clone(),
+        urls: cfg.urls.clone(),
+        template: cfg.template.as_ref().map(|t| ProxyPoolTemplateDto {
+            protocol: t.protocol.clone(),
+            host: t.host.clone(),
+            port_start: t.port_start,
+            port_end: t.port_end,
+        }),
+        username: cfg.username.clone(),
+        password: cfg.password.clone(),
+        test_url: cfg.test_url.clone(),
+        cooldown_secs: cfg.cooldown_secs,
+    }
+}
+
+/// 测试单个代理
+async fn test_single_proxy(
+    entry: &ProxyConfig,
+    test_url: &str,
+    timeout: Duration,
+    tls_backend: crate::model::config::TlsBackend,
+) -> ProxyTestItem {
+    let start = Instant::now();
+    let timeout_secs = timeout.as_secs().max(1);
+    let client = match build_client(Some(entry), timeout_secs, tls_backend) {
+        Ok(c) => c,
+        Err(e) => {
+            return ProxyTestItem {
+                url: entry.url.clone(),
+                success: false,
+                duration_ms: start.elapsed().as_millis() as u64,
+                response_ip: None,
+                error: Some(format!("构建客户端失败: {}", e)),
+            };
+        }
+    };
+
+    let masked_url = mask_proxy_url(&entry.url);
+    match tokio::time::timeout(timeout, client.get(test_url).send()).await {
+        Ok(Ok(resp)) => {
+            let status = resp.status();
+            if !status.is_success() {
+                return ProxyTestItem {
+                    url: masked_url,
+                    success: false,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    response_ip: None,
+                    error: Some(format!("HTTP 状态码: {}", status.as_u16())),
+                };
+            }
+            let body = resp.text().await.unwrap_or_default();
+            let ip = extract_ip_from_json(&body);
+            ProxyTestItem {
+                url: masked_url,
+                success: true,
+                duration_ms: start.elapsed().as_millis() as u64,
+                response_ip: ip,
+                error: None,
+            }
+        }
+        Ok(Err(e)) => ProxyTestItem {
+            url: masked_url,
+            success: false,
+            duration_ms: start.elapsed().as_millis() as u64,
+            response_ip: None,
+            error: Some(e.to_string()),
+        },
+        Err(_) => ProxyTestItem {
+            url: masked_url,
+            success: false,
+            duration_ms: start.elapsed().as_millis() as u64,
+            response_ip: None,
+            error: Some(format!("超时（{}s）", timeout.as_secs())),
+        },
+    }
+}
+
+/// 屏蔽代理 URL 中的敏感信息（用户名保留，密码 mask）
+fn mask_proxy_url(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let prefix = &url[..scheme_end + 3];
+        let rest = &url[scheme_end + 3..];
+        if let Some(at_pos) = rest.find('@') {
+            let auth = &rest[..at_pos];
+            let host = &rest[at_pos + 1..];
+            // 保留用户名，屏蔽密码
+            if let Some(colon) = auth.find(':') {
+                let user = &auth[..colon];
+                return format!("{}{}:***@{}", prefix, user, host);
+            }
+            return format!("{}***@{}", prefix, host);
+        }
+    }
+    url.to_string()
+}
+
+/// 从响应 JSON 中尽力提取 IP 字段
+fn extract_ip_from_json(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    // 常见字段名
+    for key in ["ip", "query", "origin", "YourFuckingIPAddress"] {
+        if let Some(v) = value.get(key) {
+            if let Some(s) = v.as_str() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 上游 ListAvailableModels 返回的模型是否被本服务实际支持转发
+///
+/// 当前 [`crate::anthropic::converter::map_model`] 只识别 `sonnet` / `opus` / `haiku` 关键字
+/// （即 `claude-*` 系列），其他模型（`auto` / `deepseek-*` / `minimax-*` / `glm-*` /
+/// `qwen*` 等）若暴露给客户端只会触发 `UnsupportedModel` 错误。
+///
+/// 此函数与 `map_model` 的支持范围保持一致：仅放行 `claude-*` 系列。
+/// 后续若 `map_model` 扩展，请同步放宽此过滤。
+fn is_supported_upstream_model(model_id: &str) -> bool {
+    model_id.to_ascii_lowercase().starts_with("claude-")
+}
+
+/// 把上游响应转换并过滤为可对外暴露的 [`Model`] 列表
+///
+/// 返回 `(filtered_models, total_upstream_count)`，调用方据此判断 BUG #2 (空保护)。
+/// 与 `refresh_models` 解耦后便于单独单测过滤 / 空响应行为，无需 mock 整个 token_manager。
+fn convert_and_filter_upstream_models(
+    response: &crate::kiro::model::list_models::ListAvailableModelsResponse,
+    started_at_unix: i64,
+) -> (Vec<Model>, usize) {
+    let total = response.models.len();
+    let models = response
+        .models
+        .iter()
+        .filter(|upstream| is_supported_upstream_model(&upstream.model_id))
+        .map(|upstream| upstream_to_model(upstream, started_at_unix))
+        .collect();
+    (models, total)
+}
+
+/// 从 modelId 推断 owned_by（用于对外展示）
+fn derive_owned_by(model_id: &str) -> &'static str {
+    let id = model_id.to_ascii_lowercase();
+    if id == "auto" {
+        "system"
+    } else if id.starts_with("claude-") {
+        "anthropic"
+    } else if id.starts_with("deepseek-") {
+        "deepseek"
+    } else if id.starts_with("minimax-") {
+        "minimax"
+    } else if id.starts_with("glm-") {
+        "zhipu"
+    } else if id.starts_with("qwen") {
+        "alibaba"
+    } else {
+        "unknown"
+    }
+}
+
+/// 上游 [`UpstreamModel`] -> 对外暴露的 [`Model`] 转换
+///
+/// - `created` 统一填服务启动时间（秒），便于客户端区分会话内的"批次"
+/// - `max_tokens` 从 `tokenLimits.maxOutputTokens` 取，缺失回退 64000（与原有 fallback 列表一致）
+/// - 上游缺失 `modelName` 时回退使用 `modelId` 作为展示名
+fn upstream_to_model(upstream: &UpstreamModel, started_at_unix: i64) -> Model {
+    let max_tokens = upstream
+        .token_limits
+        .as_ref()
+        .and_then(|t| t.max_output_tokens)
+        .unwrap_or(64_000) as i32;
+    let display_name = upstream
+        .model_name
+        .clone()
+        .unwrap_or_else(|| upstream.model_id.clone());
+    Model {
+        id: upstream.model_id.clone(),
+        object: "model".to_string(),
+        created: started_at_unix,
+        owned_by: derive_owned_by(&upstream.model_id).to_string(),
+        display_name,
+        model_type: "chat".to_string(),
+        max_tokens,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        LOG_TAIL_BYTES, convert_and_filter_upstream_models, derive_owned_by,
+        is_supported_upstream_model, read_tail_lines, upstream_to_model,
+    };
+    use crate::kiro::model::list_models::{
+        ListAvailableModelsResponse, UpstreamModel, UpstreamTokenLimits,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn upstream_with(id: &str) -> UpstreamModel {
+        UpstreamModel {
+            model_id: id.to_string(),
+            model_name: Some(id.to_string()),
+            description: None,
+            rate_multiplier: None,
+            rate_unit: None,
+            supported_input_types: vec![],
+            token_limits: None,
+            prompt_caching: None,
+        }
+    }
+
+    #[test]
+    fn test_is_supported_upstream_model_keeps_claude_only() {
+        assert!(is_supported_upstream_model("claude-sonnet-4.5"));
+        assert!(is_supported_upstream_model("claude-opus-4.6"));
+        assert!(is_supported_upstream_model("claude-haiku-4.5"));
+        assert!(is_supported_upstream_model("CLAUDE-Sonnet-4.5"));
+
+        // 与 map_model 当前能力对齐，下列模型应被拒绝
+        assert!(!is_supported_upstream_model("auto"));
+        assert!(!is_supported_upstream_model("deepseek-3.2"));
+        assert!(!is_supported_upstream_model("minimax-m2.5"));
+        assert!(!is_supported_upstream_model("glm-5"));
+        assert!(!is_supported_upstream_model("qwen3-coder-next"));
+        assert!(!is_supported_upstream_model(""));
+    }
+
+    #[test]
+    fn test_convert_and_filter_drops_non_claude_models() {
+        let response = ListAvailableModelsResponse {
+            default_model: Some(upstream_with("auto")),
+            models: vec![
+                upstream_with("claude-sonnet-4.5"),
+                upstream_with("claude-opus-4.6"),
+                upstream_with("deepseek-3.2"),
+                upstream_with("minimax-m2.5"),
+                upstream_with("auto"),
+            ],
+            next_token: None,
+        };
+
+        let (filtered, total) = convert_and_filter_upstream_models(&response, 1_700_000_000);
+        assert_eq!(total, 5, "原始上游模型数量应保留");
+        assert_eq!(filtered.len(), 2, "应仅保留 claude-* 模型");
+        let ids: Vec<&str> = filtered.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"claude-sonnet-4.5"));
+        assert!(ids.contains(&"claude-opus-4.6"));
+        assert!(!ids.contains(&"deepseek-3.2"));
+        assert!(!ids.contains(&"auto"));
+    }
+
+    #[test]
+    fn test_convert_and_filter_handles_empty_response() {
+        let response = ListAvailableModelsResponse {
+            default_model: None,
+            models: vec![],
+            next_token: None,
+        };
+        let (filtered, total) = convert_and_filter_upstream_models(&response, 0);
+        assert_eq!(total, 0);
+        assert!(filtered.is_empty(), "空响应应返回空列表，由调用方负责保护");
+    }
+
+    #[test]
+    fn test_convert_and_filter_all_filtered_returns_empty() {
+        // 上游返回了模型，但全部被过滤（没有任何 claude-*）
+        // 此场景与 BUG #2 等价：调用方应将其视为"无可用模型"，保留旧缓存
+        let response = ListAvailableModelsResponse {
+            default_model: None,
+            models: vec![
+                upstream_with("auto"),
+                upstream_with("deepseek-3.2"),
+                upstream_with("minimax-m2.5"),
+            ],
+            next_token: None,
+        };
+        let (filtered, total) = convert_and_filter_upstream_models(&response, 0);
+        assert_eq!(total, 3);
+        assert!(
+            filtered.is_empty(),
+            "全部被过滤等价于空响应，调用方应保留旧缓存"
+        );
+    }
+
+    #[test]
+    fn test_derive_owned_by() {
+        assert_eq!(derive_owned_by("auto"), "system");
+        assert_eq!(derive_owned_by("AUTO"), "system");
+        assert_eq!(derive_owned_by("claude-sonnet-4.5"), "anthropic");
+        assert_eq!(derive_owned_by("claude-haiku-4.5"), "anthropic");
+        assert_eq!(derive_owned_by("deepseek-3.2"), "deepseek");
+        assert_eq!(derive_owned_by("minimax-m2.5"), "minimax");
+        assert_eq!(derive_owned_by("glm-5"), "zhipu");
+        assert_eq!(derive_owned_by("qwen3-coder-next"), "alibaba");
+        assert_eq!(derive_owned_by("some-unknown-model"), "unknown");
+    }
+
+    #[test]
+    fn test_upstream_to_model_full_fields() {
+        let upstream = UpstreamModel {
+            model_id: "claude-sonnet-4.5".to_string(),
+            model_name: Some("Claude Sonnet 4.5".to_string()),
+            description: Some("desc".to_string()),
+            rate_multiplier: Some(1.3),
+            rate_unit: Some("Credit".to_string()),
+            supported_input_types: vec!["TEXT".to_string(), "IMAGE".to_string()],
+            token_limits: Some(UpstreamTokenLimits {
+                max_input_tokens: Some(200_000),
+                max_output_tokens: Some(64_000),
+            }),
+            prompt_caching: None,
+        };
+        let model = upstream_to_model(&upstream, 1_700_000_000);
+        assert_eq!(model.id, "claude-sonnet-4.5");
+        assert_eq!(model.display_name, "Claude Sonnet 4.5");
+        assert_eq!(model.owned_by, "anthropic");
+        assert_eq!(model.max_tokens, 64_000);
+        assert_eq!(model.created, 1_700_000_000);
+        assert_eq!(model.model_type, "chat");
+        assert_eq!(model.object, "model");
+    }
+
+    #[test]
+    fn test_upstream_to_model_missing_fields_fallback() {
+        let upstream = UpstreamModel {
+            model_id: "minimax-m2.1".to_string(),
+            model_name: None,
+            description: None,
+            rate_multiplier: None,
+            rate_unit: None,
+            supported_input_types: vec![],
+            token_limits: None,
+            prompt_caching: None,
+        };
+        let model = upstream_to_model(&upstream, 0);
+        assert_eq!(model.id, "minimax-m2.1");
+        assert_eq!(model.display_name, "minimax-m2.1");
+        assert_eq!(model.owned_by, "minimax");
+        assert_eq!(model.max_tokens, 64_000);
+    }
+
+    fn temp_log_path(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}.log", std::process::id()))
+    }
+
+    #[test]
+    fn read_tail_lines_handles_utf8_boundary_in_tail_window() {
+        let path = temp_log_path("kiro-admin-log-tail");
+        let tail = (0..200)
+            .map(|i| format!("2026-04-05 INFO 第{i} 行日志\n"))
+            .collect::<String>();
+
+        let mut content = "中".as_bytes().to_vec();
+        let padding_len = (LOG_TAIL_BYTES as usize + 1)
+            .checked_sub(content.len() + 1 + tail.len())
+            .expect("tail payload should fit in the fixed test window");
+
+        content.extend(std::iter::repeat_n(b'a', padding_len));
+        content.push(b'\n');
+        content.extend_from_slice(tail.as_bytes());
+
+        fs::write(&path, &content).expect("test log file should be writable");
+
+        let (lines, truncated) = read_tail_lines(&path, 10).expect("tail read should succeed");
+
+        assert!(truncated);
+        assert_eq!(lines.len(), 10);
+        assert_eq!(
+            lines.last().expect("should keep the last log line"),
+            "2026-04-05 INFO 第199 行日志"
+        );
+
+        fs::remove_file(path).expect("test log file should be removable");
     }
 }

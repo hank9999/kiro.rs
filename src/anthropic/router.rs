@@ -8,10 +8,11 @@ use axum::{
 };
 
 use crate::kiro::provider::KiroProvider;
+use crate::openai::{post_chat_completions, post_responses};
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
-    middleware::{AppState, auth_middleware, cors_layer},
+    middleware::{AppState, auth_and_monitor_middleware, cors_layer},
 };
 
 /// 请求体最大大小限制 (50MB)
@@ -35,11 +36,9 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 
 /// 创建带有 KiroProvider 的 Anthropic API 路由
 pub fn create_router_with_provider(
-    api_key: impl Into<String>,
+    mut state: AppState,
     kiro_provider: Option<KiroProvider>,
-    extract_thinking: bool,
 ) -> Router {
-    let mut state = AppState::new(api_key, extract_thinking);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
@@ -48,10 +47,12 @@ pub fn create_router_with_provider(
     let v1_routes = Router::new()
         .route("/models", get(get_models))
         .route("/messages", post(post_messages))
+        .route("/chat/completions", post(post_chat_completions))
+        .route("/responses", post(post_responses))
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            auth_middleware,
+            auth_and_monitor_middleware,
         ));
 
     // 需要认证的 /cc/v1 路由（Claude Code 兼容端点）
@@ -61,7 +62,7 @@ pub fn create_router_with_provider(
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            auth_middleware,
+            auth_and_monitor_middleware,
         ));
 
     Router::new()

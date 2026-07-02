@@ -1,0 +1,18 @@
+[Unit]
+Description=kiro-rs API proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/kiro-rs
+ExecStart=/home/ubuntu/kiro-rs/target/release/kiro-rs --config /home/ubuntu/kiro-rs/config.json --credentials /home/ubuntu/kiro-rs/credentials.json
+Restart=always
+RestartSec=3
+Environment=RUST_LOG=info
+StandardOutput=append:/home/ubuntu/kiro-rs/kiro.log
+StandardError=append:/home/ubuntu/kiro-rs/kiro.log
+
+[Install]
+WantedBy=multi-user.target

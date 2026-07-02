@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, Globe } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -23,6 +23,7 @@ import {
   useDeleteCredential,
   useForceRefreshToken,
 } from '@/hooks/use-credentials'
+import { EditCredentialProxyDialog } from '@/components/edit-credential-proxy-dialog'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
@@ -60,6 +61,8 @@ export function CredentialCard({
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [deleteConfirmStep, setDeleteConfirmStep] = useState<1 | 2>(1)
+  const [showProxyDialog, setShowProxyDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
@@ -134,6 +137,7 @@ export function CredentialCard({
       onSuccess: (res) => {
         toast.success(res.message)
         setShowDeleteDialog(false)
+        setDeleteConfirmStep(1)
       },
       onError: (err) => {
         toast.error('删除失败: ' + (err as Error).message)
@@ -281,12 +285,18 @@ export function CredentialCard({
                 <span className="text-sm text-muted-foreground ml-1">未知</span>
               )}
             </div>
-            {credential.hasProxy && (
-              <div className="col-span-2">
-                <span className="text-muted-foreground">代理：</span>
-                <span className="font-medium">{credential.proxyUrl}</span>
-              </div>
-            )}
+            <div className="col-span-2">
+              <span className="text-muted-foreground">代理：</span>
+              {credential.hasProxy ? (
+                <span className="font-medium font-mono text-xs ml-1">
+                  {credential.proxyUrl}
+                </span>
+              ) : (
+                <span className="text-muted-foreground text-xs ml-1">
+                  继承（代理池 / 全局 / 直连）
+                </span>
+              )}
+            </div>
             {credential.hasProfileArn && (
               <div className="col-span-2">
                 <Badge variant="secondary">有 Profile ARN</Badge>
@@ -361,8 +371,20 @@ export function CredentialCard({
             </Button>
             <Button
               size="sm"
+              variant="outline"
+              onClick={() => setShowProxyDialog(true)}
+              title="编辑此凭据的代理"
+            >
+              <Globe className="h-4 w-4 mr-1" />
+              代理
+            </Button>
+            <Button
+              size="sm"
               variant="destructive"
-              onClick={() => setShowDeleteDialog(true)}
+              onClick={() => {
+                setDeleteConfirmStep(1)
+                setShowDeleteDialog(true)
+              }}
               disabled={!credential.disabled}
               title={!credential.disabled ? '需要先禁用凭据才能删除' : undefined}
             >
@@ -374,12 +396,24 @@ export function CredentialCard({
       </Card>
 
       {/* 删除确认对话框 */}
-      <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
+      <Dialog
+        open={showDeleteDialog}
+        onOpenChange={(open) => {
+          setShowDeleteDialog(open)
+          if (!open) {
+            setDeleteConfirmStep(1)
+          }
+        }}
+      >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>确认删除凭据</DialogTitle>
+            <DialogTitle>
+              {deleteConfirmStep === 1 ? '确认删除凭据' : '二次确认删除'}
+            </DialogTitle>
             <DialogDescription>
-              您确定要删除凭据 #{credential.id} 吗？此操作无法撤销。
+              {deleteConfirmStep === 1
+                ? `您确定要删除凭据 #${credential.id} 吗？此操作无法撤销。`
+                : `请再次确认：即将永久删除凭据 #${credential.id}，删除后无法恢复。`}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -392,14 +426,28 @@ export function CredentialCard({
             </Button>
             <Button
               variant="destructive"
-              onClick={handleDelete}
+              onClick={() => {
+                if (deleteConfirmStep === 1) {
+                  setDeleteConfirmStep(2)
+                  return
+                }
+
+                handleDelete()
+              }}
               disabled={deleteCredential.isPending || !credential.disabled}
             >
-              确认删除
+              {deleteConfirmStep === 1 ? '继续确认' : '确认永久删除'}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* 编辑代理对话框 */}
+      <EditCredentialProxyDialog
+        open={showProxyDialog}
+        onOpenChange={setShowProxyDialog}
+        credential={credential}
+      />
     </>
   )
 }
