@@ -45,6 +45,7 @@ export interface BatchCredentialBalanceItem {
   id: number;
   success: boolean;
   enabled: boolean;
+  deleted?: boolean;
   balance?: BalanceResponse;
   error?: string;
 }
@@ -55,6 +56,7 @@ export interface BatchCredentialBalanceResponse {
   failed: number;
   withRemaining: number;
   enabled: number;
+  deletedInvalid: number;
   results: BatchCredentialBalanceItem[];
 }
 

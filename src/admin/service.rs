@@ -15,7 +15,7 @@ use crate::anthropic::types::{Model, ModelsResponse};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::list_models::UpstreamModel;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{MultiTokenManager, RefreshTokenInvalidError};
 use crate::monitoring::{RequestActivitySnapshot, RequestMonitor};
 use crate::shared_state::ModelsCacheHandle;
 
@@ -201,11 +201,15 @@ impl AdminService {
 
     /// 从上游获取余额（无缓存）
     async fn fetch_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        let usage = self
-            .token_manager
-            .get_usage_limits_for(id)
-            .await
-            .map_err(|e| self.classify_balance_error(e, id))?;
+        let usage = match self.token_manager.get_usage_limits_for(id).await {
+            Ok(usage) => usage,
+            Err(error) if error.downcast_ref::<RefreshTokenInvalidError>().is_some() => {
+                return Err(
+                    self.auto_delete_invalid_refresh_token_credential(id, error.to_string())
+                );
+            }
+            Err(error) => return Err(self.classify_balance_error(error, id)),
+        };
 
         let current_usage = usage.current_usage();
         let usage_limit = usage.usage_limit();
@@ -227,6 +231,30 @@ impl AdminService {
         })
     }
 
+    /// 自动删除已被上游明确判定为永久失效的 refreshToken 凭据。
+    fn auto_delete_invalid_refresh_token_credential(
+        &self,
+        id: u64,
+        source_message: String,
+    ) -> AdminServiceError {
+        match self
+            .token_manager
+            .delete_invalid_refresh_token_credential(id)
+        {
+            Ok(_) => {
+                self.remove_balance_cache(id);
+                AdminServiceError::InvalidRefreshTokenDeleted {
+                    id,
+                    message: source_message,
+                }
+            }
+            Err(delete_error) => AdminServiceError::InternalError(format!(
+                "凭据 #{} refreshToken 已失效，但自动删除失败: {}; 原始错误: {}",
+                id, delete_error, source_message
+            )),
+        }
+    }
+
     /// 查询所有凭据余额，并自动启用仍有剩余额度的账号
     pub async fn query_all_balances_and_enable_remaining(
         &self,
@@ -245,116 +273,128 @@ impl AdminService {
             index: usize,
             id: u64,
             result: Result<BalanceResponse, String>,
+            deleted_invalid: bool,
         }
 
-        let mut fetch_outcomes = stream::iter(snapshot.entries.into_iter().enumerate().map(
+        let mut fetch_stream = stream::iter(snapshot.entries.into_iter().enumerate().map(
             |(index, entry)| async move {
                 let id = entry.id;
-                let result = match tokio::time::timeout(
+                let (result, deleted_invalid) = match tokio::time::timeout(
                     Duration::from_secs(BATCH_BALANCE_ITEM_TIMEOUT_SECS),
                     self.fetch_balance(id),
                 )
                 .await
                 {
-                    Ok(Ok(balance)) => Ok(balance),
-                    Ok(Err(error)) => Err(error.to_string()),
-                    Err(_) => Err(format!(
-                        "额度查询超时（超过 {} 秒）",
-                        BATCH_BALANCE_ITEM_TIMEOUT_SECS
-                    )),
+                    Ok(Ok(balance)) => (Ok(balance), false),
+                    Ok(Err(error)) => {
+                        let deleted_invalid =
+                            matches!(&error, AdminServiceError::InvalidRefreshTokenDeleted { .. });
+                        (Err(error.to_string()), deleted_invalid)
+                    }
+                    Err(_) => (
+                        Err(format!(
+                            "额度查询超时（超过 {} 秒）",
+                            BATCH_BALANCE_ITEM_TIMEOUT_SECS
+                        )),
+                        false,
+                    ),
                 };
 
-                BalanceFetchOutcome { index, id, result }
+                BalanceFetchOutcome {
+                    index,
+                    id,
+                    result,
+                    deleted_invalid,
+                }
             },
         ))
-        .buffer_unordered(BATCH_BALANCE_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
+        .buffer_unordered(BATCH_BALANCE_CONCURRENCY);
 
-        // buffer_unordered 按完成顺序返回；恢复为原快照顺序，避免前端列表跳动。
-        fetch_outcomes.sort_by_key(|outcome| outcome.index);
-
-        let reset_ids: Vec<u64> = fetch_outcomes
-            .iter()
-            .filter_map(|outcome| match &outcome.result {
-                Ok(balance) if balance.remaining > 0.0 => Some(outcome.id),
-                _ => None,
-            })
-            .collect();
-
-        // 查询完成后批量重置并持久化一次，避免 1000 个账号逐个回写 credentials.json。
-        let mut reset_results = self.token_manager.reset_and_enable_many(&reset_ids);
-
-        let mut results = Vec::with_capacity(total);
+        // 按原快照顺序回填结果，避免前端列表跳动；启用动作则在单个查询完成后立即执行。
+        let mut results: Vec<Option<BatchCredentialBalanceItem>> = vec![None; total];
         let mut cache_updates = Vec::new();
         let mut success = 0usize;
         let mut failed = 0usize;
         let mut with_remaining = 0usize;
         let mut enabled = 0usize;
+        let mut deleted_invalid = 0usize;
 
-        for outcome in fetch_outcomes {
+        while let Some(outcome) = fetch_stream.next().await {
             let id = outcome.id;
 
-            match outcome.result {
+            let item = match outcome.result {
                 Ok(balance) => {
                     cache_updates.push((id, balance.clone()));
 
                     if balance.remaining > 0.0 {
                         with_remaining += 1;
 
+                        // 一旦确认有剩余额度，立即重置失败计数并启用该凭据，
+                        // 不再等待其它账号全部查询完成。
+                        let mut reset_results = self.token_manager.reset_and_enable_many(&[id]);
                         match reset_results
                             .remove(&id)
-                            .unwrap_or_else(|| Err("内部错误: 批量重置结果缺失".to_string()))
+                            .unwrap_or_else(|| Err("内部错误: 重置结果缺失".to_string()))
                         {
                             Ok(was_disabled) => {
                                 success += 1;
                                 if was_disabled {
                                     enabled += 1;
                                 }
-                                results.push(BatchCredentialBalanceItem {
+                                BatchCredentialBalanceItem {
                                     id,
                                     success: true,
                                     enabled: was_disabled,
+                                    deleted: false,
                                     balance: Some(balance),
                                     error: None,
-                                });
+                                }
                             }
                             Err(error) => {
                                 failed += 1;
-                                results.push(BatchCredentialBalanceItem {
+                                BatchCredentialBalanceItem {
                                     id,
                                     success: false,
                                     enabled: false,
+                                    deleted: false,
                                     balance: Some(balance),
                                     error: Some(error.to_string()),
-                                });
+                                }
                             }
                         }
                     } else {
                         success += 1;
-                        results.push(BatchCredentialBalanceItem {
+                        BatchCredentialBalanceItem {
                             id,
                             success: true,
                             enabled: false,
+                            deleted: false,
                             balance: Some(balance),
                             error: None,
-                        });
+                        }
                     }
                 }
                 Err(error) => {
                     failed += 1;
-                    results.push(BatchCredentialBalanceItem {
+                    if outcome.deleted_invalid {
+                        deleted_invalid += 1;
+                    }
+                    BatchCredentialBalanceItem {
                         id,
                         success: false,
                         enabled: false,
+                        deleted: outcome.deleted_invalid,
                         balance: None,
                         error: Some(error.to_string()),
-                    });
+                    }
                 }
-            }
+            };
+
+            results[outcome.index] = Some(item);
         }
 
         self.update_balance_cache_many(&cache_updates);
+        let results: Vec<BatchCredentialBalanceItem> = results.into_iter().flatten().collect();
 
         tracing::info!(
             total = results.len(),
@@ -362,6 +402,7 @@ impl AdminService {
             failed,
             with_remaining,
             enabled,
+            deleted_invalid,
             "已完成批量额度查询并自动启用有余额凭据"
         );
 
@@ -371,6 +412,7 @@ impl AdminService {
             failed,
             with_remaining,
             enabled,
+            deleted_invalid,
             results,
         })
     }
@@ -406,6 +448,14 @@ impl AdminService {
                     data: balance.clone(),
                 },
             );
+        }
+        self.save_balance_cache();
+    }
+
+    fn remove_balance_cache(&self, id: u64) {
+        {
+            let mut cache = self.balance_cache.lock();
+            cache.remove(&id);
         }
         self.save_balance_cache();
     }
@@ -481,11 +531,7 @@ impl AdminService {
             .map_err(|e| self.classify_delete_error(e, id))?;
 
         // 清理已删除凭据的余额缓存
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.remove(&id);
-        }
-        self.save_balance_cache();
+        self.remove_balance_cache(id);
 
         Ok(())
     }
@@ -637,10 +683,13 @@ impl AdminService {
 
     /// 强制刷新指定凭据的 Token
     pub async fn force_refresh_token(&self, id: u64) -> Result<(), AdminServiceError> {
-        self.token_manager
-            .force_refresh_token_for(id)
-            .await
-            .map_err(|e| self.classify_balance_error(e, id))
+        match self.token_manager.force_refresh_token_for(id).await {
+            Ok(_) => Ok(()),
+            Err(error) if error.downcast_ref::<RefreshTokenInvalidError>().is_some() => {
+                Err(self.auto_delete_invalid_refresh_token_credential(id, error.to_string()))
+            }
+            Err(error) => Err(self.classify_balance_error(error, id)),
+        }
     }
 
     // ============ 余额缓存持久化 ============

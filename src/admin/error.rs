@@ -24,6 +24,9 @@ pub enum AdminServiceError {
     /// 凭据无效（验证失败）
     InvalidCredential(String),
 
+    /// refreshToken 已明确失效，并且对应凭据已被自动删除
+    InvalidRefreshTokenDeleted { id: u64, message: String },
+
     /// 无效请求
     InvalidRequest(String),
 }
@@ -38,6 +41,13 @@ impl fmt::Display for AdminServiceError {
             AdminServiceError::UpstreamError(msg) => write!(f, "上游服务错误: {}", msg),
             AdminServiceError::InternalError(msg) => write!(f, "内部错误: {}", msg),
             AdminServiceError::InvalidCredential(msg) => write!(f, "凭据无效: {}", msg),
+            AdminServiceError::InvalidRefreshTokenDeleted { id, message } => {
+                write!(
+                    f,
+                    "凭据 #{} refreshToken 已失效，已自动删除: {}",
+                    id, message
+                )
+            }
             AdminServiceError::InvalidRequest(msg) => write!(f, "无效请求: {}", msg),
         }
     }
@@ -54,6 +64,7 @@ impl AdminServiceError {
             AdminServiceError::UpstreamError(_) => StatusCode::BAD_GATEWAY,
             AdminServiceError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AdminServiceError::InvalidCredential(_) => StatusCode::BAD_REQUEST,
+            AdminServiceError::InvalidRefreshTokenDeleted { .. } => StatusCode::BAD_REQUEST,
             AdminServiceError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
         }
     }
@@ -70,6 +81,9 @@ impl AdminServiceError {
                 AdminErrorResponse::internal_error(self.to_string())
             }
             AdminServiceError::InvalidCredential(_) => {
+                AdminErrorResponse::invalid_request(self.to_string())
+            }
+            AdminServiceError::InvalidRefreshTokenDeleted { .. } => {
                 AdminErrorResponse::invalid_request(self.to_string())
             }
             AdminServiceError::InvalidRequest(_) => {

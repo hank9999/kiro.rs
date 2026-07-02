@@ -494,13 +494,17 @@ export function Dashboard({ onLogout }: DashboardProps) {
         setBalanceMap(nextBalanceMap)
         queryClient.invalidateQueries({ queryKey: ['credentials'] })
 
+        const deletedText = response.deletedInvalid > 0
+          ? `，已删除失效凭据 ${response.deletedInvalid} 个`
+          : ''
+
         if (response.failed === 0) {
           toast.success(
-            `查询完成：${response.success}/${response.total} 个成功，${response.withRemaining} 个有余额，已启用 ${response.enabled} 个账号`
+            `查询完成：${response.success}/${response.total} 个成功，${response.withRemaining} 个有余额，已启用 ${response.enabled} 个账号${deletedText}`
           )
         } else {
           toast.warning(
-            `查询完成：成功 ${response.success} 个，失败 ${response.failed} 个，${response.withRemaining} 个有余额，已启用 ${response.enabled} 个账号`
+            `查询完成：成功 ${response.success} 个，失败 ${response.failed} 个，${response.withRemaining} 个有余额，已启用 ${response.enabled} 个账号${deletedText}`
           )
         }
       },

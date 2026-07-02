@@ -1065,10 +1065,18 @@ impl MultiTokenManager {
                     return Ok(ctx);
                 }
                 Err(e) => {
-                    // refreshToken 永久失效 → 立即禁用，不累计重试
+                    // refreshToken 永久失效 → 立即删除，不累计重试
                     let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
                         tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
-                        self.report_refresh_token_invalid(id)
+                        self.delete_invalid_refresh_token_credential(id)
+                            .unwrap_or_else(|delete_error| {
+                                tracing::error!(
+                                    "凭据 #{} refreshToken 永久失效但自动删除失败: {}，回退为禁用",
+                                    id,
+                                    delete_error
+                                );
+                                self.report_refresh_token_invalid(id)
+                            })
                     } else {
                         tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
                         self.report_refresh_failure(id)
@@ -2325,6 +2333,58 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 删除 refreshToken 已明确永久失效的凭据。
+    ///
+    /// `invalid_grant + Invalid refresh token provided` 表示该 refreshToken 已撤销或过期，
+    /// 继续保留只会反复失败，因此运行时自动处置时不要求先手动禁用。
+    ///
+    /// 返回删除后是否仍有可用凭据。
+    pub fn delete_invalid_refresh_token_credential(&self, id: u64) -> anyhow::Result<bool> {
+        let was_current = {
+            let mut entries = self.entries.lock();
+
+            if !entries.iter().any(|e| e.id == id) {
+                anyhow::bail!("凭据不存在: {}", id);
+            }
+
+            let current_id = *self.current_id.lock();
+            let was_current = current_id == id;
+            entries.retain(|e| e.id != id);
+            was_current
+        };
+
+        if was_current {
+            self.select_highest_priority();
+        }
+
+        {
+            let entries = self.entries.lock();
+            if entries.is_empty() {
+                let mut current_id = self.current_id.lock();
+                *current_id = 0;
+                tracing::info!("所有凭据已删除，current_id 已重置为 0");
+            }
+        }
+
+        self.persist_credentials()?;
+        self.save_stats();
+        self.refresh_locks.lock().remove(&id);
+
+        let has_available = self.available_count() > 0;
+        if has_available {
+            tracing::error!(
+                "凭据 #{} 因 refreshToken 已失效 (invalid_grant) 已被删除",
+                id
+            );
+        } else {
+            tracing::error!(
+                "凭据 #{} 因 refreshToken 已失效 (invalid_grant) 已被删除，当前已无可用凭据",
+                id
+            );
+        }
+        Ok(has_available)
+    }
+
     /// 删除因 Kiro 账号临时封禁而不可恢复的凭据。
     ///
     /// 与 Admin API 的 [`Self::delete_credential`] 不同，这里是运行时自动处置：
@@ -2889,6 +2949,31 @@ mod tests {
         assert_eq!(snapshot.current_id, 2);
 
         assert!(!manager.delete_suspended_credential(2).unwrap());
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.total, 0);
+        assert_eq!(snapshot.available, 0);
+        assert_eq!(snapshot.current_id, 0);
+    }
+
+    #[test]
+    fn test_multi_token_manager_delete_invalid_refresh_token_credential_removes_immediately() {
+        let config = Config::default();
+        let mut cred1 = KiroCredentials::default();
+        cred1.priority = 0;
+        let mut cred2 = KiroCredentials::default();
+        cred2.priority = 1;
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, None, false).unwrap();
+
+        assert!(manager.delete_invalid_refresh_token_credential(1).unwrap());
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.total, 1);
+        assert_eq!(snapshot.available, 1);
+        assert!(snapshot.entries.iter().all(|entry| entry.id != 1));
+        assert_eq!(snapshot.current_id, 2);
+
+        assert!(!manager.delete_invalid_refresh_token_credential(2).unwrap());
         let snapshot = manager.snapshot();
         assert_eq!(snapshot.total, 0);
         assert_eq!(snapshot.available, 0);

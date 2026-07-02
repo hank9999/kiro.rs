@@ -190,6 +190,8 @@ pub struct BatchCredentialBalanceItem {
     pub success: bool,
     /// 是否在本次操作中被启用
     pub enabled: bool,
+    /// 是否因 refreshToken 永久失效在本次操作中被自动删除
+    pub deleted: bool,
     /// 查询成功时的余额数据
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceResponse>,
@@ -212,6 +214,8 @@ pub struct BatchCredentialBalanceResponse {
     pub with_remaining: usize,
     /// 本次自动启用的凭据数
     pub enabled: usize,
+    /// 本次因 refreshToken 永久失效自动删除的凭据数
+    pub deleted_invalid: usize,
     /// 逐凭据结果
     pub results: Vec<BatchCredentialBalanceItem>,
 }
