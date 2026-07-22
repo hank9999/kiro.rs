@@ -75,10 +75,36 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
-/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
+/// 将 GPT 模型名映射到 Kiro 上游 wire ID（`gpt-5.6-{sol,terra,luna}`）
+fn map_gpt_model(model_lower: &str) -> Option<String> {
+    let model_lower = model_lower.strip_prefix("openai.").unwrap_or(model_lower);
+    let normalized = model_lower.replace("gpt-5-6", "gpt-5.6");
+
+    if !normalized.contains("gpt-5.6") {
+        return None;
+    }
+
+    if normalized.contains("sol") {
+        return Some("gpt-5.6-sol".to_string());
+    }
+    if normalized.contains("terra") {
+        return Some("gpt-5.6-terra".to_string());
+    }
+    if normalized.contains("luna") {
+        return Some("gpt-5.6-luna".to_string());
+    }
+
+    None
+}
+
+/// 模型映射：将 Anthropic / OpenAI 模型名映射到 Kiro 模型 ID
 /// 严格对照版本号
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
+
+    if let Some(mapped) = map_gpt_model(&model_lower) {
+        return Some(mapped);
+    }
 
     if model_lower.contains("sonnet") {
         if model_lower.contains("sonnet-5") {
@@ -113,9 +139,10 @@ pub fn map_model(model: &str) -> Option<String> {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Sonnet 5 / Opus 4.7 / 4.8 同 1M
+/// Sonnet 5 / Opus 4.7 / 4.8 同 1M；GPT-5.6 系列为 272K
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
+        Some(mapped) if mapped.starts_with("gpt-5.6-") => 272_000,
         Some(mapped) if mapped == "claude-sonnet-5" || mapped == "claude-sonnet-4.6" || mapped == "claude-opus-4.6" || mapped == "claude-opus-4.7" || mapped == "claude-opus-4.8" => 1_000_000,
         _ => 200_000,
     }
@@ -935,6 +962,33 @@ mod tests {
     #[test]
     fn test_map_model_unsupported() {
         assert!(map_model("gpt-4").is_none());
+        assert!(map_model("gpt-4o").is_none());
+    }
+
+    #[test]
+    fn test_map_model_gpt56() {
+        assert_eq!(
+            map_model("gpt-5.6-sol"),
+            Some("gpt-5.6-sol".to_string())
+        );
+        assert_eq!(
+            map_model("gpt-5.6-terra"),
+            Some("gpt-5.6-terra".to_string())
+        );
+        assert_eq!(
+            map_model("gpt-5.6-luna"),
+            Some("gpt-5.6-luna".to_string())
+        );
+        assert_eq!(
+            map_model("gpt-5-6-sol"),
+            Some("gpt-5.6-sol".to_string())
+        );
+        assert_eq!(
+            map_model("openai.gpt-5.6-terra"),
+            Some("gpt-5.6-terra".to_string())
+        );
+        assert_eq!(get_context_window_size("gpt-5.6-sol"), 272_000);
+        assert_eq!(get_context_window_size("gpt-5.6-luna"), 272_000);
     }
 
     #[test]
