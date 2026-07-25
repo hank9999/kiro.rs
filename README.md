@@ -440,6 +440,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 | `*sonnet-5*` | `claude-sonnet-5` |
 | `*sonnet*`（含 4.6/4-6） | `claude-sonnet-4.6` |
 | `*sonnet*`（含 4.5/4-5） | `claude-sonnet-4.5` |
+| `*opus-5*` | `claude-opus-5` |
 | `*opus*`（含 4.8/4-8） | `claude-opus-4.8` |
 | `*opus*`（含 4.7/4-7） | `claude-opus-4.7` |
 | `*opus*`（含 4.6/4-6） | `claude-opus-4.6` |
