@@ -1,5 +1,6 @@
 import { useState, useMemo } from 'react'
 import { toast } from 'sonner'
+import { useQuery } from '@tanstack/react-query'
 import { CheckCircle2, XCircle, AlertCircle, Loader2 } from 'lucide-react'
 import {
   Dialog,
@@ -10,7 +11,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
+import { getCredentialBalance, setCredentialDisabled, getProxyPool } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 
 interface KamImportDialogProps {
@@ -152,6 +153,11 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const { data: existingCredentials } = useCredentials()
   const { mutateAsync: addCredential } = useAddCredential()
   const { mutateAsync: deleteCredential } = useDeleteCredential()
+  const { data: proxyPool } = useQuery({
+    queryKey: ['proxy-pool'],
+    queryFn: getProxyPool,
+    enabled: open,
+  })
 
   const rollbackCredential = async (id: number): Promise<{ success: boolean; error?: string }> => {
     try {
@@ -221,6 +227,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       let failCount = 0
       let skippedCount = 0
 
+      const enabledProxies = proxyPool?.proxies.filter(p => p.enabled) ?? []
+
       for (let i = 0; i < validAccounts.length; i++) {
         const account = validAccounts[i]
 
@@ -274,6 +282,11 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
           }
 
+          // 无代理时从池中随机分配一个
+          const proxyUrl = enabledProxies.length > 0
+            ? enabledProxies[Math.floor(Math.random() * enabledProxies.length)].url
+            : undefined
+
           const addedCred = await addCredential({
             refreshToken: token,
             authMethod,
@@ -281,6 +294,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             clientId,
             clientSecret,
             machineId: account.machineId?.trim() || undefined,
+            email: account.email?.trim() || undefined,
+            proxyUrl,
           })
 
           addedCredId = addedCred.credentialId

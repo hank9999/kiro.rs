@@ -509,7 +509,8 @@ pub struct ManagerSnapshot {
 /// 故障统计基于 API 调用结果，而非 Token 刷新结果
 pub struct MultiTokenManager {
     config: Config,
-    proxy: Option<ProxyConfig>,
+    /// 全局代理（运行时可修改）
+    proxy: Mutex<Option<ProxyConfig>>,
     /// 凭据条目列表
     entries: Mutex<Vec<CredentialEntry>>,
     /// 当前活动凭据 ID
@@ -518,8 +519,8 @@ pub struct MultiTokenManager {
     refresh_lock: TokioMutex<()>,
     /// 凭据文件路径（用于回写）
     credentials_path: Option<PathBuf>,
-    /// 是否为多凭据格式（数组格式才回写）
-    is_multiple_format: bool,
+    /// 是否为多凭据格式（数组格式才回写；通过 add_credential 动态升级为 true）
+    is_multiple_format: AtomicBool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
     /// 最近一次统计持久化时间（用于 debounce）
@@ -646,16 +647,27 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let manager = Self {
             config,
-            proxy,
+            proxy: Mutex::new(proxy),
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
             refresh_lock: TokioMutex::new(()),
             credentials_path,
-            is_multiple_format,
+            is_multiple_format: AtomicBool::new(is_multiple_format),
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
+
+        // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
+        // 触发条件：原文件是单对象格式 && 存在凭据 && 有文件路径
+        if !is_multiple_format && !manager.entries.lock().is_empty() && manager.credentials_path.is_some() {
+            manager.is_multiple_format.store(true, Ordering::Relaxed);
+            if let Err(e) = manager.persist_credentials() {
+                tracing::warn!("单凭据格式迁移到数组格式失败: {}", e);
+            } else {
+                tracing::info!("已将凭据文件从单对象格式迁移到数组格式，token rotation 将正确持久化");
+            }
+        }
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
         if has_new_ids || has_new_machine_ids {
@@ -675,6 +687,16 @@ impl MultiTokenManager {
     /// 获取配置的引用
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// 获取全局代理配置的克隆（可安全跨锁使用）
+    pub fn proxy(&self) -> Option<ProxyConfig> {
+        self.proxy.lock().clone()
+    }
+
+    /// 设置全局代理配置（运行时修改，可传 None 清除）
+    pub fn set_global_proxy(&self, proxy: Option<ProxyConfig>) {
+        *self.proxy.lock() = proxy;
     }
 
     /// 获取凭据总数
@@ -831,9 +853,13 @@ impl MultiTokenManager {
                     return Ok(ctx);
                 }
                 Err(e) => {
-                    // refreshToken 永久失效 → 立即禁用，不累计重试
                     let has_available =
                         if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                            // 先尝试从源文件重新加载（适用于 IDE 退出后 token rotation 导致失效的场景）
+                            if self.try_reload_credential_from_file(id) {
+                                // 找到新 Token，不计入失败次数，直接重试
+                                continue;
+                            }
                             tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
                             self.report_refresh_token_invalid(id)
                         } else {
@@ -918,7 +944,8 @@ impl MultiTokenManager {
 
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 // 确实需要刷新
-                let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+                let global_proxy = self.proxy.lock().clone();
+                let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
                 let new_creds =
                     refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
 
@@ -982,7 +1009,7 @@ impl MultiTokenManager {
         use anyhow::Context;
 
         // 仅多凭据格式才回写
-        if !self.is_multiple_format {
+        if !self.is_multiple_format.load(Ordering::Relaxed) {
             return Ok(false);
         }
 
@@ -1019,6 +1046,108 @@ impl MultiTokenManager {
 
         tracing::debug!("已回写凭据到文件: {:?}", path);
         Ok(true)
+    }
+
+    /// 尝试从凭据文件重新加载指定凭据的 Token
+    ///
+    /// 当 refreshToken 失效 (invalid_grant) 时，检查源文件是否已被其他客户端更新
+    /// （例如本地 IDE 退出时刷新了 Token，导致 token rotation）。
+    /// 如果文件中存在不同的 refreshToken，更新内存凭据并返回 true。
+    ///
+    /// # 匹配规则（按优先级）
+    /// 1. 文件中与内存凭据 `id` 相同的条目
+    /// 2. 文件中与内存凭据 `email` 相同的条目
+    /// 3. 文件与内存均只有一个凭据时，直接匹配
+    ///
+    /// # 更新范围
+    /// 仅更新 token 相关字段（refreshToken / accessToken / expiresAt），
+    /// 保留代理、region、machineId 等配置不变。
+    fn try_reload_credential_from_file(&self, id: u64) -> bool {
+        use crate::kiro::model::credentials::CredentialsConfig;
+
+        let path = match self.credentials_path.as_ref() {
+            Some(p) => p.clone(),
+            None => return false,
+        };
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+
+        let file_config: CredentialsConfig = match serde_json::from_str(&content) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+
+        let file_creds = file_config.into_sorted_credentials();
+        if file_creds.is_empty() {
+            return false;
+        }
+
+        // 先读取当前凭据的身份信息（不持有锁，避免死锁）
+        let (current_cred_id, current_email, current_refresh_token, entries_len) = {
+            let entries = self.entries.lock();
+            match entries.iter().find(|e| e.id == id) {
+                Some(entry) => (
+                    entry.credentials.id,
+                    entry.credentials.email.clone(),
+                    entry.credentials.refresh_token.clone(),
+                    entries.len(),
+                ),
+                None => return false,
+            }
+        };
+
+        // 从文件中查找对应凭据
+        let matched = file_creds.iter().find(|fc| {
+            if fc.id.is_some() && fc.id == current_cred_id {
+                return true;
+            }
+            if fc.email.is_some() && fc.email == current_email {
+                return true;
+            }
+            false
+        }).or_else(|| {
+            if file_creds.len() == 1 && entries_len == 1 {
+                file_creds.first()
+            } else {
+                None
+            }
+        });
+
+        let file_cred = match matched {
+            Some(c) => c,
+            None => return false,
+        };
+
+        // 文件中的 refreshToken 必须存在且与当前不同，才值得更新
+        if file_cred.refresh_token.is_none() || file_cred.refresh_token == current_refresh_token {
+            return false;
+        }
+
+        let new_refresh_token = file_cred.refresh_token.clone();
+        let new_access_token = file_cred.access_token.clone();
+        let new_expires_at = file_cred.expires_at.clone();
+
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.credentials.refresh_token = new_refresh_token;
+                entry.credentials.access_token = new_access_token;
+                entry.credentials.expires_at = new_expires_at;
+                entry.disabled = false;
+                entry.disabled_reason = None;
+                entry.refresh_failure_count = 0;
+                entry.failure_count = 0;
+            }
+        }
+
+        tracing::info!(
+            "凭据 #{} 从文件检测到新 refreshToken（疑似 IDE token rotation），已自动恢复，将重试",
+            id
+        );
+        true
     }
 
     /// 获取缓存目录（凭据文件所在目录）
@@ -1563,7 +1692,8 @@ impl MultiTokenManager {
                 };
 
                 if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                    let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+                    let global_proxy = self.proxy.lock().clone();
+                let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
                     let new_creds =
                         refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
                             .await?;
@@ -1601,7 +1731,8 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let global_proxy = self.proxy.lock().clone();
+                let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
         let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
@@ -1714,7 +1845,8 @@ impl MultiTokenManager {
         let mut validated_cred = if new_cred.is_api_key_credential() {
             new_cred.clone()
         } else {
-            let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
+            let global_proxy = self.proxy.lock().clone();
+                let effective_proxy = new_cred.effective_proxy(global_proxy.as_ref());
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
         };
 
@@ -1760,11 +1892,48 @@ impl MultiTokenManager {
             });
         }
 
-        // 6. 持久化
+        // 6. 升级为多凭据格式（确保后续 token rotation 能写盘）并持久化
+        self.is_multiple_format.store(true, Ordering::Relaxed);
         self.persist_credentials()?;
 
         tracing::info!("成功添加凭据 #{}", new_id);
         Ok(new_id)
+    }
+
+    /// 更新凭据的可编辑字段（Admin API）
+    ///
+    /// 支持更新 email、proxy_url、proxy_username、proxy_password。
+    /// 传 `None` 表示不修改该字段，传 `Some("")` 表示清除该字段。
+    pub fn update_credential(
+        &self,
+        id: u64,
+        email: Option<Option<String>>,
+        proxy_url: Option<Option<String>>,
+        proxy_username: Option<Option<String>>,
+        proxy_password: Option<Option<String>>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            if let Some(v) = email {
+                entry.credentials.email = v.filter(|s| !s.is_empty());
+            }
+            if let Some(v) = proxy_url {
+                entry.credentials.proxy_url = v.filter(|s| !s.is_empty());
+            }
+            if let Some(v) = proxy_username {
+                entry.credentials.proxy_username = v.filter(|s| !s.is_empty());
+            }
+            if let Some(v) = proxy_password {
+                entry.credentials.proxy_password = v.filter(|s| !s.is_empty());
+            }
+        }
+        self.persist_credentials()?;
+        Ok(())
     }
 
     /// 删除凭据（Admin API）
@@ -1833,6 +2002,71 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 更新指定凭据的 refreshToken（Admin API）
+    ///
+    /// # 前置条件
+    /// - 凭据必须已禁用（disabled = true），防止意外覆盖正在使用的 Token
+    ///
+    /// # 行为
+    /// 1. 验证凭据存在且已禁用
+    /// 2. 验证新 refreshToken 格式
+    /// 3. 更新 refreshToken
+    /// 4. 重置 refresh_failure_count（保持 disabled 状态，让用户手动启用）
+    /// 5. 持久化到文件
+    pub fn update_refresh_token(
+        &self,
+        id: u64,
+        new_refresh_token: String,
+        new_access_token: Option<String>,
+        new_expires_at: Option<String>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+
+            // 用索引定位，避免两次线性扫描和后续 unwrap
+            let idx = entries
+                .iter()
+                .position(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            if !entries[idx].disabled {
+                anyhow::bail!("只能为已禁用的凭据更新 refreshToken（请先禁用凭据 #{}）", id);
+            }
+
+            // 验证新 refreshToken 格式
+            let tmp_creds = KiroCredentials {
+                refresh_token: Some(new_refresh_token.clone()),
+                ..entries[idx].credentials.clone()
+            };
+            validate_refresh_token(&tmp_creds)?;
+
+            // 检查是否与现有其他凭据重复
+            let new_hash = sha256_hex(&new_refresh_token);
+            let duplicate = entries.iter().enumerate().any(|(i, e)| {
+                i != idx
+                    && e.credentials
+                        .refresh_token
+                        .as_ref()
+                        .map(|t| sha256_hex(t) == new_hash)
+                        .unwrap_or(false)
+            });
+            if duplicate {
+                anyhow::bail!("refreshToken 与其他凭据重复");
+            }
+
+            let entry = &mut entries[idx];
+            entry.credentials.refresh_token = Some(new_refresh_token);
+            // 若调用方提供了 accessToken（来自 KAM 导出），则直接保留，无需立即调认证服务器
+            // 否则清空，下次使用时系统会自动刷新
+            entry.credentials.access_token = new_access_token;
+            entry.credentials.expires_at = new_expires_at;
+            entry.refresh_failure_count = 0;
+        }
+        self.persist_credentials()?;
+        tracing::info!("凭据 #{} refreshToken 已更新", id);
+        Ok(())
+    }
+
     /// 强制刷新指定凭据的 Token（Admin API）
     ///
     /// 无条件调用上游 API 重新获取 access token，不检查是否过期。
@@ -1851,7 +2085,8 @@ impl MultiTokenManager {
         let _guard = self.refresh_lock.lock().await;
 
         // 无条件调用 refresh_token
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let global_proxy = self.proxy.lock().clone();
+                let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
         let new_creds =
             refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
 
@@ -2595,5 +2830,230 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    // ── is_multiple_format 自动升级 ──────────────────────────────────────────
+
+    fn tmp_creds_path(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("kiro_test_{}.json", name));
+        p
+    }
+
+    /// 单凭据格式（is_multiple_format=false）启动时自动迁移为数组格式，
+    /// 迁移后 persist_credentials 能正确写盘，token rotation 不再丢失。
+    #[test]
+    fn test_single_format_auto_migrates_to_multiple_on_startup() {
+        let path = tmp_creds_path("single_migrate");
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_test_migrate_key".to_string());
+        cred.auth_method = Some("api_key".to_string());
+        let single_json = serde_json::to_string(&cred).unwrap();
+        std::fs::write(&path, &single_json).unwrap();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(path.clone()),
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            manager.is_multiple_format.load(Ordering::Relaxed),
+            "单凭据格式应在启动时自动升级为 true"
+        );
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.trim_start().starts_with('['),
+            "迁移后文件应为数组格式，实际: {}",
+            &content[..content.len().min(50)]
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 空凭据列表时不触发迁移
+    #[test]
+    fn test_empty_credentials_no_migration() {
+        let path = tmp_creds_path("empty_no_migrate");
+        std::fs::write(&path, "{}").unwrap();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![],
+            None,
+            Some(path.clone()),
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            !manager.is_multiple_format.load(Ordering::Relaxed),
+            "无凭据时不应触发格式升级"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// add_credential 后 is_multiple_format 必须升级为 true，文件写为数组格式
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_add_credential_upgrades_multiple_format() {
+        let path = tmp_creds_path("add_cred_upgrade");
+        std::fs::write(&path, "[]").unwrap();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![],
+            None,
+            Some(path.clone()),
+            false,
+        )
+        .unwrap();
+
+        assert!(!manager.is_multiple_format.load(Ordering::Relaxed));
+
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_test_upgrade_key".to_string());
+        cred.auth_method = Some("api_key".to_string());
+
+        manager.add_credential(cred).await.unwrap();
+
+        assert!(
+            manager.is_multiple_format.load(Ordering::Relaxed),
+            "add_credential 后 is_multiple_format 应升级为 true"
+        );
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.trim_start().starts_with('['),
+            "add_credential 后文件应为数组格式"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── try_reload_credential_from_file ─────────────────────────────────────
+
+    /// 文件中有新 refreshToken 时，reload 返回 true 并更新内存凭据
+    #[test]
+    fn test_reload_from_file_succeeds_when_token_rotated() {
+        let path = tmp_creds_path("reload_rotated");
+
+        // 初始 token
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(1);
+        cred.refresh_token = Some("original_token_aaaa".repeat(10));
+        let initial_json = serde_json::to_vec_pretty(&[&cred]).unwrap();
+        std::fs::write(&path, &initial_json).unwrap();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        // 模拟 IDE rotation：文件写入新 token
+        let mut updated_cred = KiroCredentials::default();
+        updated_cred.id = Some(1);
+        updated_cred.refresh_token = Some("rotated_token_bbbb".repeat(10));
+        updated_cred.access_token = Some("new_access".to_string());
+        let updated_json = serde_json::to_vec_pretty(&[&updated_cred]).unwrap();
+        std::fs::write(&path, &updated_json).unwrap();
+
+        let reloaded = manager.try_reload_credential_from_file(1);
+        assert!(reloaded, "文件中有新 token，reload 应返回 true");
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(!entry.disabled, "reload 后凭据应重新启用");
+        assert_eq!(entry.failure_count, 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 文件 token 与内存相同时，reload 返回 false（无更新可用）
+    #[test]
+    fn test_reload_from_file_returns_false_when_token_unchanged() {
+        let path = tmp_creds_path("reload_unchanged");
+
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(1);
+        cred.refresh_token = Some("same_token".repeat(15));
+        let json = serde_json::to_vec_pretty(&[&cred]).unwrap();
+        std::fs::write(&path, &json).unwrap();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        let reloaded = manager.try_reload_credential_from_file(1);
+        assert!(!reloaded, "token 未变化，reload 应返回 false");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 未配置 credentials_path 时，reload 返回 false
+    #[test]
+    fn test_reload_from_file_returns_false_without_path() {
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(1);
+        cred.refresh_token = Some("some_token".repeat(15));
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            None, // 无文件路径
+            false,
+        )
+        .unwrap();
+
+        let reloaded = manager.try_reload_credential_from_file(1);
+        assert!(!reloaded, "无 credentials_path 时应返回 false");
+    }
+
+    /// 单凭据文件无 ID 字段时，通过单凭据规则匹配
+    #[test]
+    fn test_reload_from_file_single_credential_no_id() {
+        let path = tmp_creds_path("reload_single_no_id");
+
+        // 初始：无 ID 字段
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("original_no_id".repeat(10));
+        let initial_json = serde_json::to_vec_pretty(&[&cred]).unwrap();
+        std::fs::write(&path, &initial_json).unwrap();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        // 文件更新为新 token（无 ID）
+        let mut updated = KiroCredentials::default();
+        updated.refresh_token = Some("rotated_no_id".repeat(10));
+        let updated_json = serde_json::to_vec_pretty(&[&updated]).unwrap();
+        std::fs::write(&path, &updated_json).unwrap();
+
+        // 获取实际 ID（manager 自动分配）
+        let actual_id = manager.snapshot().entries[0].id;
+        let reloaded = manager.try_reload_credential_from_file(actual_id);
+        assert!(reloaded, "单凭据无 ID 时仍应能匹配并 reload");
+
+        let _ = std::fs::remove_file(&path);
     }
 }
