@@ -34,6 +34,9 @@ export function BatchVerifyDialog({
   const resultsArray = Array.from(results.values())
   const successCount = resultsArray.filter(r => r.status === 'success').length
   const failedCount = resultsArray.filter(r => r.status === 'failed').length
+  const progressPercent = progress.total > 0
+    ? (progress.current / progress.total) * 100
+    : 0
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -53,7 +56,7 @@ export function BatchVerifyDialog({
               <div className="w-full bg-secondary rounded-full h-2">
                 <div
                   className="bg-primary h-2 rounded-full transition-all"
-                  style={{ width: `${(progress.current / progress.total) * 100}%` }}
+                  style={{ width: `${progressPercent}%` }}
                 />
               </div>
             </div>
@@ -94,11 +97,11 @@ export function BatchVerifyDialog({
                         </Badge>
                       )}
                     </div>
-                    <span>
-                      {result.status === 'success' && '✓'}
-                      {result.status === 'failed' && '✗'}
-                      {result.status === 'verifying' && '⏳'}
-                      {result.status === 'pending' && '⋯'}
+                    <span className="text-xs">
+                      {result.status === 'success' && '成功'}
+                      {result.status === 'failed' && '失败'}
+                      {result.status === 'verifying' && '进行中'}
+                      {result.status === 'pending' && '等待'}
                     </span>
                   </div>
                   {result.error && (
@@ -111,12 +114,6 @@ export function BatchVerifyDialog({
             </div>
           )}
 
-          {/* 提示信息 */}
-          {verifying && (
-            <p className="text-xs text-muted-foreground">
-              💡 验活过程中每次请求间隔 2 秒，防止被封号。你可以关闭此窗口，验活会在后台继续进行。
-            </p>
-          )}
         </div>
 
         <div className="flex justify-end gap-2">

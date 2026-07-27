@@ -101,6 +101,56 @@ impl AdminService {
         }
     }
 
+    /// 导出指定凭据为批量导入兼容格式
+    pub fn export_credentials(
+        &self,
+        ids: &[u64],
+    ) -> Result<Vec<AddCredentialRequest>, AdminServiceError> {
+        let credentials = self
+            .token_manager
+            .export_credentials(ids)
+            .map_err(|e| self.classify_export_error(e))?;
+
+        Ok(credentials
+            .into_iter()
+            .map(|credential| {
+                let auth_method = if credential.is_api_key_credential() {
+                    "api_key".to_string()
+                } else {
+                    credential.auth_method.clone().unwrap_or_else(|| {
+                        if credential.client_id.is_some() && credential.client_secret.is_some() {
+                            "idc".to_string()
+                        } else {
+                            "social".to_string()
+                        }
+                    })
+                };
+
+                AddCredentialRequest {
+                    refresh_token: if credential.is_api_key_credential() {
+                        None
+                    } else {
+                        credential.refresh_token
+                    },
+                    auth_method,
+                    client_id: credential.client_id,
+                    client_secret: credential.client_secret,
+                    priority: credential.priority,
+                    region: credential.region,
+                    auth_region: credential.auth_region,
+                    api_region: credential.api_region,
+                    machine_id: credential.machine_id,
+                    email: credential.email,
+                    proxy_url: credential.proxy_url,
+                    proxy_username: credential.proxy_username,
+                    proxy_password: credential.proxy_password,
+                    kiro_api_key: credential.kiro_api_key,
+                    endpoint: credential.endpoint,
+                }
+            })
+            .collect())
+    }
+
     /// 设置凭据禁用状态
     pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminServiceError> {
         // 先获取当前凭据 ID，用于判断是否需要切换
@@ -371,6 +421,16 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
+        } else {
+            AdminServiceError::InternalError(msg)
+        }
+    }
+
+    /// 分类导出错误
+    fn classify_export_error(&self, e: anyhow::Error) -> AdminServiceError {
+        let msg = e.to_string();
+        if msg.contains("凭据不存在") {
+            AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
         }

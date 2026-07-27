@@ -9,8 +9,8 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, ExportCredentialsRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
     },
 };
 
@@ -89,6 +89,18 @@ pub async fn add_credential(
     Json(payload): Json<AddCredentialRequest>,
 ) -> impl IntoResponse {
     match state.service.add_credential(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/export
+/// 导出指定凭据
+pub async fn export_credentials(
+    State(state): State<AdminState>,
+    Json(payload): Json<ExportCredentialsRequest>,
+) -> impl IntoResponse {
+    match state.service.export_credentials(&payload.ids) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

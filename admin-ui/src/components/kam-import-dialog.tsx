@@ -469,16 +469,16 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
               <div className="flex gap-4 text-sm">
                 <span className="text-green-600 dark:text-green-400">
-                  ✓ 成功: {results.filter(r => r.status === 'verified').length}
+                  成功: {results.filter(r => r.status === 'verified').length}
                 </span>
                 <span className="text-yellow-600 dark:text-yellow-400">
-                  ⚠ 重复: {results.filter(r => r.status === 'duplicate').length}
+                  重复: {results.filter(r => r.status === 'duplicate').length}
                 </span>
                 <span className="text-red-600 dark:text-red-400">
-                  ✗ 失败: {results.filter(r => r.status === 'failed').length}
+                  失败: {results.filter(r => r.status === 'failed').length}
                 </span>
                 <span className="text-gray-500">
-                  ○ 跳过: {results.filter(r => r.status === 'skipped').length}
+                  跳过: {results.filter(r => r.status === 'skipped').length}
                 </span>
               </div>
 
