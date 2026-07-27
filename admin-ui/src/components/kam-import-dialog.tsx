@@ -276,6 +276,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
           const addedCred = await addCredential({
             refreshToken: token,
+            name: account.nickname?.trim() || account.email?.trim() || undefined,
             authMethod,
             authRegion: cred.region?.trim() || undefined,
             clientId,

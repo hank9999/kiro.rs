@@ -21,6 +21,7 @@ type AuthMethod = 'social' | 'idc' | 'api_key'
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
+  const [name, setName] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
   const [authRegion, setAuthRegion] = useState('')
@@ -38,6 +39,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
   const resetForm = () => {
     setRefreshToken('')
+    setName('')
     setKiroApiKey('')
     setAuthMethod('social')
     setAuthRegion('')
@@ -77,6 +79,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
     mutate(
       {
+        name: name.trim() || undefined,
         authMethod,
         refreshToken: isApiKey ? undefined : refreshToken.trim(),
         kiroApiKey: isApiKey ? kiroApiKey.trim() : undefined,
@@ -113,6 +116,20 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
         <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
           <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
+            {/* 凭据名称 */}
+            <div className="space-y-2">
+              <label htmlFor="name" className="text-sm font-medium">
+                凭据名称
+              </label>
+              <Input
+                id="name"
+                placeholder="可选，用于标识凭据"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                disabled={isPending}
+              />
+            </div>
+
             {/* 认证方式 */}
             <div className="space-y-2">
               <label htmlFor="authMethod" className="text-sm font-medium">

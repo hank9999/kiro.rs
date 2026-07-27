@@ -69,6 +69,7 @@ impl AdminService {
             .into_iter()
             .map(|entry| CredentialStatusItem {
                 id: entry.id,
+                name: entry.name.clone(),
                 priority: entry.priority,
                 disabled: entry.disabled,
                 failure_count: entry.failure_count,
@@ -122,6 +123,13 @@ impl AdminService {
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_priority(id, priority)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置凭据名称
+    pub fn set_name(&self, id: u64, name: Option<String>) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_name(id, name)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -215,6 +223,7 @@ impl AdminService {
         let email = req.email.clone();
         let new_cred = KiroCredentials {
             id: None,
+            name: req.name,
             access_token: None,
             refresh_token: req.refresh_token,
             profile_arn: None,
