@@ -18,9 +18,11 @@ use crate::kiro::model::requests::tool::{
 use super::types::{ContentBlock, MessagesRequest};
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
+/// 规范化 JSON Schema，修复工具定义中常见的类型问题
 ///
-/// Claude Code / MCP 工具定义偶尔会出现 `required: null`、`properties: null` 等，
-/// 导致上游返回 400 "Improperly formed request"。
+/// 问题根源：Claude Code / MCP 工具定义使用 JSON Schema Draft 2020-12 语法（`$schema`、
+/// `exclusiveMinimum` 为数字等），kiro CLI endpoint 仅接受 Draft 07 格式，
+/// 不合规字段会导致 ValidationException "Improperly formed request."。
 fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     let serde_json::Value::Object(mut obj) = schema else {
         return serde_json::json!({
@@ -31,14 +33,23 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
         });
     };
 
+    // 移除 $schema（kiro API 不接受此字段，且 Draft 2020-12 声明会触发校验失败）
+    obj.remove("$schema");
+
     // type（必须是字符串）
     if !obj.get("type").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
         obj.insert("type".to_string(), serde_json::Value::String("object".to_string()));
     }
 
-    // properties（必须是 object）
-    match obj.get("properties") {
-        Some(serde_json::Value::Object(_)) => {}
+    // properties（必须是 object）；递归规范化每个 property 的子 schema
+    match obj.remove("properties") {
+        Some(serde_json::Value::Object(props)) => {
+            let normalized: serde_json::Map<String, serde_json::Value> = props
+                .into_iter()
+                .map(|(k, v)| (k, normalize_property_schema(v)))
+                .collect();
+            obj.insert("properties".to_string(), serde_json::Value::Object(normalized));
+        }
         _ => { obj.insert("properties".to_string(), serde_json::Value::Object(serde_json::Map::new())); }
     }
 
@@ -57,6 +68,53 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     match obj.get("additionalProperties") {
         Some(serde_json::Value::Bool(_)) | Some(serde_json::Value::Object(_)) => {}
         _ => { obj.insert("additionalProperties".to_string(), serde_json::Value::Bool(true)); }
+    }
+
+    serde_json::Value::Object(obj)
+}
+
+/// 规范化 property 级别的子 schema（非顶层 inputSchema）
+///
+/// 处理 Draft 2020-12 特有字段，使其兼容 Draft 07：
+/// - 移除 `$schema`
+/// - `exclusiveMinimum`/`exclusiveMaximum` 为数字时（Draft 2019-09+）移除（Draft 07 仅支持 bool）
+/// - `maximum`/`minimum` 超过 i32 范围时移除（部分 AWS validator 不接受超大整数约束）
+fn normalize_property_schema(schema: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(mut obj) = schema else {
+        return schema;
+    };
+
+    obj.remove("$schema");
+
+    // exclusiveMinimum/exclusiveMaximum：Draft 2019-09+ 为数字，Draft 07 为 bool；移除数字形式
+    if obj.get("exclusiveMinimum").and_then(|v| v.as_f64()).is_some() {
+        obj.remove("exclusiveMinimum");
+    }
+    if obj.get("exclusiveMaximum").and_then(|v| v.as_f64()).is_some() {
+        obj.remove("exclusiveMaximum");
+    }
+
+    // maximum/minimum 超过 i64::MAX 或为 JavaScript MAX_SAFE_INTEGER (9007199254740991) 时移除
+    for key in &["maximum", "minimum"] {
+        if let Some(v) = obj.get(*key).and_then(|v| v.as_f64()) {
+            if v > 2_147_483_647.0 || v < -2_147_483_648.0 {
+                obj.remove(*key);
+            }
+        }
+    }
+
+    // 递归处理嵌套 properties
+    if let Some(serde_json::Value::Object(props)) = obj.remove("properties") {
+        let normalized: serde_json::Map<String, serde_json::Value> = props
+            .into_iter()
+            .map(|(k, v)| (k, normalize_property_schema(v)))
+            .collect();
+        obj.insert("properties".to_string(), serde_json::Value::Object(normalized));
+    }
+
+    // 递归处理 items（数组元素 schema）
+    if let Some(items) = obj.remove("items") {
+        obj.insert("items".to_string(), normalize_property_schema(items));
     }
 
     serde_json::Value::Object(obj)
@@ -601,6 +659,13 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
                 description.push('\n');
                 description.push_str(suffix);
             }
+
+            // kiro API 不接受空描述，填充占位符
+            let description = if description.trim().is_empty() {
+                t.name.clone()
+            } else {
+                description
+            };
 
             // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
             let description = match description.char_indices().nth(10000) {

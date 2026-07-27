@@ -169,7 +169,7 @@ impl KiroProvider {
                 .client_for(&ctx.credentials)?
                 .post(&url)
                 .body(body)
-                .header("content-type", "application/json")
+                .header("content-type", endpoint.content_type())
                 .header("Connection", "close");
             let request = endpoint.decorate_mcp(base, &rctx);
 
@@ -322,15 +322,25 @@ impl KiroProvider {
             let url = endpoint.api_url(&rctx);
             let body = endpoint.transform_api_body(request_body, &rctx);
 
+            tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
+            tracing::debug!("实际发送请求体: {}", body);
+
             let base = self
                 .client_for(&ctx.credentials)?
                 .post(&url)
                 .body(body)
-                .header("content-type", "application/json")
+                .header("content-type", endpoint.content_type())
                 .header("Connection", "close");
             let request = endpoint.decorate_api(base, &rctx);
 
-            let response = match request.send().await {
+            // 打印实际发送的请求头（RUST_LOG=debug 时输出，便于排查问题）
+            let request = request.build().map_err(|e| anyhow::anyhow!("构建请求失败: {}", e))?;
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                for (k, v) in request.headers() {
+                    tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
+                }
+            }
+            let response = match self.client_for(&ctx.credentials)?.execute(request).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(

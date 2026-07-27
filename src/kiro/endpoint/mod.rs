@@ -11,8 +11,10 @@ use reqwest::RequestBuilder;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
+pub mod cli;
 pub mod ide;
 
+pub use cli::CliEndpoint;
 pub use ide::IdeEndpoint;
 
 /// Kiro 端点
@@ -21,6 +23,11 @@ pub use ide::IdeEndpoint;
 pub trait KiroEndpoint: Send + Sync {
     /// 端点名称（对应 credentials.endpoint / config.defaultEndpoint 的取值）
     fn name(&self) -> &'static str;
+
+    /// API 请求的 Content-Type（默认 application/json）
+    fn content_type(&self) -> &'static str {
+        "application/json"
+    }
 
     /// API endpoint URL
     fn api_url(&self, ctx: &RequestContext<'_>) -> String;

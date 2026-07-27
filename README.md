@@ -191,7 +191,7 @@ docker-compose up
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
-| `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
+| `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。可选值：`ide`（Kiro IDE）、`cli`（Amazon Q for CLI，适用于 `ksk_` 前缀的 API Key） |
 
 完整配置示例：
 
@@ -245,11 +245,13 @@ docker-compose up
 | `proxyUrl`     | string | 凭据级代理 URL（可选，特殊值 `direct` 表示不使用代理）       |
 | `proxyUsername`| string | 凭据级代理用户名（可选）                                |
 | `proxyPassword`| string | 凭据级代理密码（可选）                                 |
-| `endpoint`     | string | 凭据级端点名称（可选，未配置时使用 `config.defaultEndpoint`）|
+| `endpoint`     | string | 凭据级端点名称（可选，未配置时使用 `config.defaultEndpoint`）。可选值：`ide`、`cli` |
+| `kiroApiKey`   | string | Kiro API Key（`ksk_` 前缀，仅 `authMethod: "api_key"` 时使用） |
 
 说明：
 - IdC / Builder-ID / IAM 在本项目里属于同一种登录方式，配置时统一使用 `authMethod: "idc"`
 - 为兼容旧配置，`builder-id` / `iam` 仍可被识别，但会按 `idc` 处理
+- **`ksk_` 前缀的 API Key 凭据必须将 `endpoint` 设为 `cli`**（或将 `config.defaultEndpoint` 设为 `cli`），否则请求会因协议不匹配而失败
 
 #### 单凭据格式（旧格式，向后兼容）
 
