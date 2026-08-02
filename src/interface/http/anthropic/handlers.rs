@@ -648,7 +648,7 @@ async fn handle_non_stream_request(
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
-/// - Opus 4.6：覆写为 adaptive 类型
+/// - Opus 4.6、Sonnet 5、Opus 5：覆写为 adaptive 类型
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
@@ -657,10 +657,16 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 = model_lower.contains("opus")
-        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let is_adaptive_thinking = (model_lower.contains("opus")
+        && (model_lower.contains("4-6") || model_lower.contains("4.6")))
+        || model_lower.contains("sonnet-5")
+        || model_lower.contains("opus-5");
 
-    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
+    let thinking_type = if is_adaptive_thinking {
+        "adaptive"
+    } else {
+        "enabled"
+    };
 
     tracing::info!(
         model = %payload.model,
@@ -673,7 +679,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         budget_tokens: 20000,
     });
 
-    if is_opus_4_6 {
+    if is_adaptive_thinking {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
         });
@@ -877,6 +883,32 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+        }
+    }
+
+    #[test]
+    fn thinking_suffix_uses_adaptive_mode_for_supported_models() {
+        for model in [
+            "claude-opus-4-6-thinking",
+            "claude-sonnet-5-thinking",
+            "claude-opus-5-thinking",
+        ] {
+            let mut request = empty_request();
+            request.model = model.to_string();
+
+            override_thinking_from_model_name(&mut request);
+
+            let thinking = request.thinking.as_ref().expect("thinking must be set");
+            assert_eq!(thinking.thinking_type, "adaptive", "model={model}");
+            assert_eq!(thinking.budget_tokens, 20_000, "model={model}");
+            assert_eq!(
+                request
+                    .output_config
+                    .as_ref()
+                    .map(|config| config.effort.as_str()),
+                Some("high"),
+                "model={model}"
+            );
         }
     }
 
