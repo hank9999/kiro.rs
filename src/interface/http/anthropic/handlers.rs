@@ -28,7 +28,7 @@ use super::dto::{
 use super::middleware::AppState;
 use super::models::supported_models;
 use crate::interface::http::error::kiro_error_response;
-use crate::service::conversation::converter::{ConversionError, convert_request};
+use crate::service::conversation::converter::{ConversionError, convert_request, map_model};
 use crate::service::conversation::delivery::DeliveryMode;
 use crate::service::conversation::error::{FatalKiroError, is_fatal_exception};
 use crate::service::conversation::reducer::SseEvent;
@@ -94,6 +94,19 @@ async fn post_messages_impl(
         "Received POST {} request",
         endpoint
     );
+
+    // 所有请求路径（包括 WebSearch）必须先经过同一模型校验。
+    if map_model(&payload.model).is_none() {
+        tracing::warn!(model = %payload.model, "请求使用了不支持的模型");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                format!("模型不支持: {}", payload.model),
+            )),
+        )
+            .into_response();
+    }
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_client {
@@ -657,10 +670,10 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_adaptive_thinking = (model_lower.contains("opus")
-        && (model_lower.contains("4-6") || model_lower.contains("4.6")))
-        || model_lower.contains("sonnet-5")
-        || model_lower.contains("opus-5");
+    let is_adaptive_thinking = matches!(
+        map_model(&payload.model).as_deref(),
+        Some("claude-opus-4.6" | "claude-sonnet-5" | "claude-opus-5")
+    );
 
     let thinking_type = if is_adaptive_thinking {
         "adaptive"
@@ -910,6 +923,46 @@ mod tests {
                 "model={model}"
             );
         }
+    }
+
+    #[test]
+    fn thinking_suffix_does_not_enable_adaptive_for_unsupported_versions() {
+        for model in [
+            "claude-sonnet-50-thinking",
+            "claude-sonnet-5-1-thinking",
+            "claude-opus-50-thinking",
+            "claude-opus-4-6-future-thinking",
+        ] {
+            let mut request = empty_request();
+            request.model = model.to_string();
+
+            override_thinking_from_model_name(&mut request);
+
+            let thinking = request.thinking.as_ref().expect("thinking must be set");
+            assert_eq!(thinking.thinking_type, "enabled", "model={model}");
+            assert!(request.output_config.is_none(), "model={model}");
+        }
+    }
+
+    #[tokio::test]
+    async fn post_messages_rejects_unsupported_websearch_model() {
+        use super::super::dto::Tool;
+
+        let state = AppState::new("test-key", false);
+        let mut request = empty_request();
+        request.model = "claude-sonnet-5-1-thinking".to_string();
+        request.tools = Some(vec![Tool {
+            tool_type: Some("web_search_20250305".to_string()),
+            name: "web_search".to_string(),
+            description: String::new(),
+            input_schema: Default::default(),
+            max_uses: Some(8),
+        }]);
+
+        let resp = post_messages(State(state), JsonExtractor(request)).await;
+        let (status, json) = body_json(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["type"], "invalid_request_error");
     }
 
     /// 当 KiroClient 未配置时 `/v1/messages` 必须返回 503，且 body 携带

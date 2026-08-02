@@ -31,38 +31,31 @@ Complete all chunked operations without commentary.";
 
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
-/// Sonnet 与 Opus 严格按版本号映射；所有 Haiku 映射到 4.5。
+/// Sonnet 与 Opus 只接受明确支持的模型 ID 和精确的 `-thinking` 后缀；
+/// 所有 Haiku 映射到 4.5。
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
+    let model_base = model_lower
+        .strip_suffix("-thinking")
+        .unwrap_or(&model_lower);
 
-    if model_lower.contains("sonnet") {
-        if model_lower.contains("sonnet-5") {
-            Some("claude-sonnet-5".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-sonnet-4.6".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-sonnet-4.5".to_string())
-        } else {
-            None
-        }
-    } else if model_lower.contains("opus") {
-        if model_lower.contains("opus-5") {
-            Some("claude-opus-5".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-opus-4.6".to_string())
-        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
-            Some("claude-opus-4.7".to_string())
-        } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
-            Some("claude-opus-4.8".to_string())
-        } else {
-            None
-        }
-    } else if model_lower.contains("haiku") {
-        Some("claude-haiku-4.5".to_string())
-    } else {
-        None
+    match model_base {
+        "claude-sonnet-5" => Some("claude-sonnet-5".to_string()),
+        "claude-sonnet-4-6" | "claude-sonnet-4.6" => Some("claude-sonnet-4.6".to_string()),
+        "claude-sonnet-4-5"
+        | "claude-sonnet-4.5"
+        | "claude-sonnet-4-5-20250929"
+        | "claude-sonnet-4.5-20250929" => Some("claude-sonnet-4.5".to_string()),
+        "claude-opus-5" => Some("claude-opus-5".to_string()),
+        "claude-opus-4-5"
+        | "claude-opus-4.5"
+        | "claude-opus-4-5-20251101"
+        | "claude-opus-4.5-20251101" => Some("claude-opus-4.5".to_string()),
+        "claude-opus-4-6" | "claude-opus-4.6" => Some("claude-opus-4.6".to_string()),
+        "claude-opus-4-7" | "claude-opus-4.7" => Some("claude-opus-4.7".to_string()),
+        "claude-opus-4-8" | "claude-opus-4.8" => Some("claude-opus-4.8".to_string()),
+        model if model.contains("haiku") => Some("claude-haiku-4.5".to_string()),
+        _ => None,
     }
 }
 
@@ -657,6 +650,26 @@ mod tests {
         assert!(map_model("gpt-4").is_none());
         assert!(map_model("claude-sonnet-4-20250514").is_none());
         assert!(map_model("claude-opus-4-20250514").is_none());
+    }
+
+    #[test]
+    fn test_map_model_rejects_ambiguous_version_boundaries() {
+        for model in [
+            "claude-sonnet-50",
+            "claude-sonnet-5x",
+            "claude-sonnet-14-6",
+            "claude-sonnet-4.60",
+            "claude-sonnet-5-1",
+            "claude-sonnet-5-future",
+            "claude-opus-50",
+            "claude-opus-5x",
+            "claude-opus-14-6",
+            "claude-opus-4.80",
+            "claude-opus-4-6-future-thinking",
+            "claude-opus-5-thinking-extra",
+        ] {
+            assert!(map_model(model).is_none(), "model={model}");
+        }
     }
 
     #[test]

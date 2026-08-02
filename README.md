@@ -146,7 +146,7 @@ curl http://127.0.0.1:8990/v1/messages \
   -H "Content-Type: application/json" \
   -H "x-api-key: sk-kiro-rs-qazWSXedcRFV123456" \
   -d '{
-    "model": "claude-sonnet-4-20250514",
+    "model": "claude-sonnet-4-5-20250929",
     "max_tokens": 1024,
     "stream": true,
     "messages": [
@@ -392,7 +392,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 ```json
 {
-  "model": "claude-sonnet-4-20250514",
+  "model": "claude-sonnet-4-5-20250929",
   "max_tokens": 16000,
   "thinking": {
     "type": "enabled",
@@ -408,7 +408,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 ```json
 {
-  "model": "claude-sonnet-4-20250514",
+  "model": "claude-sonnet-4-5-20250929",
   "max_tokens": 1024,
   "tools": [
     {
@@ -431,15 +431,17 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 | Anthropic 模型 | Kiro 模型 |
 |----------------|-----------|
-| `*sonnet-5*` | `claude-sonnet-5` |
-| `*sonnet*`（含 4.6/4-6） | `claude-sonnet-4.6` |
-| `*sonnet*`（含 4.5/4-5） | `claude-sonnet-4.5` |
-| `*opus-5*` | `claude-opus-5` |
-| `*opus*`（含 4.8/4-8） | `claude-opus-4.8` |
-| `*opus*`（含 4.7/4-7） | `claude-opus-4.7` |
-| `*opus*`（含 4.6/4-6） | `claude-opus-4.6` |
-| `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
+| `claude-sonnet-5` | `claude-sonnet-5` |
+| `claude-sonnet-4-6` / `claude-sonnet-4.6` | `claude-sonnet-4.6` |
+| `claude-sonnet-4-5[-20250929]` / `claude-sonnet-4.5[-20250929]` | `claude-sonnet-4.5` |
+| `claude-opus-5` | `claude-opus-5` |
+| `claude-opus-4-8` / `claude-opus-4.8` | `claude-opus-4.8` |
+| `claude-opus-4-7` / `claude-opus-4.7` | `claude-opus-4.7` |
+| `claude-opus-4-6` / `claude-opus-4.6` | `claude-opus-4.6` |
+| `claude-opus-4-5[-20251101]` / `claude-opus-4.5[-20251101]` | `claude-opus-4.5` |
 | `*haiku*` | `claude-haiku-4.5` |
+
+Sonnet 与 Opus 仅接受表中 ID，可追加精确的 `-thinking` 后缀。
 
 ## Admin（可选）
 
