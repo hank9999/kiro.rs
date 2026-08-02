@@ -661,8 +661,8 @@ async fn handle_non_stream_request(
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
-/// - Opus 4.6、Sonnet 5、Opus 5：覆写为 adaptive 类型
-/// - 其他模型：覆写为 enabled 类型
+/// - Opus 4.6/4.7/4.8、Sonnet 5、Opus 5：覆写为 adaptive 类型
+/// - 其他模型（legacy）：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let model_lower = payload.model.to_lowercase();
@@ -672,7 +672,13 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 
     let is_adaptive_thinking = matches!(
         map_model(&payload.model).as_deref(),
-        Some("claude-opus-4.6" | "claude-sonnet-5" | "claude-opus-5")
+        Some(
+            "claude-opus-4.6"
+                | "claude-opus-4.7"
+                | "claude-opus-4.8"
+                | "claude-sonnet-5"
+                | "claude-opus-5"
+        )
     );
 
     let thinking_type = if is_adaptive_thinking {
@@ -903,6 +909,8 @@ mod tests {
     fn thinking_suffix_uses_adaptive_mode_for_supported_models() {
         for model in [
             "claude-opus-4-6-thinking",
+            "claude-opus-4-7-thinking",
+            "claude-opus-4-8-thinking",
             "claude-sonnet-5-thinking",
             "claude-opus-5-thinking",
         ] {
