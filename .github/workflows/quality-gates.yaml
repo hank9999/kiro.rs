@@ -1,0 +1,147 @@
+name: Quality Gates
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-gates-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  approval:
+    name: Approve PR checks
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: pr-quality
+    steps:
+      - name: Approval completed
+        run: echo "PR quality checks approved"
+
+  rustfmt:
+    name: Rust format
+    needs: approval
+    if: >-
+      always() &&
+      (
+        (github.event_name == 'push' && github.repository == 'hank9999/kiro.rs') ||
+        (github.event_name == 'pull_request' && needs.approval.result == 'success')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  test:
+    name: Rust tests
+    needs: approval
+    if: >-
+      always() &&
+      (
+        (github.event_name == 'push' && github.repository == 'hank9999/kiro.rs') ||
+        (github.event_name == 'pull_request' && needs.approval.result == 'success')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Run tests
+        run: cargo test --all-targets
+
+  clippy:
+    name: Rust Clippy
+    needs: approval
+    if: >-
+      always() &&
+      (
+        (github.event_name == 'push' && github.repository == 'hank9999/kiro.rs') ||
+        (github.event_name == 'pull_request' && needs.approval.result == 'success')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  admin-ui:
+    name: Admin UI build
+    needs: approval
+    if: >-
+      always() &&
+      (
+        (github.event_name == 'push' && github.repository == 'hank9999/kiro.rs') ||
+        (github.event_name == 'pull_request' && needs.approval.result == 'success')
+      )
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: admin-ui
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
