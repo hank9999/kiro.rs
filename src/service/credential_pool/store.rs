@@ -30,6 +30,9 @@ pub enum ValidationKind {
 
 pub struct CredentialStore {
     inner: Mutex<HashMap<u64, Credential>>,
+    /// 串行化运行期凭据快照与文件写入，避免并发写入让旧快照覆盖新值。
+    /// 锁顺序固定为 persist_lock -> inner。
+    persist_lock: Mutex<()>,
     file: Arc<CredentialsFileStore>,
     is_multiple: bool,
     next_id: Mutex<u64>,
@@ -114,6 +117,7 @@ impl CredentialStore {
 
         let store = Self {
             inner: Mutex::new(map),
+            persist_lock: Mutex::new(()),
             file,
             is_multiple,
             next_id: Mutex::new(max_id),
@@ -187,7 +191,8 @@ impl CredentialStore {
     }
 
     /// 将候选快照保存到磁盘（仅多格式），按 priority/id 排序。
-    fn save_candidate(&self, mut creds: Vec<Credential>) -> Result<bool, ConfigError> {
+    /// 调用方必须持有 `persist_lock`。
+    fn save_candidate_locked(&self, mut creds: Vec<Credential>) -> Result<bool, ConfigError> {
         if !self.is_multiple {
             return Ok(false);
         }
@@ -213,19 +218,21 @@ impl CredentialStore {
     ///
     /// 用于 admin 显式写路径：API 返回失败时调用方不应观察到部分成功。
     pub fn replace_persisted(&self, id: u64, new_cred: Credential) -> Result<bool, ConfigError> {
+        let _persist_guard = self.persist_lock.lock();
         let mut map = self.inner.lock();
         if !map.contains_key(&id) {
             return Ok(false);
         }
         let mut candidate = map.clone();
         candidate.insert(id, new_cred.clone());
-        self.save_candidate(candidate.into_values().collect())?;
+        self.save_candidate_locked(candidate.into_values().collect())?;
         map.insert(id, new_cred);
         Ok(true)
     }
 
     /// 设置 priority：先写盘，成功后才更新内存。
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<bool, ConfigError> {
+        let _persist_guard = self.persist_lock.lock();
         let mut map = self.inner.lock();
         if !map.contains_key(&id) {
             return Ok(false);
@@ -234,7 +241,7 @@ impl CredentialStore {
         if let Some(c) = candidate.get_mut(&id) {
             c.priority = priority;
         }
-        self.save_candidate(candidate.into_values().collect())?;
+        self.save_candidate_locked(candidate.into_values().collect())?;
         if let Some(c) = map.get_mut(&id) {
             c.priority = priority;
         }
@@ -243,6 +250,7 @@ impl CredentialStore {
 
     /// 设置 disabled：先写盘，成功后才更新内存。
     pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<bool, ConfigError> {
+        let _persist_guard = self.persist_lock.lock();
         let mut map = self.inner.lock();
         if !map.contains_key(&id) {
             return Ok(false);
@@ -251,7 +259,7 @@ impl CredentialStore {
         if let Some(c) = candidate.get_mut(&id) {
             c.disabled = disabled;
         }
-        self.save_candidate(candidate.into_values().collect())?;
+        self.save_candidate_locked(candidate.into_values().collect())?;
         if let Some(c) = map.get_mut(&id) {
             c.disabled = disabled;
         }
@@ -262,6 +270,8 @@ impl CredentialStore {
         if !self.is_multiple {
             return Ok(false);
         }
+        // 必须在取得快照前加锁，并持有到写盘结束；否则旧快照可能后写覆盖新值。
+        let _persist_guard = self.persist_lock.lock();
         // 按 priority/id 排序后落盘（与原文件字段顺序一致）
         let mut sorted: Vec<Credential> = self.inner.lock().values().cloned().collect();
         sorted.sort_by_key(|c| (c.priority, c.id.unwrap_or(0)));
@@ -274,6 +284,8 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+    use std::thread;
+    use std::time::{Duration, Instant};
     use uuid::Uuid;
 
     const FIXTURE_ARRAY_MIXED: &str =
@@ -318,6 +330,17 @@ mod tests {
         let content = fs::read_to_string(path).unwrap();
         let creds: Vec<Credential> = serde_json::from_str(&content).unwrap();
         creds.into_iter().map(|c| c.id.unwrap()).collect()
+    }
+
+    fn wait_for_refresh_token(store: &CredentialStore, id: u64, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if store.get(id).and_then(|c| c.refresh_token).as_deref() == Some(expected) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "等待凭据 {id} 更新到内存超时");
+            thread::yield_now();
+        }
     }
 
     #[test]
@@ -588,5 +611,70 @@ mod tests {
             Some("new-token"),
             "best-effort 语义：磁盘失败但内存已更新"
         );
+    }
+
+    #[test]
+    fn concurrent_best_effort_replacements_serialize_snapshot_and_write() {
+        let json = r#"[
+            {"id":1,"refreshToken":"rt-a-old","authMethod":"social"},
+            {"id":2,"refreshToken":"rt-b-old","authMethod":"social"}
+        ]"#;
+        let (store, _, path) = make_store_from(json, "concurrent-persist");
+        let store = Arc::new(store);
+
+        let mut cred_a = store.get(1).unwrap();
+        cred_a.refresh_token = Some("rt-a-new".to_string());
+        let mut cred_b = store.get(2).unwrap();
+        cred_b.refresh_token = Some("rt-b-new".to_string());
+
+        // 暂停持久化，让两个不同 id 的内存更新同时等待同一把锁。
+        // persist_lock 在快照前获取，因此此时磁盘必须仍是旧值。
+        let persist_guard = store.persist_lock.lock();
+        let store_a = Arc::clone(&store);
+        let worker_a = thread::spawn(move || store_a.replace_best_effort(1, cred_a));
+        wait_for_refresh_token(&store, 1, "rt-a-new");
+
+        let store_b = Arc::clone(&store);
+        let worker_b = thread::spawn(move || store_b.replace_best_effort(2, cred_b));
+        wait_for_refresh_token(&store, 2, "rt-b-new");
+
+        let before_release: Vec<Credential> =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            before_release
+                .iter()
+                .find(|c| c.id == Some(1))
+                .and_then(|c| c.refresh_token.as_deref()),
+            Some("rt-a-old")
+        );
+        assert_eq!(
+            before_release
+                .iter()
+                .find(|c| c.id == Some(2))
+                .and_then(|c| c.refresh_token.as_deref()),
+            Some("rt-b-old")
+        );
+
+        drop(persist_guard);
+        assert!(worker_a.join().unwrap().unwrap());
+        assert!(worker_b.join().unwrap().unwrap());
+
+        let persisted: Vec<Credential> =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            persisted
+                .iter()
+                .find(|c| c.id == Some(1))
+                .and_then(|c| c.refresh_token.as_deref()),
+            Some("rt-a-new")
+        );
+        assert_eq!(
+            persisted
+                .iter()
+                .find(|c| c.id == Some(2))
+                .and_then(|c| c.refresh_token.as_deref()),
+            Some("rt-b-new")
+        );
+        let _ = fs::remove_file(&path);
     }
 }
