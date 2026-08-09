@@ -214,6 +214,27 @@ impl CredentialStore {
         Ok(true)
     }
 
+    /// Best-effort 更新订阅等级：仅修改最新凭据的 `subscription_title` 字段。
+    ///
+    /// 用于额度查询返回后的元数据同步，避免用请求前的旧凭据快照覆盖并发刷新的 token。
+    pub fn set_subscription_title_best_effort(
+        &self,
+        id: u64,
+        title: &str,
+    ) -> Result<bool, ConfigError> {
+        let mut map = self.inner.lock();
+        let Some(cred) = map.get_mut(&id) else {
+            return Ok(false);
+        };
+        if cred.subscription_title.as_deref() == Some(title) {
+            return Ok(true);
+        }
+        cred.subscription_title = Some(title.to_string());
+        drop(map);
+        self.persist()?;
+        Ok(true)
+    }
+
     /// 严格持久化：先写盘，成功后才更新内存。
     ///
     /// 用于 admin 显式写路径：API 返回失败时调用方不应观察到部分成功。
@@ -609,6 +630,63 @@ mod tests {
         assert_eq!(
             store.get(id).unwrap().access_token.as_deref(),
             Some("new-token"),
+            "best-effort 语义：磁盘失败但内存已更新"
+        );
+    }
+
+    #[test]
+    fn set_subscription_title_best_effort_updates_only_title_and_persists() {
+        let json = r#"[{
+            "id": 1,
+            "accessToken": "at-new",
+            "refreshToken": "rt-new",
+            "profileArn": "arn:new",
+            "expiresAt": "2030-01-01T00:00:00Z",
+            "authMethod": "social",
+            "priority": 7,
+            "proxyUrl": "http://proxy.example",
+            "disabled": true
+        }]"#;
+        let (store, _, path) = make_store_from(json, "subscription-title");
+        let before = store.get(1).unwrap();
+
+        assert!(
+            store
+                .set_subscription_title_best_effort(1, "KIRO PRO")
+                .unwrap()
+        );
+
+        let after = store.get(1).unwrap();
+        let mut expected = serde_json::to_value(before).unwrap();
+        expected["subscriptionTitle"] = serde_json::json!("KIRO PRO");
+        assert_eq!(serde_json::to_value(&after).unwrap(), expected);
+
+        let persisted: Vec<Credential> =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&persisted[0]).unwrap(), expected);
+        assert!(
+            !store
+                .set_subscription_title_best_effort(999, "KIRO PRO")
+                .unwrap()
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn set_subscription_title_best_effort_persist_failure_still_modifies_memory() {
+        let (store, dir) =
+            make_store_with_deletable_dir(FIXTURE_ARRAY_MIXED, "subscription-title-best-effort");
+        let id = store.ids()[0];
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        let err = store
+            .set_subscription_title_best_effort(id, "KIRO PRO")
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::Io(_)));
+        assert_eq!(
+            store.get(id).unwrap().subscription_title.as_deref(),
+            Some("KIRO PRO"),
             "best-effort 语义：磁盘失败但内存已更新"
         );
     }

@@ -846,15 +846,29 @@ impl CredentialPool {
         let (token, fresh_cred) = self.prepare_token_for_admin(id, &cred).await?;
         let usage = self.fetch_usage_limits(&fresh_cred, &token).await?;
 
-        // 同步订阅等级到凭据（仅在变化时）
-        if let Some(title) = usage.subscription_title()
-            && fresh_cred.subscription_title.as_deref() != Some(title)
-        {
-            let mut updated = fresh_cred.clone();
-            updated.subscription_title = Some(title.to_string());
-            let _ = self.store.replace_best_effort(id, updated);
+        if let Some(title) = usage.subscription_title() {
+            self.sync_subscription_title(id, title).await;
         }
         Ok(usage)
+    }
+
+    /// 与同 id 的 token 刷新串行化，并只更新最新凭据的订阅等级。
+    async fn sync_subscription_title(&self, id: u64, title: &str) {
+        if self.store.get(id).is_none() {
+            tracing::warn!(id, "同步订阅等级时凭据已被删除");
+            return;
+        }
+        let guard = self.refresh_guard_for(id);
+        let _lock = guard.lock().await;
+        match self.store.set_subscription_title_best_effort(id, title) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(id, "同步订阅等级时凭据已被删除");
+            }
+            Err(e) => {
+                tracing::error!(?e, id, "订阅等级已更新到内存，但持久化失败");
+            }
+        }
     }
 
     /// admin 路径专用 prepare_token：API Key 直用；OAuth 必要时刷新并写回
@@ -1124,6 +1138,28 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct BlockingRotatingRefresher {
+        started: Arc<tokio::sync::Notify>,
+        proceed: Arc<tokio::sync::Notify>,
+    }
+
+    impl TokenSource for BlockingRotatingRefresher {
+        async fn refresh(
+            &self,
+            _cred: &Credential,
+        ) -> Result<RefreshOutcome, crate::domain::error::RefreshError> {
+            self.started.notify_one();
+            self.proceed.notified().await;
+            Ok(RefreshOutcome {
+                access_token: "rotated-at".to_string(),
+                refresh_token: Some("rotated-rt".to_string()),
+                profile_arn: None,
+                expires_at: Some(far_future_expires_at()),
+            })
+        }
+    }
+
     /// 构造一个使用 mock refresher 的 pool（凭据无 access_token，强制走 refresh 路径）
     fn pool_with_mock_refresher(
         n: usize,
@@ -1302,6 +1338,60 @@ mod tests {
             elapsed < std::time::Duration::from_millis(150),
             "不同 id 应并行执行 (~80ms)，实际耗时 {elapsed:?}"
         );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn subscription_sync_after_force_refresh_preserves_rotated_tokens() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        let refresher: Arc<dyn DynTokenSource> = Arc::new(BlockingRotatingRefresher {
+            started: Arc::clone(&started),
+            proceed: Arc::clone(&proceed),
+        });
+        let (pool, path) = pool_with_mock_refresher(1, MODE_PRIORITY, refresher);
+        let pool = Arc::new(pool);
+        let id = pool.store.ids()[0];
+
+        // 模拟额度请求跨网络等待持有的旧凭据快照。
+        let usage_request_snapshot = pool.store.get(id).unwrap();
+        assert_eq!(
+            usage_request_snapshot.refresh_token.as_deref(),
+            Some("rt-0")
+        );
+
+        let refresh_pool = Arc::clone(&pool);
+        let refresh_task =
+            tokio::spawn(async move { refresh_pool.force_refresh_token_for(id).await });
+        started.notified().await;
+
+        let subscription_pool = Arc::clone(&pool);
+        let mut subscription_task = tokio::spawn(async move {
+            subscription_pool
+                .sync_subscription_title(id, "KIRO PRO")
+                .await;
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut subscription_task)
+                .await
+                .is_err(),
+            "同 id 的 token 刷新完成前，订阅等级同步必须等待"
+        );
+
+        proceed.notify_one();
+        refresh_task.await.unwrap().unwrap();
+        subscription_task.await.unwrap();
+
+        let latest = pool.store.get(id).unwrap();
+        assert_eq!(latest.access_token.as_deref(), Some("rotated-at"));
+        assert_eq!(latest.refresh_token.as_deref(), Some("rotated-rt"));
+        assert_eq!(latest.subscription_title.as_deref(), Some("KIRO PRO"));
+
+        let persisted: Vec<Credential> =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(persisted[0].access_token.as_deref(), Some("rotated-at"));
+        assert_eq!(persisted[0].refresh_token.as_deref(), Some("rotated-rt"));
+        assert_eq!(persisted[0].subscription_title.as_deref(), Some("KIRO PRO"));
         let _ = fs::remove_file(&path);
     }
 
