@@ -611,15 +611,17 @@ impl CredentialPool {
     }
 
     /// 设置凭据禁用状态（同步到 store + state，state 层会清失败计数）
+    ///
+    /// 不清理 `refresh_locks`：禁用不会终止进行中的 refresh（它仍持有旧 Arc），
+    /// 此处移除映射会让后续 force_refresh / 重新启用惰性新建第二把锁，
+    /// 使同 id 的两个 refresh 并发使用同一个待轮换的 refresh_token。
+    /// 锁项由 [`delete_credential`](Self::delete_credential) 统一回收。
     pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminPoolError> {
         let exists = self.store.set_disabled(id, disabled)?;
         if !exists {
             return Err(AdminPoolError::NotFound(id));
         }
         self.state.set_disabled(id, disabled);
-        if disabled {
-            self.refresh_locks.lock().remove(&id);
-        }
         Ok(())
     }
 
@@ -1219,6 +1221,18 @@ mod tests {
         let g1 = pool.refresh_guard_for(1);
         let g2 = pool.refresh_guard_for(2);
         assert!(!Arc::ptr_eq(&g1, &g2));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// 禁用必须保留 refresh 锁，否则进行中的 refresh 与后续 refresh 会各持一把锁
+    #[test]
+    fn set_disabled_keeps_refresh_lock_entry() {
+        let (pool, path) = pool_with_n_credentials(1, MODE_PRIORITY);
+        let id = pool.store.ids()[0];
+        let g1 = pool.refresh_guard_for(id);
+        pool.set_disabled(id, true).unwrap();
+        let g2 = pool.refresh_guard_for(id);
+        assert!(Arc::ptr_eq(&g1, &g2), "禁用后应复用同一把 refresh 锁");
         let _ = fs::remove_file(&path);
     }
 
