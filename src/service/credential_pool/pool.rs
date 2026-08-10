@@ -390,10 +390,9 @@ impl CredentialPool {
             RefresherKind::Social => self.refresher_social.refresh(&fresh).await,
         }?;
 
-        // 写回 store；持久化失败仅 log，请求路径不因磁盘抖动失败
-        let mut updated = fresh;
-        updated.apply_refresh(&outcome);
-        match self.store.replace_best_effort(id, updated.clone()) {
+        // 字段级写回 store（避免整条快照覆盖并发的 admin 修改）；
+        // 持久化失败仅 log，请求路径不因磁盘抖动失败
+        match self.store.apply_refresh_best_effort(id, &outcome) {
             Ok(true) => {}
             Ok(false) => {
                 tracing::warn!(id, "刷新成功但凭据已被删除，token 仅本次请求有效");
@@ -402,6 +401,8 @@ impl CredentialPool {
                 tracing::error!(?e, id, "刷新成功但持久化失败，凭据已更新到内存");
             }
         }
+        let mut updated = fresh;
+        updated.apply_refresh(&outcome);
         Ok((outcome.access_token, updated))
     }
 
@@ -484,9 +485,8 @@ impl CredentialPool {
             RefresherKind::Idc => self.refresher_idc.refresh(&fresh).await,
             RefresherKind::Social => self.refresher_social.refresh(&fresh).await,
         }?;
-        let mut updated = fresh;
-        updated.apply_refresh(&outcome);
-        match self.store.replace_best_effort(id, updated) {
+        // 字段级写回，避免整条快照覆盖并发的 admin 修改
+        match self.store.apply_refresh_best_effort(id, &outcome) {
             Ok(true) => {}
             Ok(false) => {
                 tracing::warn!(id, "刷新成功但凭据已被删除，token 仅本次请求有效");
@@ -830,10 +830,8 @@ impl CredentialPool {
                 return Err(e.into());
             }
         };
-        let mut updated = fresh;
-        updated.apply_refresh(&outcome);
-        // admin 路径：持久化失败应反馈给调用方
-        let _ = self.store.replace_persisted(id, updated)?;
+        // 字段级写回，避免整条快照覆盖并发的 admin 修改；持久化失败应反馈给调用方
+        let _ = self.store.apply_refresh_persisted(id, &outcome)?;
         self.state.report_success(id);
         tracing::info!("凭据 #{} Token 已强制刷新", id);
         Ok(())
@@ -912,9 +910,8 @@ impl CredentialPool {
                 return Err(e.into());
             }
         };
-        let mut updated = fresh;
-        updated.apply_refresh(&outcome);
-        match self.store.replace_best_effort(id, updated.clone()) {
+        // 字段级写回，避免整条快照覆盖并发的 admin 修改
+        match self.store.apply_refresh_best_effort(id, &outcome) {
             Ok(true) => {}
             Ok(false) => {
                 tracing::warn!(id, "刷新成功但凭据已被删除，token 仅本次请求有效");
@@ -923,6 +920,8 @@ impl CredentialPool {
                 tracing::error!(?e, id, "刷新成功但持久化失败，凭据已更新到内存");
             }
         }
+        let mut updated = fresh;
+        updated.apply_refresh(&outcome);
         Ok((outcome.access_token, updated))
     }
 
@@ -1406,6 +1405,43 @@ mod tests {
         assert_eq!(persisted[0].access_token.as_deref(), Some("rotated-at"));
         assert_eq!(persisted[0].refresh_token.as_deref(), Some("rotated-rt"));
         assert_eq!(persisted[0].subscription_title.as_deref(), Some("KIRO PRO"));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// 刷新 await 期间 admin 禁用凭据，写回不得把 store 中的 disabled=true 回滚
+    /// （state 层不受影响，但 store 回滚会导致重启后凭据悄悄重新启用）
+    #[tokio::test]
+    async fn disable_during_inflight_refresh_is_not_reverted_by_writeback() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        let refresher: Arc<dyn DynTokenSource> = Arc::new(BlockingRotatingRefresher {
+            started: Arc::clone(&started),
+            proceed: Arc::clone(&proceed),
+        });
+        let (pool, path) = pool_with_mock_refresher(1, MODE_PRIORITY, refresher);
+        let pool = Arc::new(pool);
+        let id = pool.store.ids()[0];
+
+        let refresh_pool = Arc::clone(&pool);
+        let refresh_task =
+            tokio::spawn(async move { refresh_pool.force_refresh_token_for(id).await });
+        started.notified().await;
+
+        // 刷新还在网络往返中，admin 禁用该凭据
+        pool.set_disabled(id, true).unwrap();
+
+        proceed.notify_one();
+        refresh_task.await.unwrap().unwrap();
+
+        let latest = pool.store.get(id).unwrap();
+        assert!(latest.disabled, "刷新写回不得回滚 store 中的 disabled=true");
+        assert_eq!(latest.access_token.as_deref(), Some("rotated-at"));
+        assert_eq!(latest.refresh_token.as_deref(), Some("rotated-rt"));
+
+        let persisted: Vec<Credential> =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(persisted[0].disabled, "持久化文件同样不得回滚 disabled");
+        assert_eq!(persisted[0].refresh_token.as_deref(), Some("rotated-rt"));
         let _ = fs::remove_file(&path);
     }
 

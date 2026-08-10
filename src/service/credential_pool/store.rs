@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use crate::config::Config;
 use crate::domain::credential::Credential;
 use crate::domain::error::ConfigError;
+use crate::domain::token::RefreshOutcome;
 use crate::infra::machine_id::MachineIdResolver;
 use crate::infra::storage::CredentialsFileStore;
 
@@ -200,15 +201,21 @@ impl CredentialStore {
         self.file.save(&creds, true)
     }
 
-    /// Best-effort 写回：先更新内存再持久化；磁盘失败时内存仍保留新值。
+    /// Best-effort 应用刷新结果：仅更新最新凭据的 token 相关字段，先内存后持久化；
+    /// 磁盘失败时内存仍保留新值。
     ///
     /// 用于请求路径（token 刷新）：刷新成功但磁盘抖动时，内存更新让请求继续。
-    pub fn replace_best_effort(&self, id: u64, new_cred: Credential) -> Result<bool, ConfigError> {
+    /// 字段级写回避免用刷新前的整条快照覆盖并发的 admin 修改（disabled/priority/proxy 等）。
+    pub fn apply_refresh_best_effort(
+        &self,
+        id: u64,
+        outcome: &RefreshOutcome,
+    ) -> Result<bool, ConfigError> {
         let mut map = self.inner.lock();
-        if !map.contains_key(&id) {
+        let Some(cred) = map.get_mut(&id) else {
             return Ok(false);
-        }
-        map.insert(id, new_cred);
+        };
+        cred.apply_refresh(outcome);
         drop(map);
         self.persist()?;
         Ok(true)
@@ -235,19 +242,28 @@ impl CredentialStore {
         Ok(true)
     }
 
-    /// 严格持久化：先写盘，成功后才更新内存。
+    /// 严格持久化地应用刷新结果：仅更新 token 相关字段，先写盘，成功后才更新内存。
     ///
-    /// 用于 admin 显式写路径：API 返回失败时调用方不应观察到部分成功。
-    pub fn replace_persisted(&self, id: u64, new_cred: Credential) -> Result<bool, ConfigError> {
+    /// 用于 admin 显式刷新路径：API 返回失败时调用方不应观察到部分成功。
+    /// 字段级写回避免用刷新前的整条快照覆盖并发的 admin 修改（disabled/priority/proxy 等）。
+    pub fn apply_refresh_persisted(
+        &self,
+        id: u64,
+        outcome: &RefreshOutcome,
+    ) -> Result<bool, ConfigError> {
         let _persist_guard = self.persist_lock.lock();
         let mut map = self.inner.lock();
         if !map.contains_key(&id) {
             return Ok(false);
         }
         let mut candidate = map.clone();
-        candidate.insert(id, new_cred.clone());
+        if let Some(c) = candidate.get_mut(&id) {
+            c.apply_refresh(outcome);
+        }
         self.save_candidate_locked(candidate.into_values().collect())?;
-        map.insert(id, new_cred);
+        if let Some(c) = map.get_mut(&id) {
+            c.apply_refresh(outcome);
+        }
         Ok(true)
     }
 
@@ -593,19 +609,27 @@ mod tests {
         );
     }
 
+    fn refresh_outcome(access_token: &str, refresh_token: Option<&str>) -> RefreshOutcome {
+        RefreshOutcome {
+            access_token: access_token.to_string(),
+            refresh_token: refresh_token.map(str::to_string),
+            profile_arn: None,
+            expires_at: None,
+        }
+    }
+
     #[test]
-    fn replace_persisted_persist_failure_does_not_modify_memory() {
+    fn apply_refresh_persisted_persist_failure_does_not_modify_memory() {
         let (store, dir) =
-            make_store_with_deletable_dir(FIXTURE_ARRAY_MIXED, "replace-persisted-rollback");
+            make_store_with_deletable_dir(FIXTURE_ARRAY_MIXED, "apply-refresh-persisted-rollback");
         let id = store.ids()[0];
-        let old_cred = store.get(id).unwrap();
-        let old_token = old_cred.access_token.clone();
+        let old_token = store.get(id).unwrap().access_token.clone();
 
         fs::remove_dir_all(&dir).unwrap();
 
-        let mut new_cred = old_cred;
-        new_cred.access_token = Some("new-token".to_string());
-        let err = store.replace_persisted(id, new_cred).unwrap_err();
+        let err = store
+            .apply_refresh_persisted(id, &refresh_outcome("new-token", None))
+            .unwrap_err();
         assert!(matches!(err, ConfigError::Io(_)));
         assert_eq!(
             store.get(id).unwrap().access_token,
@@ -615,23 +639,68 @@ mod tests {
     }
 
     #[test]
-    fn replace_best_effort_persist_failure_still_modifies_memory() {
+    fn apply_refresh_best_effort_persist_failure_still_modifies_memory() {
         let (store, dir) =
-            make_store_with_deletable_dir(FIXTURE_ARRAY_MIXED, "replace-best-effort");
+            make_store_with_deletable_dir(FIXTURE_ARRAY_MIXED, "apply-refresh-best-effort");
         let id = store.ids()[0];
-        let old_cred = store.get(id).unwrap();
 
         fs::remove_dir_all(&dir).unwrap();
 
-        let mut new_cred = old_cred;
-        new_cred.access_token = Some("new-token".to_string());
-        let err = store.replace_best_effort(id, new_cred).unwrap_err();
+        let err = store
+            .apply_refresh_best_effort(id, &refresh_outcome("new-token", None))
+            .unwrap_err();
         assert!(matches!(err, ConfigError::Io(_)));
         assert_eq!(
             store.get(id).unwrap().access_token.as_deref(),
             Some("new-token"),
             "best-effort 语义：磁盘失败但内存已更新"
         );
+    }
+
+    /// 刷新写回必须是字段级的：不得用刷新前快照覆盖并发的 admin 修改（disabled 等）
+    #[test]
+    fn apply_refresh_preserves_concurrent_admin_fields() {
+        let json = r#"[
+            {"id":1,"refreshToken":"rt-old","authMethod":"social","priority":3},
+            {"id":2,"refreshToken":"rt-x","authMethod":"social"}
+        ]"#;
+        let (store, _, path) = make_store_from(json, "apply-refresh-preserves-admin");
+
+        // 模拟：刷新 await 期间 admin 禁用了凭据并改了优先级
+        store.set_disabled(1, true).unwrap();
+        store.set_priority(1, 9).unwrap();
+
+        assert!(
+            store
+                .apply_refresh_best_effort(1, &refresh_outcome("at-new", Some("rt-new")))
+                .unwrap()
+        );
+
+        let after = store.get(1).unwrap();
+        assert!(after.disabled, "刷新写回不得回滚 disabled=true");
+        assert_eq!(after.priority, 9, "刷新写回不得回滚 priority");
+        assert_eq!(after.access_token.as_deref(), Some("at-new"));
+        assert_eq!(after.refresh_token.as_deref(), Some("rt-new"));
+
+        // 持久化文件同样保留 admin 修改
+        let persisted: Vec<Credential> =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let p1 = persisted.iter().find(|c| c.id == Some(1)).unwrap();
+        assert!(p1.disabled);
+        assert_eq!(p1.priority, 9);
+        assert_eq!(p1.refresh_token.as_deref(), Some("rt-new"));
+
+        // 严格持久化版本同样字段级
+        assert!(
+            store
+                .apply_refresh_persisted(1, &refresh_outcome("at-new2", Some("rt-new2")))
+                .unwrap()
+        );
+        let after2 = store.get(1).unwrap();
+        assert!(after2.disabled);
+        assert_eq!(after2.priority, 9);
+        assert_eq!(after2.refresh_token.as_deref(), Some("rt-new2"));
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
@@ -692,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_best_effort_replacements_serialize_snapshot_and_write() {
+    fn concurrent_best_effort_refreshes_serialize_snapshot_and_write() {
         let json = r#"[
             {"id":1,"refreshToken":"rt-a-old","authMethod":"social"},
             {"id":2,"refreshToken":"rt-b-old","authMethod":"social"}
@@ -700,20 +769,18 @@ mod tests {
         let (store, _, path) = make_store_from(json, "concurrent-persist");
         let store = Arc::new(store);
 
-        let mut cred_a = store.get(1).unwrap();
-        cred_a.refresh_token = Some("rt-a-new".to_string());
-        let mut cred_b = store.get(2).unwrap();
-        cred_b.refresh_token = Some("rt-b-new".to_string());
+        let outcome_a = refresh_outcome("at-a-new", Some("rt-a-new"));
+        let outcome_b = refresh_outcome("at-b-new", Some("rt-b-new"));
 
         // 暂停持久化，让两个不同 id 的内存更新同时等待同一把锁。
         // persist_lock 在快照前获取，因此此时磁盘必须仍是旧值。
         let persist_guard = store.persist_lock.lock();
         let store_a = Arc::clone(&store);
-        let worker_a = thread::spawn(move || store_a.replace_best_effort(1, cred_a));
+        let worker_a = thread::spawn(move || store_a.apply_refresh_best_effort(1, &outcome_a));
         wait_for_refresh_token(&store, 1, "rt-a-new");
 
         let store_b = Arc::clone(&store);
-        let worker_b = thread::spawn(move || store_b.replace_best_effort(2, cred_b));
+        let worker_b = thread::spawn(move || store_b.apply_refresh_best_effort(2, &outcome_b));
         wait_for_refresh_token(&store, 2, "rt-b-new");
 
         let before_release: Vec<Credential> =
