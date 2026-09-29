@@ -79,6 +79,9 @@ jobs:
         with:
           cache-on-failure: true
 
+      - name: Prepare admin UI embed folder
+        run: mkdir -p admin-ui/dist
+
       - name: Run tests
         run: cargo test --all-targets
 
@@ -107,6 +110,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+
+      - name: Prepare admin UI embed folder
+        run: mkdir -p admin-ui/dist
 
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings
