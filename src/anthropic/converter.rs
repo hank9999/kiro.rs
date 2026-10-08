@@ -95,7 +95,10 @@ pub fn map_model(model: &str) -> Option<String> {
             None
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("opus-5") {
+        // 5.5 必须先于 opus-5 判断：`contains("opus-5")` 会同时匹配 opus-5.5
+        if model_lower.contains("opus-5-5") || model_lower.contains("opus-5.5") {
+            Some("claude-opus-5.5".to_string())
+        } else if model_lower.contains("opus-5") {
             Some("claude-opus-5".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
@@ -119,10 +122,21 @@ pub fn map_model(model: &str) -> Option<String> {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Sonnet 5 / Opus 4.7 / 4.8 / Opus 5 / Fable 5.1 同 1M
+/// Sonnet 5 / Opus 4.7 / 4.8 / Opus 5 / 5.5 / Fable 5.1 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
-        Some(mapped) if mapped == "claude-fable-5.1" || mapped == "claude-sonnet-5" || mapped == "claude-opus-5" || mapped == "claude-sonnet-4.6" || mapped == "claude-opus-4.6" || mapped == "claude-opus-4.7" || mapped == "claude-opus-4.8" => 1_000_000,
+        Some(mapped)
+            if mapped == "claude-fable-5.1"
+                || mapped == "claude-sonnet-5"
+                || mapped == "claude-opus-5.5"
+                || mapped == "claude-opus-5"
+                || mapped == "claude-sonnet-4.6"
+                || mapped == "claude-opus-4.6"
+                || mapped == "claude-opus-4.7"
+                || mapped == "claude-opus-4.8" =>
+        {
+            1_000_000
+        }
         _ => 200_000,
     }
 }
@@ -1032,6 +1046,28 @@ mod tests {
         );
         assert_eq!(get_context_window_size("claude-fable-5-1"), 1_000_000);
         // fable 分支不应影响其他系列
+        assert_eq!(
+            map_model("claude-opus-5"),
+            Some("claude-opus-5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_model_opus_5_5() {
+        for name in [
+            "claude-opus-5-5",
+            "claude-opus-5.5",
+            "claude-opus-5-5-thinking",
+            "claude-opus-5.5-20260922",
+        ] {
+            assert_eq!(
+                map_model(name),
+                Some("claude-opus-5.5".to_string()),
+                "{name} should map to claude-opus-5.5"
+            );
+        }
+        assert_eq!(get_context_window_size("claude-opus-5-5"), 1_000_000);
+        // opus-5 不应被 5.5 分支吞掉
         assert_eq!(
             map_model("claude-opus-5"),
             Some("claude-opus-5".to_string())
