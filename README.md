@@ -123,7 +123,8 @@ IdC 认证：
    "expiresAt": "2025-12-31T02:32:45.144Z",
    "authMethod": "idc",
    "clientId": "你的clientId",
-   "clientSecret": "你的clientSecret"
+   "clientSecret": "你的clientSecret",
+     "profileArn": "你的profileArn（可选，部分企业IdC必填）"
 }
 ```
 
@@ -437,6 +438,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 | Anthropic 模型 | Kiro 模型 |
 |----------------|-----------|
+| `*fable*` | `claude-fable-5.1` |
 | `*sonnet-5*` | `claude-sonnet-5` |
 | `*sonnet*`（含 4.6/4-6） | `claude-sonnet-4.6` |
 | `*sonnet*`（含 4.5/4-5） | `claude-sonnet-4.5` |
@@ -549,3 +551,16 @@ MIT
  - [proxycast](https://github.com/aiclientproxy/proxycast)
 
 本项目部分逻辑参考了以上的项目, 再次由衷的感谢!
+
+## 常见排错与经验 (Troubleshooting)
+
+### 1. IdC 认证报 ă Forbidden: User is not authorized to make this call.如果你在使用 IdC (Enterprise) 认证时，代理能正常启动并刷新 Token，但在实际发送对话请求时 Kiro 后端返回了 403 权限错误，这通常是因为**配置文件中漏掉了 \profileArn\ 字段**。
+- **原因**：企业版 IdC (AWS Identity Center) 在调用 Kiro API 时，强制要求在请求中附带 \profileArn\ 标识身份环境。
+- **解决方案**：在 \credentials.json\ 中补齐 \profileArn\ 字段。如果你是用官方的 Kiro IDE 插件登录的，可以在本地缓存中找到它（例如 Windows 下通常位于 \%APPDATA%\Kiro\User\globalStorage\kiro.kiroagent\profile.json\ 中）。
+
+### 2. 启动时报 \没有可用的 accessToken\ 并导致凭据被禁用
+当手动从缓存（如 \kiro-auth-token.json\）拼接生成 \credentials.json\ 时，如果你保留了未来的 \expiresAt\ 时间，但忘记配置 \ccessToken\，就会报这个错。
+- **原因**：当代理服务发现 \expiresAt\ 是未来时间时，它会认为当前 Token 依然有效，于是**跳过网络刷新流程**，直接尝试读取 \ccessToken\ 去发请求。如果此时配置里没有 \ccessToken\，就会因找不到 Token 而报错并禁用该凭据。
+- **解决方案**：
+  - **方法一**：将 \ccessToken\ 完整写入 \credentials.json\ 中。
+  - **方法二**：删除 \expiresAt\ 字段，或者将其改为过去的时间。这样代理服务在启动时就会强制触发一次 Token 刷新，自动获取新的 \ccessToken\。
