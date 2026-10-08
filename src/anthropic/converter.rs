@@ -91,7 +91,10 @@ pub fn map_model(model: &str) -> Option<String> {
             None
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("opus-5") {
+        // 5.5 必须先于 opus-5 判断：`contains("opus-5")` 会同时匹配 opus-5.5
+        if model_lower.contains("opus-5-5") || model_lower.contains("opus-5.5") {
+            Some("claude-opus-5.5".to_string())
+        } else if model_lower.contains("opus-5") {
             Some("claude-opus-5".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
@@ -118,7 +121,7 @@ pub fn map_model(model: &str) -> Option<String> {
 /// Sonnet 5 / Opus 4.7 / 4.8 / Opus 5 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
-        Some(mapped) if mapped == "claude-sonnet-5" || mapped == "claude-opus-5" || mapped == "claude-sonnet-4.6" || mapped == "claude-opus-4.6" || mapped == "claude-opus-4.7" || mapped == "claude-opus-4.8" => 1_000_000,
+        Some(mapped) if mapped == "claude-sonnet-5" || mapped == "claude-opus-5.5" || mapped == "claude-opus-5" || mapped == "claude-sonnet-4.6" || mapped == "claude-opus-4.6" || mapped == "claude-opus-4.7" || mapped == "claude-opus-4.8" => 1_000_000,
         _ => 200_000,
     }
 }
@@ -975,6 +978,28 @@ mod tests {
         assert_eq!(
             map_model("claude-sonnet-4-5-20250929"),
             Some("claude-sonnet-4.5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_model_opus_5_5() {
+        for name in [
+            "claude-opus-5-5",
+            "claude-opus-5.5",
+            "claude-opus-5-5-thinking",
+            "claude-opus-5.5-20260922",
+        ] {
+            assert_eq!(
+                map_model(name),
+                Some("claude-opus-5.5".to_string()),
+                "{name} should map to claude-opus-5.5"
+            );
+        }
+        assert_eq!(get_context_window_size("claude-opus-5-5"), 1_000_000);
+        // opus-5 不应被 5.5 分支吞掉
+        assert_eq!(
+            map_model("claude-opus-5"),
+            Some("claude-opus-5".to_string())
         );
     }
 
