@@ -953,25 +953,28 @@ mod tests {
 
     #[test]
     fn test_map_model_sonnet() {
-        assert!(
-            map_model("claude-sonnet-4-20250514")
-                .unwrap()
-                .contains("sonnet")
-        );
-        assert!(
-            map_model("claude-3-5-sonnet-20241022")
-                .unwrap()
-                .contains("sonnet")
-        );
+        for (model, expected) in [
+            ("claude-sonnet-4-5-20250929", "claude-sonnet-4.5"),
+            ("claude-sonnet-4.5", "claude-sonnet-4.5"),
+            ("claude-sonnet-4-6", "claude-sonnet-4.6"),
+            ("claude-sonnet-4.6", "claude-sonnet-4.6"),
+        ] {
+            assert_eq!(map_model(model), Some(expected.to_string()), "{model}");
+        }
     }
 
     #[test]
     fn test_map_model_opus() {
-        assert!(
-            map_model("claude-opus-4-20250514")
-                .unwrap()
-                .contains("opus")
-        );
+        for (model, expected) in [
+            ("claude-opus-4-5-20251101", "claude-opus-4.5"),
+            ("claude-opus-4.5", "claude-opus-4.5"),
+            ("claude-opus-4-6", "claude-opus-4.6"),
+            ("claude-opus-4.6", "claude-opus-4.6"),
+            ("claude-opus-4-7", "claude-opus-4.7"),
+            ("claude-opus-4.7", "claude-opus-4.7"),
+        ] {
+            assert_eq!(map_model(model), Some(expected.to_string()), "{model}");
+        }
     }
 
     #[test]
@@ -985,7 +988,16 @@ mod tests {
 
     #[test]
     fn test_map_model_unsupported() {
-        assert!(map_model("gpt-4").is_none());
+        for model in [
+            "gpt-4",
+            "claude-sonnet-4",
+            "claude-sonnet-4-20250514",
+            "claude-3-5-sonnet-20241022",
+            "claude-opus-4",
+            "claude-opus-4-20250514",
+        ] {
+            assert_eq!(map_model(model), None, "{model}");
+        }
     }
 
     #[test]
@@ -1116,7 +1128,7 @@ mod tests {
     fn test_determine_chat_trigger_type() {
         // 无工具时返回 MANUAL
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
             messages: vec![],
             stream: false,
@@ -1220,7 +1232,7 @@ mod tests {
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1270,7 +1282,7 @@ mod tests {
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1333,7 +1345,7 @@ mod tests {
 
         // 创建一个请求，历史中有工具使用，但 tools 列表为空
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1432,7 +1444,7 @@ mod tests {
 
         // 测试带有 metadata 的请求，应该使用 session UUID 作为 conversationId
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -1464,7 +1476,7 @@ mod tests {
 
         // 测试没有 metadata 的请求，应该生成新的 UUID
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -1871,7 +1883,7 @@ mod tests {
         use super::super::types::Message as AnthropicMessage;
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
