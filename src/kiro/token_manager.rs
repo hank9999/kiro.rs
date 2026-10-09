@@ -320,6 +320,23 @@ async fn refresh_idc_token(
 }
 
 /// 获取使用额度信息
+fn build_usage_limits_url(credentials: &KiroCredentials, config: &Config) -> String {
+    let host = format!(
+        "q.{}.amazonaws.com",
+        credentials.effective_api_region(config)
+    );
+    let mut url = format!(
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
+        host
+    );
+
+    if let Some(profile_arn) = credentials.profile_arn_for_request() {
+        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
+    }
+
+    url
+}
+
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
     config: &Config,
@@ -337,15 +354,7 @@ pub(crate) async fn get_usage_limits(
     let node_version = &config.node_version;
 
     // 构建 URL
-    let mut url = format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
-        host
-    );
-
-    // profileArn 是可选的
-    if let Some(profile_arn) = &credentials.profile_arn {
-        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
-    }
+    let url = build_usage_limits_url(credentials, config);
 
     // 构建 User-Agent headers
     let user_agent = format!(
@@ -2567,6 +2576,41 @@ mod tests {
         let api_host = format!("q.{}.amazonaws.com", api_region);
 
         assert_eq!(api_host, "q.eu-central-1.amazonaws.com");
+    }
+
+    #[test]
+    fn test_usage_limits_url_includes_profile_arn_for_social() {
+        let mut config = Config::default();
+        config.region = "us-east-1".to_string();
+
+        let credentials = KiroCredentials {
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/ABC".to_string()),
+            ..Default::default()
+        };
+
+        let url = build_usage_limits_url(&credentials, &config);
+        assert!(url.contains("q.us-east-1.amazonaws.com/getUsageLimits"));
+        assert!(
+            url.contains("profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123%3Aprofile%2FABC")
+        );
+    }
+
+    #[test]
+    fn test_usage_limits_url_omits_profile_arn_for_idc() {
+        let mut config = Config::default();
+        config.region = "us-east-1".to_string();
+
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some("client-id".to_string()),
+            client_secret: Some("client-secret".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/ABC".to_string()),
+            ..Default::default()
+        };
+
+        let url = build_usage_limits_url(&credentials, &config);
+        assert!(url.contains("q.us-east-1.amazonaws.com/getUsageLimits"));
+        assert!(!url.contains("profileArn="));
     }
 
     #[test]

@@ -4,12 +4,15 @@
 //! - API: `https://q.{api_region}.amazonaws.com/generateAssistantResponse`
 //! - MCP: `https://q.{api_region}.amazonaws.com/mcp`
 //!
-//! 请求头使用 aws-sdk-js User-Agent 标识。请求体会在根对象上注入 `profileArn`。
+//! 请求头使用 aws-sdk-js User-Agent 标识。
+//! 对 Social 凭据，请求体会在根对象上注入 `profileArn`；
+//! 对 Builder/IdC 凭据，不携带任何 `profileArn` 相关字段。
 
 use reqwest::RequestBuilder;
 use uuid::Uuid;
 
 use super::{KiroEndpoint, RequestContext};
+use crate::kiro::model::credentials::KiroCredentials;
 
 /// Kiro IDE 端点名称
 pub const IDE_ENDPOINT_NAME: &str = "ide";
@@ -45,6 +48,10 @@ impl IdeEndpoint {
             ctx.config.kiro_version,
             ctx.machine_id
         )
+    }
+
+    fn profile_arn_for_request<'a>(&self, credentials: &'a KiroCredentials) -> Option<&'a str> {
+        credentials.profile_arn_for_request()
     }
 }
 
@@ -96,7 +103,7 @@ impl KiroEndpoint for IdeEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if let Some(ref arn) = ctx.credentials.profile_arn {
+        if let Some(arn) = self.profile_arn_for_request(ctx.credentials) {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
         if ctx.credentials.is_api_key_credential() {
@@ -106,33 +113,47 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
-        inject_profile_arn(body, &ctx.credentials.profile_arn)
+        inject_profile_arn(body, ctx.credentials)
     }
 }
 
 /// 将 profile_arn 注入到请求体 JSON 根对象
-fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> String {
-    if let Some(arn) = profile_arn {
-        if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
-            json["profileArn"] = serde_json::Value::String(arn.clone());
-            if let Ok(body) = serde_json::to_string(&json) {
-                return body;
-            }
+fn inject_profile_arn(request_body: &str, credentials: &KiroCredentials) -> String {
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) else {
+        return request_body.to_string();
+    };
+
+    if credentials.is_aws_sso_oidc_credential() {
+        if let Some(obj) = json.as_object_mut() {
+            obj.remove("profileArn");
+        }
+        return serde_json::to_string(&json).unwrap_or_else(|_| request_body.to_string());
+    }
+
+    if let Some(arn) = credentials.profile_arn_for_request() {
+        json["profileArn"] = serde_json::Value::String(arn.to_string());
+        if let Ok(body) = serde_json::to_string(&json) {
+            return body;
         }
     }
+
     request_body.to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::inject_profile_arn;
+    use crate::kiro::model::credentials::KiroCredentials;
     use serde_json::Value;
 
     #[test]
     fn test_inject_profile_arn_with_some() {
         let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
-        let arn = Some("arn:aws:codewhisperer:us-east-1:123:profile/ABC".to_string());
-        let result = inject_profile_arn(body, &arn);
+        let credentials = KiroCredentials {
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/ABC".to_string()),
+            ..Default::default()
+        };
+        let result = inject_profile_arn(body, &credentials);
         let json: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(
             json["profileArn"],
@@ -144,7 +165,7 @@ mod tests {
     #[test]
     fn test_inject_profile_arn_with_none() {
         let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
-        let result = inject_profile_arn(body, &None);
+        let result = inject_profile_arn(body, &KiroCredentials::default());
         let json: Value = serde_json::from_str(&result).unwrap();
         assert!(json.get("profileArn").is_none());
         assert_eq!(json["conversationState"]["conversationId"], "c1");
@@ -153,17 +174,38 @@ mod tests {
     #[test]
     fn test_inject_profile_arn_overwrites_existing() {
         let body = r#"{"conversationState":{},"profileArn":"old-arn"}"#;
-        let arn = Some("new-arn".to_string());
-        let result = inject_profile_arn(body, &arn);
+        let credentials = KiroCredentials {
+            profile_arn: Some("new-arn".to_string()),
+            ..Default::default()
+        };
+        let result = inject_profile_arn(body, &credentials);
         let json: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["profileArn"], "new-arn");
     }
 
     #[test]
+    fn test_inject_profile_arn_removes_existing_for_idc() {
+        let body = r#"{"conversationState":{},"profileArn":"old-arn"}"#;
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            profile_arn: Some("should-not-be-used".to_string()),
+            client_id: Some("client-id".to_string()),
+            client_secret: Some("client-secret".to_string()),
+            ..Default::default()
+        };
+        let result = inject_profile_arn(body, &credentials);
+        let json: Value = serde_json::from_str(&result).unwrap();
+        assert!(json.get("profileArn").is_none());
+    }
+
+    #[test]
     fn test_inject_profile_arn_invalid_json() {
         let body = "not-valid-json";
-        let arn = Some("arn:test".to_string());
-        let result = inject_profile_arn(body, &arn);
+        let credentials = KiroCredentials {
+            profile_arn: Some("arn:test".to_string()),
+            ..Default::default()
+        };
+        let result = inject_profile_arn(body, &credentials);
         assert_eq!(result, "not-valid-json");
     }
 }
