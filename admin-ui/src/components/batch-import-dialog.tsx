@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
+import { useQuery } from '@tanstack/react-query'
 import { CheckCircle2, XCircle, AlertCircle, Loader2 } from 'lucide-react'
 import {
   Dialog,
@@ -10,7 +11,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
+import { getCredentialBalance, setCredentialDisabled, getProxyPool } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 
 interface BatchImportDialogProps {
@@ -30,6 +31,10 @@ interface CredentialInput {
   kiroApiKey?: string
   authMethod?: string
   endpoint?: string
+  email?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
 }
 
 interface VerificationResult {
@@ -55,6 +60,11 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   const { data: existingCredentials } = useCredentials()
   const { mutateAsync: addCredential } = useAddCredential()
   const { mutateAsync: deleteCredential } = useDeleteCredential()
+  const { data: proxyPool } = useQuery({
+    queryKey: ['proxy-pool'],
+    queryFn: getProxyPool,
+    enabled: open,
+  })
 
   const rollbackCredential = async (id: number): Promise<{ success: boolean; error?: string }> => {
     try {
@@ -130,9 +140,18 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       let rollbackFailedCount = 0
       let rollbackSkippedCount = 0
 
+      // 可用的代理池条目（用于无代理凭据的随机分配）
+      const enabledProxies = proxyPool?.proxies.filter(p => p.enabled) ?? []
+
       // 4. 导入并验活
       for (let i = 0; i < credentials.length; i++) {
         const cred = credentials[i]
+
+        // 若凭据未指定代理且代理池有可用代理，随机分配一个
+        if (!cred.proxyUrl?.trim() && enabledProxies.length > 0) {
+          const picked = enabledProxies[Math.floor(Math.random() * enabledProxies.length)]
+          cred.proxyUrl = picked.url
+        }
         const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
 
         // 更新状态为检查中
@@ -234,6 +253,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               apiRegion: cred.apiRegion?.trim() || undefined,
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
+              email: cred.email?.trim() || undefined,
+              proxyUrl: cred.proxyUrl?.trim() || undefined,
+              proxyUsername: cred.proxyUsername?.trim() || undefined,
+              proxyPassword: cred.proxyPassword?.trim() || undefined,
             })
 
             addedCredId = addedCred.credentialId
@@ -246,14 +269,15 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
             successCount++
             existingApiKeyHashes.add(credHash)
-            setCurrentProcessing(addedCred.email ? `验活成功: ${addedCred.email}` : `验活成功: 凭据 ${i + 1}`)
+            const displayEmail = addedCred.email || cred.email?.trim() || undefined
+            setCurrentProcessing(displayEmail ? `验活成功: ${displayEmail}` : `验活成功: 凭据 ${i + 1}`)
             setResults(prev => {
               const newResults = [...prev]
               newResults[i] = {
                 ...newResults[i],
                 status: 'verified',
                 usage: `${balance.currentUsage}/${balance.usageLimit}`,
-                email: addedCred.email || undefined,
+                email: displayEmail,
                 credentialId: addedCred.credentialId
               }
               return newResults
@@ -283,6 +307,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             priority: cred.priority || 0,
             machineId: cred.machineId?.trim() || undefined,
             endpoint: cred.endpoint?.trim() || undefined,
+            email: cred.email?.trim() || undefined,
+            proxyUrl: cred.proxyUrl?.trim() || undefined,
+            proxyUsername: cred.proxyUsername?.trim() || undefined,
+            proxyPassword: cred.proxyPassword?.trim() || undefined,
           })
 
           addedCredId = addedCred.credentialId
@@ -294,16 +322,17 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           const balance = await getCredentialBalance(addedCred.credentialId)
 
           // 验活成功
+          const oauthDisplayEmail = addedCred.email || cred.email?.trim() || undefined
           successCount++
           existingOauthHashes.add(credHash)
-          setCurrentProcessing(addedCred.email ? `验活成功: ${addedCred.email}` : `验活成功: 凭据 ${i + 1}`)
+          setCurrentProcessing(oauthDisplayEmail ? `验活成功: ${oauthDisplayEmail}` : `验活成功: 凭据 ${i + 1}`)
           setResults(prev => {
             const newResults = [...prev]
             newResults[i] = {
               ...newResults[i],
               status: 'verified',
               usage: `${balance.currentUsage}/${balance.usageLimit}`,
-              email: addedCred.email || undefined,
+              email: oauthDisplayEmail,
               credentialId: addedCred.credentialId
             }
             return newResults

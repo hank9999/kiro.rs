@@ -1,19 +1,31 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Globe, LogIn, Key, Settings } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { Input } from '@/components/ui/input'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+  DialogDescription,
+} from '@/components/ui/dialog'
 import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
+import { IdcLoginDialog } from '@/components/idc-login-dialog'
+import { SocialLoginDialog } from '@/components/social-login-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
+import { ProxyPoolDialog } from '@/components/proxy-pool-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
-import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
+import { getCredentialBalance, forceRefreshToken, updateAdminKey } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
 
@@ -26,7 +38,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
+  const [idcLoginDialogOpen, setIdcLoginDialogOpen] = useState(false)
+  const [socialLoginDialogOpen, setSocialLoginDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
+  const [proxyPoolDialogOpen, setProxyPoolDialogOpen] = useState(false)
+  const [adminKeyDialogOpen, setAdminKeyDialogOpen] = useState(false)
+  const [newAdminKey, setNewAdminKey] = useState('')
+  const [updatingAdminKey, setUpdatingAdminKey] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
@@ -491,6 +509,27 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setVerifying(false)
   }
 
+  const handleUpdateAdminKey = async (e: React.FormEvent) => {
+    e.preventDefault()
+    const key = newAdminKey.trim()
+    if (!key) {
+      toast.error('新 Admin Key 不能为空')
+      return
+    }
+    setUpdatingAdminKey(true)
+    try {
+      await updateAdminKey({ newKey: key })
+      storage.setApiKey(key)
+      toast.success('Admin API Key 已更新，已自动切换到新 Key')
+      setAdminKeyDialogOpen(false)
+      setNewAdminKey('')
+    } catch (error) {
+      toast.error(`更新失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setUpdatingAdminKey(false)
+    }
+  }
+
   // 切换负载均衡模式
   const handleToggleLoadBalancing = () => {
     const currentMode = loadBalancingData?.mode || 'priority'
@@ -559,6 +598,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </Button>
             <Button variant="ghost" size="icon" onClick={handleRefresh}>
               <RefreshCw className="h-5 w-5" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => { setNewAdminKey(''); setAdminKeyDialogOpen(true) }}
+              title="修改 Admin API Key"
+            >
+              <Settings className="h-5 w-5" />
             </Button>
             <Button variant="ghost" size="icon" onClick={handleLogout}>
               <LogOut className="h-5 w-5" />
@@ -682,6 +729,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   清除已禁用
                 </Button>
               )}
+              <Button onClick={() => setProxyPoolDialogOpen(true)} size="sm" variant="outline">
+                <Globe className="h-4 w-4 mr-2" />
+                IP 管理
+              </Button>
               <Button onClick={() => setKamImportDialogOpen(true)} size="sm" variant="outline">
                 <FileUp className="h-4 w-4 mr-2" />
                 Kiro Account Manager 导入
@@ -689,6 +740,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
               <Button onClick={() => setBatchImportDialogOpen(true)} size="sm" variant="outline">
                 <Upload className="h-4 w-4 mr-2" />
                 批量导入
+              </Button>
+              <Button onClick={() => setSocialLoginDialogOpen(true)} size="sm" variant="outline">
+                <LogIn className="h-4 w-4 mr-2" />
+                Kiro 账号登录
+              </Button>
+              <Button onClick={() => setIdcLoginDialogOpen(true)} size="sm" variant="outline">
+                <Key className="h-4 w-4 mr-2" />
+                AWS SSO 登录
               </Button>
               <Button onClick={() => setAddDialogOpen(true)} size="sm">
                 <Plus className="h-4 w-4 mr-2" />
@@ -766,10 +825,30 @@ export function Dashboard({ onLogout }: DashboardProps) {
         onOpenChange={setBatchImportDialogOpen}
       />
 
+      {/* Social / Kiro 账号登录对话框 */}
+      <SocialLoginDialog
+        open={socialLoginDialogOpen}
+        onOpenChange={setSocialLoginDialogOpen}
+        onSuccess={() => queryClient.invalidateQueries({ queryKey: ['credentials'] })}
+      />
+
+      {/* IdC / AWS SSO 登录对话框 */}
+      <IdcLoginDialog
+        open={idcLoginDialogOpen}
+        onOpenChange={setIdcLoginDialogOpen}
+        onSuccess={() => queryClient.invalidateQueries({ queryKey: ['credentials'] })}
+      />
+
       {/* KAM 账号导入对话框 */}
       <KamImportDialog
         open={kamImportDialogOpen}
         onOpenChange={setKamImportDialogOpen}
+      />
+
+      {/* 代理 IP 池管理对话框 */}
+      <ProxyPoolDialog
+        open={proxyPoolDialogOpen}
+        onOpenChange={setProxyPoolDialogOpen}
       />
 
       {/* 批量验活对话框 */}
@@ -781,6 +860,47 @@ export function Dashboard({ onLogout }: DashboardProps) {
         results={verifyResults}
         onCancel={handleCancelVerify}
       />
+
+      {/* 修改 Admin API Key 对话框 */}
+      <Dialog
+        open={adminKeyDialogOpen}
+        onOpenChange={(open) => { if (!updatingAdminKey) setAdminKeyDialogOpen(open) }}
+      >
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Key className="h-4 w-4" />
+              修改 Admin API Key
+            </DialogTitle>
+            <DialogDescription>
+              修改后将自动更新本地存储的 Key，无需重新登录。
+            </DialogDescription>
+          </DialogHeader>
+          <form onSubmit={handleUpdateAdminKey} className="space-y-4 py-2">
+            <Input
+              type="password"
+              placeholder="输入新的 Admin API Key"
+              value={newAdminKey}
+              onChange={(e) => setNewAdminKey(e.target.value)}
+              disabled={updatingAdminKey}
+              autoFocus
+            />
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setAdminKeyDialogOpen(false)}
+                disabled={updatingAdminKey}
+              >
+                取消
+              </Button>
+              <Button type="submit" disabled={updatingAdminKey || !newAdminKey.trim()}>
+                {updatingAdminKey ? '更新中...' : '确认更新'}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use parking_lot::RwLock;
+
 use axum::{
     body::Body,
     extract::State,
@@ -17,8 +19,8 @@ use crate::common::auth;
 /// Admin API 共享状态
 #[derive(Clone)]
 pub struct AdminState {
-    /// Admin API 密钥
-    pub admin_api_key: String,
+    /// Admin API 密钥（运行时可修改）
+    pub admin_api_key: Arc<RwLock<String>>,
     /// Admin 服务
     pub service: Arc<AdminService>,
 }
@@ -26,7 +28,7 @@ pub struct AdminState {
 impl AdminState {
     pub fn new(admin_api_key: impl Into<String>, service: AdminService) -> Self {
         Self {
-            admin_api_key: admin_api_key.into(),
+            admin_api_key: Arc::new(RwLock::new(admin_api_key.into())),
             service: Arc::new(service),
         }
     }
@@ -40,8 +42,9 @@ pub async fn admin_auth_middleware(
 ) -> Response {
     let api_key = auth::extract_api_key(&request);
 
+    let current_key = state.admin_api_key.read().clone();
     match api_key {
-        Some(key) if auth::constant_time_eq(&key, &state.admin_api_key) => next.run(request).await,
+        Some(key) if auth::constant_time_eq(&key, &current_key) => next.run(request).await,
         _ => {
             let error = AdminErrorResponse::authentication_error();
             (StatusCode::UNAUTHORIZED, Json(error)).into_response()

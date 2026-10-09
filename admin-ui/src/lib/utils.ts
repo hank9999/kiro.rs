@@ -109,6 +109,18 @@ function parseNestedErrorMessage(message: string): { title: string; detail?: str
 
 
 /**
+ * 脱敏代理 URL：将 user:pass@host 中的认证信息替换为 xxx****xxx
+ */
+export function maskProxyUrl(url: string): string {
+  const match = url.match(/^(\w+:\/\/)([^:@]+):([^@]+)@(.+)$/)
+  if (!match) return url
+  const [, scheme, user, pass, host] = match
+  const mask = (s: string) =>
+    s.length <= 6 ? '****' : `${s.slice(0, 3)}****${s.slice(-3)}`
+  return `${scheme}${mask(user)}:${mask(pass)}@${host}`
+}
+
+/**
  * 计算字符串的 SHA-256 哈希（十六进制）
  *
  * 优先使用 Web Crypto API（crypto.subtle），在非安全上下文（HTTP + 非 localhost）中
