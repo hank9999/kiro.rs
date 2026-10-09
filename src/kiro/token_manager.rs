@@ -450,6 +450,9 @@ struct StatsEntry {
 pub struct CredentialEntrySnapshot {
     /// 凭据唯一 ID
     pub id: u64,
+    /// 凭据自定义名称
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// 优先级
     pub priority: u32,
     /// 是否被禁用
@@ -1404,6 +1407,7 @@ impl MultiTokenManager {
                 .iter()
                 .map(|e| CredentialEntrySnapshot {
                     id: e.id,
+                    name: e.credentials.name.clone(),
                     priority: e.credentials.priority,
                     disabled: e.disabled,
                     failure_count: e.failure_count,
@@ -1501,6 +1505,20 @@ impl MultiTokenManager {
         // 立即按新优先级重新选择当前凭据（无论持久化是否成功）
         self.select_highest_priority();
         // 持久化更改
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置凭据名称（Admin API）
+    pub fn set_name(&self, id: u64, name: Option<String>) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.name = name;
+        }
         self.persist_credentials()?;
         Ok(())
     }
