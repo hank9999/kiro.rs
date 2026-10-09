@@ -93,7 +93,7 @@ impl CurrentMessage {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputMessage {
-    /// 用户输入消息上下文
+    /// 用户输入消息上下文（始终序列化，envState 是 CLI endpoint 必填字段）
     pub user_input_message_context: UserInputMessageContext,
     /// 消息内容
     pub content: String,
@@ -138,18 +138,54 @@ impl UserInputMessage {
     }
 }
 
+/// 环境状态（kiro-cli 始终发送此字段，CLI endpoint 要求）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvState {
+    pub operating_system: String,
+    pub current_working_directory: String,
+}
+
+impl Default for EnvState {
+    fn default() -> Self {
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "/".to_string());
+        Self {
+            operating_system: "macos".to_string(),
+            current_working_directory: cwd,
+        }
+    }
+}
+
 /// 用户输入消息上下文
 ///
 /// 包含工具定义和工具执行结果
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputMessageContext {
+    /// 环境状态（kiro-cli 始终携带）
+    pub env_state: EnvState,
     /// 工具执行结果列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_results: Vec<ToolResult>,
     /// 可用工具列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Tool>,
+}
+
+impl Default for UserInputMessageContext {
+    fn default() -> Self {
+        Self {
+            env_state: EnvState::default(),
+            tool_results: Vec::new(),
+            tools: Vec::new(),
+        }
+    }
+}
+
+fn is_empty_context(ctx: &UserInputMessageContext) -> bool {
+    ctx.tools.is_empty() && ctx.tool_results.is_empty()
 }
 
 impl UserInputMessageContext {
@@ -243,13 +279,9 @@ pub struct UserMessage {
     /// 图片列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<KiroImage>,
-    /// 用户输入消息上下文
-    #[serde(default, skip_serializing_if = "is_default_context")]
+    /// 用户输入消息上下文（历史消息无工具时跳过）
+    #[serde(default, skip_serializing_if = "is_empty_context")]
     pub user_input_message_context: UserInputMessageContext,
-}
-
-fn is_default_context(ctx: &UserInputMessageContext) -> bool {
-    ctx.tools.is_empty() && ctx.tool_results.is_empty()
 }
 
 impl UserMessage {

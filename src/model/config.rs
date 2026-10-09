@@ -127,12 +127,11 @@ fn default_region() -> String {
 }
 
 fn default_kiro_version() -> String {
-    "0.11.107".to_string()
+    "2.3.0".to_string()
 }
 
 fn default_system_version() -> String {
-    const SYSTEM_VERSIONS: &[&str] = &["darwin#24.6.0", "win32#10.0.22631"];
-    SYSTEM_VERSIONS[fastrand::usize(..SYSTEM_VERSIONS.len())].to_string()
+    "macos".to_string()
 }
 
 fn default_node_version() -> String {
