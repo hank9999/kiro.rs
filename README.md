@@ -371,6 +371,32 @@ docker-compose up
 RUST_LOG=debug ./target/release/kiro-rs
 ```
 
+### 用 credits 反推缓存读取
+
+Kiro 的 `meteringEvent` 只有 credit 总量，没有缓存 token。对配置了 alpha 的模型，网关用上下文大小和 credit 反推 `cache_read_input_tokens`。缓存创建固定为 0。没有 alpha 的模型仍把上下文全部记为未缓存输入。
+
+```text
+equivalent = credits / alpha
+cache_read = round((T + 5 * output - equivalent) / (1 - cache_ratio))
+```
+
+`T` 是 `contextUsagePercentage / 100 * 上下文窗口` 的四舍五入结果。`cache_read` 限制在 `0..=T`；如果未缓存输入会变成 0，则保留 1 个 token，避免部分下游把流式 `input_tokens: 0` 当成用量还没结束。
+
+默认缓存倍率按 Claude 官方缓存读取价：Sonnet 5.5 和 Opus 5.5 是 `0.05`，Sonnet 5 和 Haiku 4.5 是 `0.10`。2026-10-21 的重复请求实测折扣更接近全价的 10%，不是 5%。要把用量标签贴近这次观测时，把 5.5 的倍率覆盖成 `0.10`。这样标签会变，但按官方 5% 加权后的金额不再严格等于 `credits / alpha`。
+
+| 环境变量 | 默认 |
+|----------|------|
+| `KIRO_CREDIT_ALPHA_SONNET55` | `0.0000217529`。2026-10-21 约 1200 token 的单点测量：`0.0261034826 / 1200` |
+| `KIRO_CREDIT_ALPHA_OPUS55` | 不设置。同期实测约 `0.0000331675`，需要显式打开 |
+| `KIRO_CREDIT_ALPHA_SONNET5` | 不设置。Sonnet 5 不是单一费率，不要填一个常数 |
+| `KIRO_CREDIT_ALPHA_HAIKU45` | 不设置 |
+| `KIRO_CREDIT_CACHE_RATIO_SONNET55` | `0.05` |
+| `KIRO_CREDIT_CACHE_RATIO_OPUS55` | `0.05` |
+| `KIRO_CREDIT_CACHE_RATIO_SONNET5` | `0.10` |
+| `KIRO_CREDIT_CACHE_RATIO_HAIKU45` | `0.10` |
+
+alpha 小于等于 0 时关闭该模型的反推。倍率不在 `(0, 1)` 内时回退到默认值。无法解析的 alpha 文本也回退到默认值。
+
 ## API 端点
 
 ### 标准端点 (/v1)
@@ -439,6 +465,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 | Anthropic 模型 | Kiro 模型 |
 |----------------|-----------|
 | `*fable*` | `claude-fable-5.1` |
+| `*sonnet-5.5*` / `*sonnet-5-5*` | `claude-sonnet-5.5` |
 | `*sonnet-5*` | `claude-sonnet-5` |
 | `*sonnet*`（含 4.6/4-6） | `claude-sonnet-4.6` |
 | `*sonnet*`（含 4.5/4-5） | `claude-sonnet-4.5` |
@@ -448,9 +475,10 @@ RUST_LOG=debug ./target/release/kiro-rs
 | `*opus*`（含 4.7/4-7） | `claude-opus-4.7` |
 | `*opus*`（含 4.6/4-6） | `claude-opus-4.6` |
 | `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
-| `*haiku*` | `claude-haiku-4.5` |
+| `*haiku*` except `*haiku-5*` | `claude-haiku-4.5` |
+| `*haiku-5*` | unsupported; Kiro has not published Haiku 5.5 |
 
-Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/claude-sonnet-5.md)。
+Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/claude-sonnet-5.md)。Sonnet 5.5 同样不接受 `thinking.type=enabled`，请求里的该值会改写为 `adaptive`。
 
 ## Admin（可选）
 

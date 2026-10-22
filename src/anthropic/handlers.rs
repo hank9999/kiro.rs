@@ -129,6 +129,24 @@ pub async fn get_models() -> impl IntoResponse {
             max_tokens: 128_000,
         },
         Model {
+            id: "claude-sonnet-5-5".to_string(),
+            object: "model".to_string(),
+            created: 1759363200, // Oct 2, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 5.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64_000,
+        },
+        Model {
+            id: "claude-sonnet-5-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1759363200, // Oct 2, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 5.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64_000,
+        },
+        Model {
             id: "claude-sonnet-5".to_string(),
             object: "model".to_string(),
             created: 1782777600, // Jun 30, 2026
@@ -312,6 +330,7 @@ pub async fn post_messages(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    normalize_sonnet5_thinking(&mut payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -380,12 +399,8 @@ pub async fn post_messages(
         payload.tools,
     ) as i32;
 
-    // 检查是否启用了thinking
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
+    // 检查是否启用了thinking。Sonnet 5.5 上游默认 adaptive。
+    let thinking_enabled = request_thinking_enabled(&payload.model, payload.thinking.as_ref());
 
     let tool_name_map = conversion_result.tool_name_map;
 
@@ -586,6 +601,8 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    let mut credit_usage = 0.0;
+    let mut saw_metering = false;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -637,12 +654,13 @@ async fn handle_non_stream_request(
                             }
                         }
                         Event::ContextUsage(context_usage) => {
-                            // 从上下文使用百分比计算实际的 input_tokens
+                            // 从上下文使用百分比计算实际的 input_tokens，四舍五入到整数。
                             let window_size = get_context_window_size(model);
-                            let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (window_size as f64)
-                                / 100.0)
-                                as i32;
+                            let actual_input_tokens =
+                                super::credit_cache::tokens_from_context_percentage(
+                                    context_usage.context_usage_percentage,
+                                    window_size,
+                                );
                             context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
@@ -657,6 +675,15 @@ async fn handle_non_stream_request(
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
+                            }
+                        }
+                        Event::Metering(metering) => {
+                            if let Some(credits) = super::credit_cache::observe_credit(
+                                &metering.unit,
+                                metering.usage,
+                            ) {
+                                credit_usage += credits;
+                                saw_metering = true;
                             }
                         }
                         _ => {}
@@ -707,8 +734,18 @@ async fn handle_non_stream_request(
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-    let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值。
+    // 只有拿到上下文大小时才用 credits 反推缓存。
+    let usage = if let Some(total_input) = context_input_tokens {
+        super::credit_cache::split_usage(
+            model,
+            total_input,
+            output_tokens,
+            if saw_metering { Some(credit_usage) } else { None },
+        )
+    } else {
+        super::credit_cache::split_usage(model, input_tokens, output_tokens, None)
+    };
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -720,8 +757,10 @@ async fn handle_non_stream_request(
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
+            "input_tokens": usage.input_tokens,
+            "cache_read_input_tokens": usage.cache_read_input_tokens,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": usage.output_tokens
         }
     });
 
@@ -733,6 +772,43 @@ async fn handle_non_stream_request(
 /// - Opus 4.6：覆写为 adaptive 类型
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
+fn is_sonnet_5_family(model: &str) -> bool {
+    let model_lower = model.to_lowercase();
+    model_lower.contains("sonnet-5")
+}
+
+fn is_sonnet_55(model: &str) -> bool {
+    let model_lower = model.to_lowercase();
+    model_lower.contains("sonnet-5.5") || model_lower.contains("sonnet-5-5")
+}
+
+/// Sonnet 5 / 5.5 拒绝手动的 `thinking.type=enabled`。
+fn normalize_sonnet5_thinking(payload: &mut MessagesRequest) {
+    if !is_sonnet_5_family(&payload.model) {
+        return;
+    }
+    let needs_adaptive = payload
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.thinking_type == "enabled");
+    if !needs_adaptive {
+        return;
+    }
+    if let Some(thinking) = payload.thinking.as_mut() {
+        thinking.thinking_type = "adaptive".to_string();
+    }
+    if payload.output_config.is_none() {
+        payload.output_config = Some(OutputConfig {
+            effort: "high".to_string(),
+        });
+    }
+}
+
+fn request_thinking_enabled(model: &str, thinking: Option<&Thinking>) -> bool {
+    let explicit = thinking.map(|t| t.is_enabled()).unwrap_or(false);
+    explicit || is_sonnet_55(model)
+}
+
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let model_lower = payload.model.to_lowercase();
     if !model_lower.contains("thinking") {
@@ -828,6 +904,7 @@ pub async fn post_messages_cc(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    normalize_sonnet5_thinking(&mut payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -896,12 +973,8 @@ pub async fn post_messages_cc(
         payload.tools,
     ) as i32;
 
-    // 检查是否启用了thinking
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
+    // 检查是否启用了thinking。Sonnet 5.5 上游默认 adaptive。
+    let thinking_enabled = request_thinking_enabled(&payload.model, payload.thinking.as_ref());
 
     let tool_name_map = conversion_result.tool_name_map;
 

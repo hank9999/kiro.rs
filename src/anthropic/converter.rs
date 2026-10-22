@@ -85,7 +85,11 @@ pub fn map_model(model: &str) -> Option<String> {
         // 目前 Kiro 仅上线 5.1 一个 Fable 版本，故与 haiku 分支一致采用无条件映射
         Some("claude-fable-5.1".to_string())
     } else if model_lower.contains("sonnet") {
-        if model_lower.contains("sonnet-5") {
+        // 5.5 必须先于 sonnet-5 判断：`contains("sonnet-5")` 也会匹配 5.5。
+        // 上游只接受点号形式 claude-sonnet-5.5。
+        if model_lower.contains("sonnet-5.5") || model_lower.contains("sonnet-5-5") {
+            Some("claude-sonnet-5.5".to_string())
+        } else if model_lower.contains("sonnet-5") {
             Some("claude-sonnet-5".to_string())
         } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
@@ -112,7 +116,13 @@ pub fn map_model(model: &str) -> Option<String> {
             None
         }
     } else if model_lower.contains("haiku") {
-        Some("claude-haiku-4.5".to_string())
+        // 2026-10-21 实测 claude-haiku-5.5 / claude-haiku-5-5 被上游拒绝。
+        // 保留 Haiku 4.5，但不要把 5.x 请求静默降级到 4.5。
+        if model_lower.contains("haiku-5") {
+            None
+        } else {
+            Some("claude-haiku-4.5".to_string())
+        }
     } else {
         None
     }
@@ -122,12 +132,13 @@ pub fn map_model(model: &str) -> Option<String> {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Sonnet 5 / Opus 4.7 / 4.8 / Opus 5 / 5.5 / Fable 5.1 同 1M
+/// Sonnet 5 / Sonnet 5.5 / Opus 4.7 / 4.8 / Opus 5 / 5.5 / Fable 5.1 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
         Some(mapped)
             if mapped == "claude-fable-5.1"
                 || mapped == "claude-sonnet-5"
+                || mapped == "claude-sonnet-5.5"
                 || mapped == "claude-opus-5.5"
                 || mapped == "claude-opus-5"
                 || mapped == "claude-sonnet-4.6"
@@ -1032,6 +1043,20 @@ mod tests {
             Some("claude-sonnet-5".to_string())
         );
         assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
+        assert_eq!(
+            map_model("claude-sonnet-5.5"),
+            Some("claude-sonnet-5.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-5-5"),
+            Some("claude-sonnet-5.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-5.5-thinking"),
+            Some("claude-sonnet-5.5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-sonnet-5.5"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-sonnet-5-5"), 1_000_000);
         // sonnet-4-5 不应误匹配为 sonnet-5
         assert_eq!(
             map_model("claude-sonnet-4-5-20250929"),
@@ -1122,6 +1147,12 @@ mod tests {
         // thinking 后缀不应影响 haiku 模型映射
         let result = map_model("claude-haiku-4-5-20251001-thinking");
         assert_eq!(result, Some("claude-haiku-4.5".to_string()));
+        assert_eq!(
+            map_model("claude-haiku-4.5"),
+            Some("claude-haiku-4.5".to_string())
+        );
+        assert_eq!(map_model("claude-haiku-5.5"), None);
+        assert_eq!(map_model("claude-haiku-5-5"), None);
     }
 
     #[test]

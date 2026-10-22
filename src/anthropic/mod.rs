@@ -23,6 +23,7 @@
 //! ```
 
 mod converter;
+mod credit_cache;
 mod handlers;
 mod middleware;
 mod router;

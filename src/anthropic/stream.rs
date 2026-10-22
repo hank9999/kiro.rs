@@ -458,6 +458,7 @@ impl SseStateManager {
         &mut self,
         input_tokens: i32,
         output_tokens: i32,
+        cache_read_input_tokens: i32,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -488,6 +489,8 @@ impl SseStateManager {
                     },
                     "usage": {
                         "input_tokens": input_tokens,
+                        "cache_read_input_tokens": cache_read_input_tokens,
+                        "cache_creation_input_tokens": 0,
                         "output_tokens": output_tokens
                     }
                 }),
@@ -521,6 +524,10 @@ pub struct StreamContext {
     pub input_tokens: i32,
     /// 从 contextUsageEvent 计算的实际输入 tokens
     pub context_input_tokens: Option<i32>,
+    /// 已观察到的 Kiro credit 消耗
+    pub credit_usage: f64,
+    /// 是否收到过 meteringEvent
+    pub saw_metering: bool,
     /// 输出 tokens 累计
     pub output_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
@@ -558,6 +565,8 @@ impl StreamContext {
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_tokens,
             context_input_tokens: None,
+            credit_usage: 0.0,
+            saw_metering: false,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
             tool_name_map,
@@ -636,11 +645,12 @@ impl StreamContext {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(context_usage) => {
-                // 从上下文使用百分比计算实际的 input_tokens
+                // 从上下文使用百分比计算实际的 input_tokens，四舍五入到整数。
                 let window_size = get_context_window_size(&self.model);
-                let actual_input_tokens = (context_usage.context_usage_percentage
-                    * (window_size as f64)
-                    / 100.0) as i32;
+                let actual_input_tokens = super::credit_cache::tokens_from_context_percentage(
+                    context_usage.context_usage_percentage,
+                    window_size,
+                );
                 self.context_input_tokens = Some(actual_input_tokens);
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                 if context_usage.context_usage_percentage >= 100.0 {
@@ -670,6 +680,15 @@ impl StreamContext {
                     self.state_manager.set_stop_reason("max_tokens");
                 }
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                Vec::new()
+            }
+            Event::Metering(metering) => {
+                if let Some(credits) =
+                    super::credit_cache::observe_credit(&metering.unit, metering.usage)
+                {
+                    self.credit_usage += credits;
+                    self.saw_metering = true;
+                }
                 Vec::new()
             }
             _ => Vec::new(),
@@ -1040,6 +1059,23 @@ impl StreamContext {
         events
     }
 
+    fn billed_usage(&self) -> super::credit_cache::UsageSplit {
+        let credits = if self.saw_metering {
+            Some(self.credit_usage)
+        } else {
+            None
+        };
+        match self.context_input_tokens {
+            Some(total_input) => super::credit_cache::split_usage(
+                &self.model,
+                total_input,
+                self.output_tokens,
+                credits,
+            ),
+            None => super::credit_cache::split_usage(&self.model, self.input_tokens, self.output_tokens, None),
+        }
+    }
+
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
@@ -1117,13 +1153,16 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(" "));
         }
 
-        // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-        let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        // 有 contextUsageEvent 时按 credits 反推缓存；否则保持原来的估算输入。
+        let usage = self.billed_usage();
 
         // 生成最终事件
         events.extend(
-            self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens),
+            self.state_manager.generate_final_events(
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_input_tokens,
+            ),
         );
         events
     }
@@ -1202,18 +1241,27 @@ impl BufferedStreamContext {
         let final_events = self.inner.generate_final_events();
         self.event_buffer.extend(final_events);
 
-        // 获取正确的 input_tokens
-        let final_input_tokens = self
-            .inner
-            .context_input_tokens
-            .unwrap_or(self.estimated_input_tokens);
+        // 更正 message_start。没有上下文事件时仍回退到估算输入。
+        let usage_split = self.inner.billed_usage();
+        let final_input_tokens = if self.inner.context_input_tokens.is_some() {
+            usage_split.input_tokens
+        } else {
+            self.estimated_input_tokens
+        };
+        let cache_read_input_tokens = if self.inner.context_input_tokens.is_some() {
+            usage_split.cache_read_input_tokens
+        } else {
+            0
+        };
 
-        // 更正 message_start 事件中的 input_tokens
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
                         usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                        usage["cache_read_input_tokens"] =
+                            serde_json::json!(cache_read_input_tokens);
+                        usage["cache_creation_input_tokens"] = serde_json::json!(0);
                     }
                 }
             }
