@@ -122,6 +122,36 @@ jobs:
       - name: Build app
         run: cargo build --release --target ${{ matrix.target }} ${{ contains(matrix.target, 'musl') && '--no-default-features' || '' }}
 
+      - name: Package archive (Unix)
+        if: matrix.platform != 'windows-latest'
+        shell: bash
+        run: |
+          ARCHIVE_NAME="kiro-rs-${{ steps.version.outputs.version }}-${{ matrix.name }}"
+          STAGING_DIR="${ARCHIVE_NAME}"
+          mkdir -p "${STAGING_DIR}"
+          cp "target/${{ matrix.target }}/release/kiro-rs" "${STAGING_DIR}/"
+          cp README.md LICENSE "${STAGING_DIR}/" 2>/dev/null || true
+          tar -czf "${ARCHIVE_NAME}.tar.gz" "${STAGING_DIR}"
+          shasum -a 256 "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
+          echo "asset_path=${ARCHIVE_NAME}.tar.gz" >> $GITHUB_ENV
+          echo "asset_sha=${ARCHIVE_NAME}.tar.gz.sha256" >> $GITHUB_ENV
+
+      - name: Package archive (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $archiveName = "kiro-rs-${{ steps.version.outputs.version }}-${{ matrix.name }}"
+          $stagingDir = $archiveName
+          New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/kiro-rs.exe" -Destination $stagingDir
+          if (Test-Path README.md) { Copy-Item README.md -Destination $stagingDir }
+          if (Test-Path LICENSE) { Copy-Item LICENSE -Destination $stagingDir }
+          Compress-Archive -Path $stagingDir -DestinationPath "$archiveName.zip"
+          $hash = Get-FileHash "$archiveName.zip" -Algorithm SHA256
+          "$($hash.Hash.ToLower())  $archiveName.zip" | Out-File -Encoding ascii "$archiveName.zip.sha256"
+          "asset_path=$archiveName.zip" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+          "asset_sha=$archiveName.zip.sha256" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -129,5 +159,37 @@ jobs:
           if-no-files-found: error
           compression-level: 6
           path: |
-            target/${{ matrix.target }}/release/kiro-rs
-            target/${{ matrix.target }}/release/kiro-rs.exe
+            ${{ env.asset_path }}
+            ${{ env.asset_sha }}
+
+  release:
+    name: Publish Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) -exec cp {} release-assets/ \;
+          ls -la release-assets
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/*
