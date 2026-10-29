@@ -24,6 +24,9 @@ pub struct CredentialsStatusResponse {
 pub struct CredentialStatusItem {
     /// 凭据唯一 ID
     pub id: u64,
+    /// 凭据自定义名称
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// 优先级（数字越小优先级越高）
     pub priority: u32,
     /// 是否被禁用
@@ -82,12 +85,23 @@ pub struct SetPriorityRequest {
     pub priority: u32,
 }
 
+/// 修改凭据名称请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetNameRequest {
+    /// 新名称（空字符串表示清除名称）
+    pub name: Option<String>,
+}
+
 /// 添加凭据请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddCredentialRequest {
     /// 刷新令牌（OAuth 凭据必填，API Key 凭据不需要）
     pub refresh_token: Option<String>,
+
+    /// 凭据自定义名称（可选）
+    pub name: Option<String>,
 
     /// 认证方式（可选，默认 social）
     #[serde(default = "default_auth_method")]

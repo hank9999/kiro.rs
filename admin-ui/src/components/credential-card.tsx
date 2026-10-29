@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, Pencil } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -19,6 +19,7 @@ import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
 import {
   useSetDisabled,
   useSetPriority,
+  useSetName,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
@@ -59,10 +60,13 @@ export function CredentialCard({
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
+  const [editingName, setEditingName] = useState(false)
+  const [nameValue, setNameValue] = useState(credential.name || '')
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
+  const setName = useSetName()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
@@ -152,7 +156,78 @@ export function CredentialCard({
                 onCheckedChange={onToggleSelect}
               />
               <CardTitle className="text-lg flex items-center gap-2">
-                {credential.email || `凭据 #${credential.id}`}
+                {editingName ? (
+                  <div className="inline-flex items-center gap-1">
+                    <Input
+                      value={nameValue}
+                      onChange={(e) => setNameValue(e.target.value)}
+                      className="w-40 h-7 text-sm"
+                      placeholder="输入名称"
+                      autoFocus
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          const trimmed = nameValue.trim()
+                          setName.mutate(
+                            { id: credential.id, name: trimmed || null },
+                            {
+                              onSuccess: (res) => {
+                                toast.success(res.message)
+                                setEditingName(false)
+                              },
+                              onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+                            }
+                          )
+                        } else if (e.key === 'Escape') {
+                          setEditingName(false)
+                          setNameValue(credential.name || '')
+                        }
+                      }}
+                    />
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 w-7 p-0"
+                      onClick={() => {
+                        const trimmed = nameValue.trim()
+                        setName.mutate(
+                          { id: credential.id, name: trimmed || null },
+                          {
+                            onSuccess: (res) => {
+                              toast.success(res.message)
+                              setEditingName(false)
+                            },
+                            onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+                          }
+                        )
+                      }}
+                      disabled={setName.isPending}
+                    >
+                      ✓
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 w-7 p-0"
+                      onClick={() => {
+                        setEditingName(false)
+                        setNameValue(credential.name || '')
+                      }}
+                    >
+                      ✕
+                    </Button>
+                  </div>
+                ) : (
+                  <span className="flex items-center gap-1">
+                    {credential.name || credential.email || `凭据 #${credential.id}`}
+                    <Pencil
+                      className="h-3.5 w-3.5 text-muted-foreground cursor-pointer hover:text-foreground"
+                      onClick={() => {
+                        setNameValue(credential.name || '')
+                        setEditingName(true)
+                      }}
+                    />
+                  </span>
+                )}
                 {credential.isCurrent && (
                   <Badge variant="success">当前</Badge>
                 )}
