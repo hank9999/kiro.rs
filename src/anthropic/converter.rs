@@ -11,6 +11,9 @@ use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
     HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
 };
+use crate::kiro::model::requests::kiro::{
+    AdditionalModelRequestFields, ModelOutputConfig, ModelThinking,
+};
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
@@ -152,6 +155,69 @@ pub struct ConversionResult {
     pub conversation_state: ConversationState,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
+    /// Kiro 原生的推理强度 / 思考模式参数，模型不支持时为 None
+    pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
+}
+
+/// 支持原生 effort / thinking 参数的 Kiro 模型，以及各自可选的 effort 档位
+///
+/// 来自 Kiro ListAvailableModels 返回的 additionalModelRequestFieldsSchema（2026-10-30）。
+/// 上游严格校验：表外模型（如 4.5 系列）携带该字段会返回 400
+/// "additionalModelRequestFields is not supported for this model"，
+/// 档位不在枚举内同样返回 400，所以只对表内模型发送表内档位。
+fn native_effort_levels(model_id: &str) -> Option<&'static [&'static str]> {
+    const FOUR_LEVELS: &[&str] = &["low", "medium", "high", "max"];
+    const FIVE_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+    match model_id {
+        "claude-opus-4.6" | "claude-sonnet-4.6" => Some(FOUR_LEVELS),
+        "claude-opus-4.7" | "claude-opus-4.8" | "claude-opus-5" | "claude-sonnet-5"
+        | "claude-opus-5.5" | "claude-sonnet-5.5" | "claude-haiku-5.5" => Some(FIVE_LEVELS),
+        _ => None,
+    }
+}
+
+/// 把 Anthropic 的 `output_config.effort` / `thinking` 转成 Kiro 原生的 `additionalModelRequestFields`
+///
+/// 写进提示词的 `<thinking_effort>` 标签不会改变上游实际的推理强度，
+/// 不传这个字段时上游按模型默认档位运行（例如 claude-opus-5.5 默认 medium）。
+/// Kiro IDE 也是通过这个字段传 effort 和 thinking。
+fn build_additional_model_request_fields(
+    req: &MessagesRequest,
+    model_id: &str,
+) -> Option<AdditionalModelRequestFields> {
+    let levels = native_effort_levels(model_id)?;
+
+    let output_config = req.output_config.as_ref().and_then(|config| {
+        if levels.contains(&config.effort.as_str()) {
+            Some(ModelOutputConfig {
+                effort: config.effort.clone(),
+            })
+        } else {
+            tracing::debug!(
+                model = model_id,
+                effort = %config.effort,
+                "模型不支持该 effort 档位，不传原生 effort，由上游使用默认档位"
+            );
+            None
+        }
+    });
+
+    // 表内模型都支持 adaptive；Anthropic 的 enabled（固定预算）在这些模型上没有对应取值，同样按 adaptive 发送
+    let thinking = req
+        .thinking
+        .as_ref()
+        .filter(|thinking| thinking.is_enabled())
+        .map(|_| ModelThinking {
+            thinking_type: "adaptive".to_string(),
+        });
+
+    if output_config.is_none() && thinking.is_none() {
+        return None;
+    }
+    Some(AdditionalModelRequestFields {
+        output_config,
+        thinking,
+    })
 }
 
 /// 转换错误
@@ -355,9 +421,13 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         );
     }
 
+    // 14. 推理强度 / 思考模式走 Kiro 原生字段
+    let additional_model_request_fields = build_additional_model_request_fields(req, &model_id);
+
     Ok(ConversionResult {
         conversation_state,
         tool_name_map,
+        additional_model_request_fields,
     })
 }
 
@@ -1148,6 +1218,82 @@ mod tests {
         // thinking 后缀不应影响 haiku 模型映射
         let result = map_model("claude-haiku-4-5-20251001-thinking");
         assert_eq!(result, Some("claude-haiku-4.5".to_string()));
+    }
+
+    fn effort_request(
+        model: &str,
+        thinking_type: Option<&str>,
+        effort: Option<&str>,
+    ) -> MessagesRequest {
+        use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
+        MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: thinking_type.map(|t| Thinking {
+                thinking_type: t.to_string(),
+                budget_tokens: 20000,
+            }),
+            output_config: effort.map(|e| OutputConfig {
+                effort: e.to_string(),
+            }),
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_native_effort_and_thinking_for_supported_model() {
+        let req = effort_request("claude-opus-5-5", Some("adaptive"), Some("max"));
+        let fields = build_additional_model_request_fields(&req, "claude-opus-5.5").unwrap();
+        assert_eq!(fields.output_config.unwrap().effort, "max");
+        assert_eq!(fields.thinking.unwrap().thinking_type, "adaptive");
+
+        // convert_request 会把字段带进转换结果
+        let result = convert_request(&req).unwrap();
+        assert!(result.additional_model_request_fields.is_some());
+    }
+
+    #[test]
+    fn test_native_effort_skips_level_the_model_lacks() {
+        // claude-opus-4.6 没有 xhigh：不传 effort（上游会 400），thinking 照常发送
+        let req = effort_request("claude-opus-4-6", Some("adaptive"), Some("xhigh"));
+        let fields = build_additional_model_request_fields(&req, "claude-opus-4.6").unwrap();
+        assert!(fields.output_config.is_none());
+        assert_eq!(fields.thinking.unwrap().thinking_type, "adaptive");
+    }
+
+    #[test]
+    fn test_native_fields_not_sent_for_models_without_schema() {
+        // 4.5 系列不支持 additionalModelRequestFields，带上会 400
+        let req = effort_request("claude-sonnet-4-5", Some("enabled"), Some("high"));
+        assert!(build_additional_model_request_fields(&req, "claude-sonnet-4.5").is_none());
+        assert!(build_additional_model_request_fields(&req, "claude-haiku-4.5").is_none());
+    }
+
+    #[test]
+    fn test_native_fields_effort_only_or_enabled_thinking() {
+        // 只给 effort、不开 thinking：只传 effort
+        let req = effort_request("claude-sonnet-5-5", None, Some("low"));
+        let fields = build_additional_model_request_fields(&req, "claude-sonnet-5.5").unwrap();
+        assert_eq!(fields.output_config.unwrap().effort, "low");
+        assert!(fields.thinking.is_none());
+
+        // enabled（固定预算）按 adaptive 发送；没给 effort 时由上游用默认档位
+        let req = effort_request("claude-opus-4-8", Some("enabled"), None);
+        let fields = build_additional_model_request_fields(&req, "claude-opus-4.8").unwrap();
+        assert!(fields.output_config.is_none());
+        assert_eq!(fields.thinking.unwrap().thinking_type, "adaptive");
+
+        // 两者都没有：不传
+        let req = effort_request("claude-opus-4-8", None, None);
+        assert!(build_additional_model_request_fields(&req, "claude-opus-4.8").is_none());
     }
 
     #[test]
