@@ -143,6 +143,34 @@ fn default_auth_method() -> String {
     "social".to_string()
 }
 
+/// 更新 refreshToken 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateRefreshTokenRequest {
+    /// 新的刷新令牌
+    pub refresh_token: String,
+    /// 可选：同时更新 accessToken（来自 KAM 导出，避免强制清空后立即需要刷新）
+    #[serde(default)]
+    pub access_token: Option<String>,
+    /// 可选：同时更新 expiresAt（与 accessToken 配套）
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+/// 更新凭据请求（仅可编辑字段，None 表示不修改，Some("") 表示清除）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCredentialRequest {
+    /// 用户邮箱（用于前端显示）
+    pub email: Option<String>,
+    /// 凭据级代理 URL（空字符串表示清除）
+    pub proxy_url: Option<String>,
+    /// 凭据级代理认证用户名
+    pub proxy_username: Option<String>,
+    /// 凭据级代理认证密码
+    pub proxy_password: Option<String>,
+}
+
 /// 添加凭据成功响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -194,6 +222,184 @@ pub struct LoadBalancingModeResponse {
 pub struct SetLoadBalancingModeRequest {
     /// 模式（"priority" 或 "balanced"）
     pub mode: String,
+}
+
+// ============ 代理池 ============
+
+/// 代理池条目
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolEntry {
+    /// 唯一 ID（自增）
+    pub id: u64,
+    /// 代理 URL（如 socks5://user:pass@host:port）
+    pub url: String,
+    /// 备注标签（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// 是否启用
+    pub enabled: bool,
+    /// 使用此代理的凭据数量
+    pub credential_count: u32,
+}
+
+/// 代理池列表响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolResponse {
+    pub total: usize,
+    pub proxies: Vec<ProxyPoolEntry>,
+}
+
+/// 添加代理请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddProxyRequest {
+    pub url: String,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// 批量导入代理请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchAddProxyRequest {
+    /// 代理 URL 列表（每行一个）
+    pub urls: Vec<String>,
+}
+
+/// 分配代理给凭据请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignProxyRequest {
+    /// 代理池中的代理 ID；null 表示清除代理
+    #[serde(default)]
+    pub proxy_id: Option<u64>,
+}
+
+// ============ 全局代理配置 ============
+
+/// 全局代理配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalProxyResponse {
+    /// 当前全局代理 URL（null 表示未配置）
+    pub proxy_url: Option<String>,
+}
+
+/// 设置全局代理请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetGlobalProxyRequest {
+    /// 代理 URL，null 表示清除全局代理
+    pub proxy_url: Option<String>,
+}
+
+// ============ Admin API Key 修改 ============
+
+/// 修改 Admin API Key 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateAdminKeyRequest {
+    /// 新的 Admin API Key
+    pub new_key: String,
+}
+
+// ============ IdC 设备授权登录 ============
+
+/// 发起 IdC 设备授权请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartIdcLoginRequest {
+    pub region: String,
+    #[serde(default)]
+    pub start_url: Option<String>,
+    #[serde(default)]
+    pub priority: u32,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+}
+
+/// 发起 IdC 设备授权响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartIdcLoginResponse {
+    pub session_id: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_uri_complete: Option<String>,
+    pub expires_at: String,
+    pub poll_interval: i64,
+}
+
+/// 轮询 IdC 登录状态响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase", tag = "status")]
+pub enum PollIdcLoginResponse {
+    #[serde(rename = "pending")]
+    Pending,
+    #[serde(rename = "success")]
+    Success { credential_id: u64 },
+    #[serde(rename = "expired")]
+    Expired,
+}
+
+// ============ Social 登录（Portal PKCE OAuth） ============
+
+/// 发起 Social 登录请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartSocialLoginRequest {
+    /// 优先级（默认 0）
+    #[serde(default)]
+    pub priority: u32,
+    /// 用户邮箱（可选）
+    #[serde(default)]
+    pub email: Option<String>,
+    /// 代理 URL（可选）
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    /// Kiro auth endpoint（留空用默认）
+    #[serde(default)]
+    pub auth_endpoint: Option<String>,
+}
+
+/// 发起 Social 登录响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartSocialLoginResponse {
+    /// 会话 ID
+    pub session_id: String,
+    /// 在浏览器打开的 portal URL
+    pub portal_url: String,
+    /// 会话过期时间（RFC3339）
+    pub expires_at: String,
+}
+
+/// 轮询 Social 登录状态（与 IdC 共用状态枚举）
+pub type PollSocialLoginResponse = PollIdcLoginResponse;
+
+/// 手动完成 Social 登录请求（远程访问场景：从浏览器地址栏复制回调 URL）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteSocialLoginRequest {
+    /// OAuth 授权码（从回调 URL 的 code 参数提取）
+    pub code: String,
+    /// OAuth state（从回调 URL 的 state 参数提取，用于 CSRF 校验）
+    pub state: String,
+    /// 登录选项（从回调 URL 的 login_option 参数提取，可为空）
+    #[serde(default)]
+    pub login_option: String,
+    /// 回调 URL 的路径（如 /oauth/callback）
+    #[serde(default = "default_oauth_path")]
+    pub path: String,
+}
+
+fn default_oauth_path() -> String {
+    "/oauth/callback".to_string()
 }
 
 // ============ 通用响应 ============
