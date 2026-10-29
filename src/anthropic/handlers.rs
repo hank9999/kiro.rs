@@ -15,10 +15,14 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
+use futures::stream::BoxStream;
 use futures::{Stream, StreamExt, stream};
 use serde_json::json;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::interval;
+use tokio::time::{Interval, interval};
 use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
@@ -446,8 +450,23 @@ async fn handle_stream_request(
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
+    // 上游流没有任何可见输出就结束时，用同一请求体透明重试
+    let retry_provider = provider.clone();
+    let retry_body = request_body.to_string();
+    let retry: UpstreamRetry = Arc::new(move || {
+        let provider = retry_provider.clone();
+        let body = retry_body.clone();
+        Box::pin(async move { provider.call_api_stream(&body).await })
+    });
+
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events);
+    let stream = create_sse_stream(
+        response,
+        ctx,
+        initial_events,
+        retry,
+        MAX_EMPTY_OUTPUT_RETRIES,
+    );
 
     // 返回 SSE 响应
     Response::builder()
@@ -467,93 +486,157 @@ fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
 }
 
+/// 重新发起一次上游流式请求。用于上游流结束却没有任何可见输出时的透明重试。
+type UpstreamRetry = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = anyhow::Result<reqwest::Response>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// 上游流结束但没有产生文本或工具调用时，最多透明重试的次数。
+///
+/// Kiro 上游偶尔只推送客户端看不到的事件（例如未解析的推理事件）就结束本轮。
+/// 原样转发会得到一个空的 end_turn，Claude Code 只会再提示一次“没有可见输出”，
+/// 随后直接结束这一轮，表现为会话中途断掉。此时客户端尚未收到任何内容块，
+/// 重新请求不会造成重复输出。
+const MAX_EMPTY_OUTPUT_RETRIES: u32 = 2;
+
+/// `create_sse_stream` 的展开状态
+struct SseStreamState {
+    body_stream: BoxStream<'static, reqwest::Result<Bytes>>,
+    ctx: StreamContext,
+    decoder: EventStreamDecoder,
+    finished: bool,
+    ping_interval: Interval,
+    retry: UpstreamRetry,
+    retries_left: u32,
+}
+
+/// 上游流结束但客户端还没有收到任何内容时，用同一请求重新获取上游流。
+///
+/// 返回 true 表示已切换到新的上游流，调用方应继续读取；返回 false 表示
+/// 不满足重试条件、预算已用完或重试请求本身失败，调用方按原逻辑收尾。
+async fn retry_empty_upstream_output(state: &mut SseStreamState) -> bool {
+    if state.retries_left == 0 || !state.ctx.should_retry_empty_output() {
+        return false;
+    }
+    state.retries_left -= 1;
+    tracing::warn!(
+        retries_left = state.retries_left,
+        unknown_events = %state.ctx.unknown_event_summary(),
+        actual_input_tokens = ?state.ctx.context_input_tokens,
+        "上游流结束但没有可见输出，透明重试"
+    );
+
+    match (state.retry)().await {
+        Ok(response) => {
+            state.body_stream = response.bytes_stream().boxed();
+            state.decoder = EventStreamDecoder::new();
+            state.ctx.reset_for_upstream_retry();
+            true
+        }
+        Err(e) => {
+            tracing::warn!("无可见输出后的重试请求失败: {}", e);
+            false
+        }
+    }
+}
+
+fn sse_bytes(events: Vec<SseEvent>) -> Vec<Result<Bytes, Infallible>> {
+    events
+        .into_iter()
+        .map(|e| Ok(Bytes::from(e.to_sse_string())))
+        .collect()
+}
+
 /// 创建 SSE 事件流
 fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
+    retry: UpstreamRetry,
+    max_empty_output_retries: u32,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
-    let initial_stream = stream::iter(
-        initial_events
-            .into_iter()
-            .map(|e| Ok(Bytes::from(e.to_sse_string()))),
-    );
+    let initial_stream = stream::iter(sse_bytes(initial_events));
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
-    let body_stream = response.bytes_stream();
+    let state = SseStreamState {
+        body_stream: response.bytes_stream().boxed(),
+        ctx,
+        decoder: EventStreamDecoder::new(),
+        finished: false,
+        ping_interval: interval(Duration::from_secs(PING_INTERVAL_SECS)),
+        retry,
+        retries_left: max_empty_output_retries,
+    };
 
-    let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
-            if finished {
-                return None;
-            }
+    let processing_stream = stream::unfold(state, |mut state| async move {
+        if state.finished {
+            return None;
+        }
 
-            // 使用 select! 同时等待数据和 ping 定时器
-            tokio::select! {
-                // 处理数据流
-                chunk_result = body_stream.next() => {
-                    match chunk_result {
-                        Some(Ok(chunk)) => {
-                            // 解码事件
-                            if let Err(e) = decoder.feed(&chunk) {
-                                tracing::warn!("缓冲区溢出: {}", e);
-                            }
+        // 使用 select! 同时等待数据和 ping 定时器
+        tokio::select! {
+            // 处理数据流
+            chunk_result = state.body_stream.next() => {
+                match chunk_result {
+                    Some(Ok(chunk)) => {
+                        // 解码事件
+                        if let Err(e) = state.decoder.feed(&chunk) {
+                            tracing::warn!("缓冲区溢出: {}", e);
+                        }
 
-                            let mut events = Vec::new();
-                            for result in decoder.decode_iter() {
-                                match result {
-                                    Ok(frame) => {
-                                        if let Ok(event) = Event::from_frame(frame) {
-                                            let sse_events = ctx.process_kiro_event(&event);
-                                            events.extend(sse_events);
+                        let mut events = Vec::new();
+                        for result in state.decoder.decode_iter() {
+                            match result {
+                                Ok(frame) => {
+                                    let event_type = frame.event_type().map(str::to_owned);
+                                    if let Ok(event) = Event::from_frame(frame) {
+                                        if matches!(event, Event::Unknown { .. }) {
+                                            state.ctx.record_unknown_event(
+                                                event_type.as_deref().unwrap_or("unknown"),
+                                            );
                                         }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("解码事件失败: {}", e);
+                                        events.extend(state.ctx.process_kiro_event(&event));
                                     }
                                 }
+                                Err(e) => {
+                                    tracing::warn!("解码事件失败: {}", e);
+                                }
                             }
+                        }
 
-                            // 转换为 SSE 字节流
-                            let bytes: Vec<Result<Bytes, Infallible>> = events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                        Some((stream::iter(sse_bytes(events)), state))
+                    }
+                    Some(Err(e)) => {
+                        tracing::error!("读取响应流失败: {}", e);
+                        if retry_empty_upstream_output(&mut state).await {
+                            return Some((stream::iter(Vec::new()), state));
                         }
-                        Some(Err(e)) => {
-                            tracing::error!("读取响应流失败: {}", e);
-                            // 发送最终事件并结束
-                            let final_events = ctx.generate_final_events();
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                        // 发送最终事件并结束
+                        let final_events = state.ctx.generate_final_events();
+                        state.finished = true;
+                        Some((stream::iter(sse_bytes(final_events)), state))
+                    }
+                    None => {
+                        if retry_empty_upstream_output(&mut state).await {
+                            return Some((stream::iter(Vec::new()), state));
                         }
-                        None => {
-                            // 流结束，发送最终事件
-                            let final_events = ctx.generate_final_events();
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
-                        }
+                        // 流结束，发送最终事件
+                        let final_events = state.ctx.generate_final_events();
+                        state.finished = true;
+                        Some((stream::iter(sse_bytes(final_events)), state))
                     }
                 }
-                // 发送 ping 保活
-                _ = ping_interval.tick() => {
-                    tracing::trace!("发送 ping 保活事件");
-                    let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
-                }
             }
-        },
-    )
+            // 发送 ping 保活
+            _ = state.ping_interval.tick() => {
+                tracing::trace!("发送 ping 保活事件");
+                Some((stream::iter(vec![Ok(create_ping_sse())]), state))
+            }
+        }
+    })
     .flatten();
 
     initial_stream.chain(processing_stream)
@@ -1064,4 +1147,179 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod empty_output_retry_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// 编码一个 AWS Event Stream 事件帧
+    fn event_frame(event_type: &str, payload: &str) -> Vec<u8> {
+        let mut headers = Vec::new();
+        for (name, value) in [
+            (":message-type", "event"),
+            (":event-type", event_type),
+            (":content-type", "application/json"),
+        ] {
+            headers.push(name.len() as u8);
+            headers.extend_from_slice(name.as_bytes());
+            headers.push(7); // string
+            headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            headers.extend_from_slice(value.as_bytes());
+        }
+        let crc32 = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
+        let total_len = 12 + headers.len() + payload.len() + 4;
+        let mut frame = Vec::with_capacity(total_len);
+        frame.extend_from_slice(&(total_len as u32).to_be_bytes());
+        frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        let prelude_crc = crc32.checksum(&frame[..8]);
+        frame.extend_from_slice(&prelude_crc.to_be_bytes());
+        frame.extend_from_slice(&headers);
+        frame.extend_from_slice(payload.as_bytes());
+        let message_crc = crc32.checksum(&frame);
+        frame.extend_from_slice(&message_crc.to_be_bytes());
+        frame
+    }
+
+    /// 启动一次性本地 HTTP 服务，返回携带给定事件流正文的上游响应
+    async fn upstream_response(body: Vec<u8>) -> reqwest::Response {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/vnd.amazon.eventstream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(&body).await.unwrap();
+            let _ = socket.shutdown().await;
+        });
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{}/", addr))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// 返回固定正文的重试钩子，并统计调用次数
+    fn counting_retry(body: Vec<u8>) -> (UpstreamRetry, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let retry: UpstreamRetry = Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let body = body.clone();
+            Box::pin(async move { Ok(upstream_response(body).await) })
+        });
+        (retry, calls)
+    }
+
+    async fn run_stream(
+        first_body: Vec<u8>,
+        retry: UpstreamRetry,
+        max_retries: u32,
+        thinking_enabled: bool,
+    ) -> String {
+        let first = upstream_response(first_body).await;
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-5", 10, thinking_enabled, HashMap::new());
+        let initial = ctx.generate_initial_events();
+        let chunks: Vec<_> = create_sse_stream(first, ctx, initial, retry, max_retries)
+            .collect()
+            .await;
+        chunks
+            .into_iter()
+            .map(|chunk| String::from_utf8(chunk.unwrap().to_vec()).unwrap())
+            .collect()
+    }
+
+    /// 拼接 SSE 中所有 text_delta 的文本（流式输出会把文本拆成多个 delta）
+    fn streamed_text(body: &str) -> String {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+            .filter(|v| v["type"] == "content_block_delta" && v["delta"]["type"] == "text_delta")
+            .filter_map(|v| v["delta"]["text"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// 只有客户端不可见的事件（推理事件 + 计费）然后正常 EOF 的上游响应
+    fn invisible_only_body() -> Vec<u8> {
+        [
+            event_frame("reasoningContentEvent", r#"{"text":"thinking only"}"#),
+            event_frame("meteringEvent", r#"{"unit":"credit","usage":1.0}"#),
+        ]
+        .concat()
+    }
+
+    #[tokio::test]
+    async fn retries_upstream_response_without_visible_output() {
+        for thinking_enabled in [true, false] {
+            let answer = event_frame(
+                "assistantResponseEvent",
+                r#"{"content":"recovered answer"}"#,
+            );
+            let (retry, calls) = counting_retry(answer);
+            let body = run_stream(invisible_only_body(), retry, 2, thinking_enabled).await;
+
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "thinking={thinking_enabled}: {body}"
+            );
+            assert_eq!(
+                streamed_text(&body).trim(),
+                "recovered answer",
+                "thinking={thinking_enabled}: {body}"
+            );
+            assert_eq!(body.matches("event: message_start").count(), 1, "{body}");
+            assert_eq!(body.matches("event: message_stop").count(), 1, "{body}");
+            assert!(!body.contains("thinking only"), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_after_visible_output() {
+        let partial = event_frame("assistantResponseEvent", r#"{"content":"visible partial"}"#);
+        let (retry, calls) = counting_retry(Vec::new());
+        let body = run_stream(partial, retry, 2, true).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "{body}");
+        assert_eq!(streamed_text(&body), "visible partial", "{body}");
+        assert_eq!(body.matches("event: message_stop").count(), 1, "{body}");
+    }
+
+    #[tokio::test]
+    async fn stops_retrying_after_budget_is_spent() {
+        let (retry, calls) = counting_retry(invisible_only_body());
+        let body = run_stream(invisible_only_body(), retry, 2, true).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "{body}");
+        assert_eq!(body.matches("event: message_start").count(), 1, "{body}");
+        assert_eq!(body.matches("event: message_stop").count(), 1, "{body}");
+        assert!(body.contains("\"stop_reason\":\"end_turn\""), "{body}");
+    }
+
+    #[tokio::test]
+    async fn finishes_normally_when_retry_request_fails() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let retry: UpstreamRetry = Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(anyhow::anyhow!("upstream unavailable")) })
+        });
+        let body = run_stream(invisible_only_body(), retry, 2, true).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{body}");
+        assert_eq!(body.matches("event: message_stop").count(), 1, "{body}");
+    }
 }

@@ -539,6 +539,8 @@ pub struct StreamContext {
     pub thinking_block_index: Option<i32>,
     /// 文本块索引（thinking 启用时动态分配）
     pub text_block_index: Option<i32>,
+    /// 本次上游响应中未识别的事件类型计数（仅记录类型名，不记录内容）
+    unknown_event_counts: HashMap<String, u32>,
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
@@ -567,8 +569,47 @@ impl StreamContext {
             thinking_extracted: false,
             thinking_block_index: None,
             text_block_index: None,
+            unknown_event_counts: HashMap::new(),
             strip_thinking_leading_newline: false,
         }
+    }
+
+    /// 记录一个未识别的上游事件类型
+    pub fn record_unknown_event(&mut self, event_type: &str) {
+        *self
+            .unknown_event_counts
+            .entry(event_type.to_string())
+            .or_insert(0) += 1;
+    }
+
+    /// 未识别事件类型摘要，按类型名排序，例如 `reasoningContentEvent=812`
+    pub fn unknown_event_summary(&self) -> String {
+        let mut entries: Vec<_> = self.unknown_event_counts.iter().collect();
+        entries.sort();
+        entries
+            .into_iter()
+            .map(|(event_type, count)| format!("{}={}", event_type, count))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// 本次上游响应是否可以透明重试。
+    ///
+    /// 条件：没有任何文本内容、没有工具调用、也没有上游给出的明确结束原因
+    /// （例如上下文超限）。此时客户端只收到了 message_start（以及非 thinking
+    /// 模式下的空文本块起始），重新请求不会产生重复输出。
+    pub fn should_retry_empty_output(&self) -> bool {
+        self.output_tokens == 0
+            && !self.state_manager.has_tool_use
+            && self.state_manager.stop_reason.is_none()
+            && self.thinking_buffer.is_empty()
+    }
+
+    /// 透明重试前清理与单次上游响应相关的状态。
+    /// 已发送给客户端的消息与内容块状态保持不变，后续内容继续写入同一条消息。
+    pub fn reset_for_upstream_retry(&mut self) {
+        self.context_input_tokens = None;
+        self.unknown_event_counts.clear();
     }
 
     /// 生成 message_start 事件
