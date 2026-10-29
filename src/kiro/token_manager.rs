@@ -1462,6 +1462,38 @@ impl MultiTokenManager {
         }
     }
 
+    /// 导出指定凭据的完整配置（Admin API）
+    ///
+    /// 该方法返回可重新导入的凭据配置，但不包含运行态 accessToken、
+    /// expiresAt、profileArn 和 subscriptionTitle。
+    pub fn export_credentials(&self, ids: &[u64]) -> anyhow::Result<Vec<KiroCredentials>> {
+        if ids.is_empty() {
+            anyhow::bail!("请选择要导出的凭据");
+        }
+
+        let entries = self.entries.lock();
+        let mut exported = Vec::with_capacity(ids.len());
+
+        for id in ids {
+            let entry = entries
+                .iter()
+                .find(|e| e.id == *id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            let mut credential = entry.credentials.clone();
+            credential.canonicalize_auth_method();
+            credential.id = None;
+            credential.access_token = None;
+            credential.profile_arn = None;
+            credential.expires_at = None;
+            credential.subscription_title = None;
+            credential.disabled = false;
+            exported.push(credential);
+        }
+
+        Ok(exported)
+    }
+
     /// 设置凭据禁用状态（Admin API）
     pub fn set_disabled(&self, id: u64, disabled: bool) -> anyhow::Result<()> {
         {

@@ -83,7 +83,7 @@ pub struct SetPriorityRequest {
 }
 
 /// 添加凭据请求
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddCredentialRequest {
     /// 刷新令牌（OAuth 凭据必填，API Key 凭据不需要）
@@ -141,6 +141,14 @@ pub struct AddCredentialRequest {
 
 fn default_auth_method() -> String {
     "social".to_string()
+}
+
+/// 导出凭据请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportCredentialsRequest {
+    /// 要导出的凭据 ID 列表
+    pub ids: Vec<u64>,
 }
 
 /// 添加凭据成功响应

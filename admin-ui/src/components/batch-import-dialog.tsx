@@ -27,6 +27,10 @@ interface CredentialInput {
   apiRegion?: string
   priority?: number
   machineId?: string
+  email?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
   kiroApiKey?: string
   authMethod?: string
   endpoint?: string
@@ -230,9 +234,14 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               authMethod: 'api_key',
               kiroApiKey: cred.kiroApiKey?.trim(),
               priority: cred.priority || 0,
+              region: cred.region?.trim() || undefined,
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
               machineId: cred.machineId?.trim() || undefined,
+              email: cred.email?.trim() || undefined,
+              proxyUrl: cred.proxyUrl?.trim() || undefined,
+              proxyUsername: cred.proxyUsername?.trim() || undefined,
+              proxyPassword: cred.proxyPassword?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
             })
 
@@ -277,11 +286,16 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             refreshToken: token,
             authMethod,
             authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
+            region: cred.region?.trim() || undefined,
             apiRegion: cred.apiRegion?.trim() || undefined,
             clientId,
             clientSecret,
             priority: cred.priority || 0,
             machineId: cred.machineId?.trim() || undefined,
+            email: cred.email?.trim() || undefined,
+            proxyUrl: cred.proxyUrl?.trim() || undefined,
+            proxyUsername: cred.proxyUsername?.trim() || undefined,
+            proxyPassword: cred.proxyPassword?.trim() || undefined,
             endpoint: cred.endpoint?.trim() || undefined,
           })
 
@@ -400,6 +414,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     }
   }
 
+  const progressPercent = progress.total > 0
+    ? (progress.current / progress.total) * 100
+    : 0
+
   return (
     <Dialog
       open={open}
@@ -429,7 +447,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              💡 导入时自动验活，失败的凭据会被排除
+              导入时自动验活，失败的凭据会被排除
             </p>
           </div>
 
@@ -444,7 +462,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                 <div className="w-full bg-secondary rounded-full h-2">
                   <div
                     className="bg-primary h-2 rounded-full transition-all"
-                    style={{ width: `${(progress.current / progress.total) * 100}%` }}
+                    style={{ width: `${progressPercent}%` }}
                   />
                 </div>
                 {importing && currentProcessing && (
@@ -457,13 +475,13 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               {/* 统计 */}
               <div className="flex gap-4 text-sm">
                 <span className="text-green-600 dark:text-green-400">
-                  ✓ 成功: {results.filter(r => r.status === 'verified').length}
+                  成功: {results.filter(r => r.status === 'verified').length}
                 </span>
                 <span className="text-yellow-600 dark:text-yellow-400">
-                  ⚠ 重复: {results.filter(r => r.status === 'duplicate').length}
+                  重复: {results.filter(r => r.status === 'duplicate').length}
                 </span>
                 <span className="text-red-600 dark:text-red-400">
-                  ✗ 失败: {results.filter(r => r.status === 'failed').length}
+                  失败: {results.filter(r => r.status === 'failed').length}
                 </span>
               </div>
 
