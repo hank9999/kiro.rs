@@ -112,12 +112,22 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, false).await
+        self.call_api_with_retry(request_body, false, None).await
     }
 
     /// 发送流式 API 请求
     pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, true).await
+        self.call_api_with_retry(request_body, true, None).await
+    }
+
+    /// 带原始请求会话键的调用。键只用于本地选账号。
+    pub async fn call_api_with_affinity(
+        &self,
+        request_body: &str,
+        is_stream: bool,
+        affinity_key: Option<&str>,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.call_api_with_retry(request_body, is_stream, affinity_key).await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -134,7 +144,7 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            let ctx = match self.token_manager.acquire_context(None, None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -280,6 +290,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
+        affinity_key: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
@@ -289,10 +300,17 @@ impl KiroProvider {
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
+        // 优先用转换前传入的键。请求体此时已是 Kiro 格式，通常没有稳定会话键。
+        let extracted_key = if affinity_key.is_none() {
+            crate::kiro::affinity::extract_affinity_key(request_body)
+        } else {
+            None
+        };
+        let affinity_key = affinity_key.or(extracted_key.as_deref());
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let ctx = match self.token_manager.acquire_context(model.as_deref(), affinity_key).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);

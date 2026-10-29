@@ -190,7 +190,7 @@ docker-compose up
 | `proxyUsername` | string | - | 代理用户名 |
 | `proxyPassword` | string | - | 代理密码 |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
-| `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
+| `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）、`balanced`（按成功次数均衡）或 `session`（同一会话固定账号） |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 
@@ -299,6 +299,9 @@ docker-compose up
 ```
 
 多凭据特性：
+
+`session` 模式按会话粘连。键在转换成 Kiro 请求之前提取，优先取 `metadata.user_id`（Claude Code）或 `prompt_cache_key`（Codex），都没有时用 system 加第一条 user 消息的指纹。转换后的 conversationId 不能当会话键，因为没有 session UUID 时它每次都是新的。同一键在一小时内固定到同一个可用账号；账号被禁用或连续失败后才会换。新会话优先分到当前粘连最少的账号，避免并发请求扎堆。这个键只在本地选择账号，不会转发给 Kiro。没有键的请求也按当前粘连数分配。
+
 - 按 `priority` 字段排序，数字越小优先级越高（默认为 0）
 - 单凭据最多重试 3 次，单请求最多重试 9 次
 - 自动故障转移到下一个可用凭据
