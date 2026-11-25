@@ -301,6 +301,26 @@ pub async fn get_models() -> impl IntoResponse {
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
+fn request_affinity_key(payload: &MessagesRequest) -> Option<String> {
+    let user_id = payload
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.user_id.as_deref());
+    let system = payload.system.as_ref().map(|items| {
+        items
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+    let first_user = payload
+        .messages
+        .iter()
+        .find(|message| message.role == "user")
+        .map(|message| &message.content);
+    crate::kiro::affinity::affinity_key_for_anthropic(user_id, system.as_deref(), first_user)
+}
+
 pub async fn post_messages(
     State(state): State<AppState>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
@@ -390,6 +410,8 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
+    let affinity_key = request_affinity_key(&payload);
+
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -416,12 +438,13 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            affinity_key.as_deref(),
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, affinity_key.as_deref()).await
     }
 }
 
@@ -433,9 +456,14 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    affinity_key: Option<&str>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let response = match if affinity_key.is_some() {
+        provider.call_api_with_affinity(request_body, true, affinity_key).await
+    } else {
+        provider.call_api_stream(request_body).await
+    } {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -569,9 +597,14 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    affinity_key: Option<&str>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
+    let response = match if affinity_key.is_some() {
+        provider.call_api_with_affinity(request_body, false, affinity_key).await
+    } else {
+        provider.call_api(request_body).await
+    } {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -906,6 +939,8 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
+    let affinity_key = request_affinity_key(&payload);
+
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -932,12 +967,13 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            affinity_key.as_deref(),
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, affinity_key.as_deref()).await
     }
 }
 
@@ -952,9 +988,14 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    affinity_key: Option<&str>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let response = match if affinity_key.is_some() {
+        provider.call_api_with_affinity(request_body, true, affinity_key).await
+    } else {
+        provider.call_api_stream(request_body).await
+    } {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };

@@ -522,6 +522,8 @@ pub struct MultiTokenManager {
     is_multiple_format: bool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// 会话键到凭据的粘连表。只在 session 模式使用。
+    affinity: Mutex<crate::kiro::affinity::AffinityTable>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -653,6 +655,7 @@ impl MultiTokenManager {
             credentials_path,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            affinity: Mutex::new(crate::kiro::affinity::AffinityTable::default()),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -725,6 +728,19 @@ impl MultiTokenManager {
         let mode = mode.as_str();
 
         match mode {
+            "session" => {
+                // 没有会话键，或粘连账号不可用后的回退：先摊到当前粘连最少的账号。
+                let affinity = self.affinity.lock();
+                let entry = available.iter().min_by_key(|e| {
+                    (
+                        affinity.pin_count(e.id),
+                        e.success_count,
+                        e.credentials.priority,
+                        e.id,
+                    )
+                })?;
+                Some((entry.id, entry.credentials.clone()))
+            }
             "balanced" => {
                 // Least-Used 策略：选择成功次数最少的凭据
                 // 平局时按优先级排序（数字越小优先级越高）
@@ -752,7 +768,55 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+    /// - `affinity_key`: 会话粘连键。仅 `session` 模式使用。
+
+    fn credential_matches_model(entry: &CredentialEntry, model: Option<&str>) -> bool {
+        if entry.disabled {
+            return false;
+        }
+        let is_opus = model
+            .map(|value| value.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+        !is_opus || entry.credentials.supports_opus()
+    }
+
+    fn pinned_session_credential(
+        &self,
+        key: &str,
+        model: Option<&str>,
+    ) -> Option<(u64, KiroCredentials)> {
+        let entries = self.entries.lock();
+        let available: Vec<(u64, u64, u32)> = entries
+            .iter()
+            .filter(|entry| Self::credential_matches_model(entry, model))
+            .map(|entry| (entry.id, entry.success_count, entry.credentials.priority))
+            .collect();
+        let mut affinity = self.affinity.lock();
+        let id = affinity.resolve(key, &available, Instant::now())?;
+        entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| (entry.id, entry.credentials.clone()))
+    }
+
+    fn remember_session_credential(&self, key: &str, id: u64) {
+        let entries = self.entries.lock();
+        let available: Vec<(u64, u64, u32)> = entries
+            .iter()
+            .filter(|entry| !entry.disabled)
+            .map(|entry| (entry.id, entry.success_count, entry.credentials.priority))
+            .collect();
+        drop(entries);
+        self.affinity
+            .lock()
+            .pin(key, id, &available, Instant::now());
+    }
+
+    pub async fn acquire_context(
+        &self,
+        model: Option<&str>,
+        affinity_key: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -767,11 +831,13 @@ impl MultiTokenManager {
             }
 
             let (id, credentials) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+                let mode = self.load_balancing_mode.lock().clone();
 
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
+                // session：同一会话键固定账号；balanced：每次重新均衡；
+                // priority：优先使用 current_id 指向的凭据。
+                let current_hit = if mode == "session" {
+                    affinity_key.and_then(|key| self.pinned_session_credential(key, model))
+                } else if mode == "balanced" {
                     None
                 } else {
                     let entries = self.entries.lock();
@@ -783,6 +849,9 @@ impl MultiTokenManager {
                 };
 
                 if let Some(hit) = current_hit {
+                    if mode == "session" {
+                        *self.current_id.lock() = hit.0;
+                    }
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
@@ -810,7 +879,12 @@ impl MultiTokenManager {
                     }
 
                     if let Some((new_id, new_creds)) = best {
-                        // 更新 current_id
+                        if mode == "session" {
+                            if let Some(key) = affinity_key {
+                                self.remember_session_credential(key, new_id);
+                            }
+                        }
+                        // 更新 current_id。session 模式下它只表示最近一次选中的账号。
                         let mut current_id = self.current_id.lock();
                         *current_id = new_id;
                         (new_id, new_creds)
@@ -824,6 +898,8 @@ impl MultiTokenManager {
                     }
                 }
             };
+
+            tracing::info!(credential_id = id, pinned = affinity_key.is_some(), "选择凭据");
 
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
@@ -1902,7 +1978,7 @@ impl MultiTokenManager {
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         // 验证模式值
-        if mode != "priority" && mode != "balanced" {
+        if mode != "priority" && mode != "balanced" && mode != "session" {
             anyhow::bail!("无效的负载均衡模式: {}", mode);
         }
 
@@ -2328,7 +2404,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -2350,7 +2426,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
     }
@@ -2395,7 +2471,7 @@ mod tests {
         }
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager.acquire_context(None, None).await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -2435,7 +2511,7 @@ mod tests {
         manager.report_quota_exhausted(2);
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager.acquire_context(None, None).await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
